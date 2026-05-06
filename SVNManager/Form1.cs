@@ -16,6 +16,7 @@ public partial class Form1 : Form
     private readonly ListView _changesList = new();
     private readonly TextBox _statusSearchText = new();
     private readonly ComboBox _statusFilterCombo = new();
+    private readonly CheckBox _statusCommitVisibleOnlyCheck = new();
     private readonly Label _statusFilterSummaryLabel = new();
     private readonly DataGridView _conflictGrid = new();
     private readonly Label _conflictSummaryLabel = new();
@@ -861,13 +862,14 @@ public partial class Form1 : Form
         var panel = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 3,
+            ColumnCount = 4,
             RowCount = 1,
             BackColor = Color.White,
         };
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126));
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 176));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 230));
 
         _statusSearchText.Dock = DockStyle.Fill;
         _statusSearchText.Margin = new Padding(0, 4, 6, 4);
@@ -887,11 +889,18 @@ public partial class Form1 : Form
         _statusFilterCombo.SelectedIndexChanged += (_, _) => ApplyStatusFilter();
         panel.Controls.Add(_statusFilterCombo, 1, 0);
 
+        _statusCommitVisibleOnlyCheck.Dock = DockStyle.Fill;
+        _statusCommitVisibleOnlyCheck.Margin = new Padding(0, 5, 8, 4);
+        _statusCommitVisibleOnlyCheck.Text = "只提交当前筛选结果";
+        _statusCommitVisibleOnlyCheck.TextAlign = ContentAlignment.MiddleLeft;
+        _statusCommitVisibleOnlyCheck.CheckedChanged += (_, _) => UpdateStatusFilterSummary(_changesList.Items.Count);
+        panel.Controls.Add(_statusCommitVisibleOnlyCheck, 2, 0);
+
         _statusFilterSummaryLabel.Dock = DockStyle.Fill;
         _statusFilterSummaryLabel.TextAlign = ContentAlignment.MiddleLeft;
         _statusFilterSummaryLabel.ForeColor = Color.FromArgb(90, 100, 115);
         _statusFilterSummaryLabel.Text = "显示 0/0，已勾选 0";
-        panel.Controls.Add(_statusFilterSummaryLabel, 2, 0);
+        panel.Controls.Add(_statusFilterSummaryLabel, 3, 0);
         return panel;
     }
 
@@ -1954,6 +1963,23 @@ public partial class Form1 : Form
         UpdateStatusFilterSummary(filtered.Count);
     }
 
+    private List<string> GetCommitSelectedPaths()
+    {
+        if (_statusCommitVisibleOnlyCheck.Checked)
+        {
+            return _changesList.Items
+                .Cast<ListViewItem>()
+                .Where(item => item.Checked && item.Tag is SvnChange)
+                .Select(item => ((SvnChange)item.Tag!).RelativePath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        return _checkedStatusPaths
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     private ListViewItem CreateStatusListItem(SvnChange change)
     {
         var item = new ListViewItem(change.DisplayStatus)
@@ -2006,7 +2032,8 @@ public partial class Form1 : Form
 
     private void UpdateStatusFilterSummary(int visibleCount)
     {
-        _statusFilterSummaryLabel.Text = $"显示 {visibleCount}/{_statusChangesAll.Count}，已勾选 {_checkedStatusPaths.Count}";
+        var scopeText = _statusCommitVisibleOnlyCheck.Checked ? "提交当前" : "提交全部";
+        _statusFilterSummaryLabel.Text = $"显示 {visibleCount}/{_statusChangesAll.Count}，已勾选 {_checkedStatusPaths.Count}，{scopeText}";
     }
 
     private void UpdateStatusBadges(int changeCount, int conflictCount)
@@ -3076,13 +3103,14 @@ try {{
             return;
         }
 
-        var selectedPaths = _checkedStatusPaths
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var selectedPaths = GetCommitSelectedPaths();
 
         if (selectedPaths.Count == 0)
         {
-            MessageBox.Show("请先勾选要提交的文件。", "没有选择文件", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            var noSelectionMessage = _statusCommitVisibleOnlyCheck.Checked && _checkedStatusPaths.Count > 0
+                ? $"当前筛选结果里没有已勾选文件。{Environment.NewLine}{Environment.NewLine}当前共有 {_checkedStatusPaths.Count} 个隐藏或不在筛选结果里的已勾选文件。取消“只提交当前筛选结果”，或在当前筛选结果中勾选文件后再提交。"
+                : "请先勾选要提交的文件。";
+            MessageBox.Show(noSelectionMessage, "没有选择文件", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -5201,6 +5229,7 @@ try {{
         _historyDeepSearchButton.Enabled = !busy;
         _historyLoadMoreButton.Enabled = !busy;
         _historyClearSearchButton.Enabled = !busy && !string.IsNullOrWhiteSpace(_historySearchText.Text);
+        _statusCommitVisibleOnlyCheck.Enabled = !busy;
         UseWaitCursor = busy;
         if (!busy)
         {
