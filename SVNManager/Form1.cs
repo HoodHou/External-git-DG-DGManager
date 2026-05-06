@@ -31,6 +31,8 @@ public partial class Form1 : Form
     private readonly Button _historyClearSearchButton = new();
     private readonly TextBox _historyDetailText = new();
     private readonly TreeView _historyChangedFilesTree = new();
+    private readonly TextBox _historyChangedFilesSearchText = new();
+    private readonly ComboBox _historyChangedFilesFilterCombo = new();
     private readonly Panel _historyDiffPanel = new();
     private readonly TabControl _mainTabs = new();
     private readonly TabPage _configPage = new("配置");
@@ -77,6 +79,8 @@ public partial class Form1 : Form
     private List<SvnLogEntry> _selectedHistoryLogs = [];
     private List<SvnLogEntry> _historyRows = [];
     private int _historyLoadedLimit = InitialHistoryLimit;
+    private IReadOnlyList<ChangedFileEntry> _historyChangedFilesAll = [];
+    private string _historyChangedFilesRootText = "Changed files";
     private List<SvnChange> _currentConflicts = [];
     private readonly Dictionary<string, DiffPreviewData> _historyDiffPreviewCache = new(StringComparer.Ordinal);
     private CancellationTokenSource? _historyDiffPreviewCts;
@@ -368,7 +372,12 @@ public partial class Form1 : Form
         _historyChangedFilesTree.AfterSelect += async (_, args) => await ShowSelectedHistoryFileDiffAsync(args.Node);
         BuildHistoryChangedFilesMenu();
         _historyChangedFilesTree.ContextMenuStrip = _historyChangedFilesMenu;
-        _changedFilesSplit.Panel1.Controls.Add(CreateTitledPanel("Changed files", _historyChangedFilesTree));
+        _changedFilesSplit.Panel1.Controls.Add(CreateChangedFilesFilterPanel(
+            "Changed files",
+            _historyChangedFilesTree,
+            _historyChangedFilesSearchText,
+            _historyChangedFilesFilterCombo,
+            ApplyHistoryChangedFilesFilter));
 
         _historyDiffPanel.Dock = DockStyle.Fill;
         _historyDiffPanel.BackColor = Color.White;
@@ -995,6 +1004,67 @@ public partial class Form1 : Form
         button.Text = text;
         button.Dock = DockStyle.Fill;
         button.Margin = new Padding(0, 4, 6, 4);
+    }
+
+    internal static Control CreateChangedFilesFilterPanel(
+        string title,
+        TreeView tree,
+        TextBox searchText,
+        ComboBox filterCombo,
+        Action applyFilter)
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            BackColor = Color.White,
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        panel.Controls.Add(new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(8, 0, 0, 0),
+            BackColor = Color.FromArgb(241, 243, 245),
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
+
+        var filters = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            BackColor = Color.White,
+        };
+        filters.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        filters.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118));
+
+        searchText.Dock = DockStyle.Fill;
+        searchText.Margin = new Padding(0, 4, 6, 4);
+        searchText.PlaceholderText = "搜索文件名 / 路径";
+        searchText.TextChanged += (_, _) => applyFilter();
+        filters.Controls.Add(searchText, 0, 0);
+
+        filterCombo.Dock = DockStyle.Fill;
+        filterCombo.Margin = new Padding(0, 4, 0, 4);
+        filterCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        filterCombo.Items.Clear();
+        foreach (var text in ChangedFilesFilter.Options)
+        {
+            filterCombo.Items.Add(text);
+        }
+
+        filterCombo.SelectedIndex = 0;
+        filterCombo.SelectedIndexChanged += (_, _) => applyFilter();
+        filters.Controls.Add(filterCombo, 1, 0);
+
+        panel.Controls.Add(filters, 0, 1);
+        panel.Controls.Add(tree, 0, 2);
+        return panel;
     }
 
     private static Control CreatePanelToolbar(string title, string buttonText, Func<Task> refresh)
@@ -3911,7 +3981,7 @@ try {{
             : _historyRows.Where(log => filter.Matches(log)).ToList();
         _historyList.BeginUpdate();
         _historyList.Items.Clear();
-        _historyChangedFilesTree.Nodes.Clear();
+        ClearHistoryChangedFiles();
         foreach (var row in rows)
         {
             AddHistoryItem(row);
@@ -4955,7 +5025,7 @@ try {{
         _historyRows.Clear();
         UpdateHistoryBadge(0);
         _historyDetailText.Clear();
-        _historyChangedFilesTree.Nodes.Clear();
+        ClearHistoryChangedFiles();
         _historyDiffPanel.Controls.Clear();
         UpdateHistorySearchControls();
         LoadAllFiles();
@@ -5018,7 +5088,7 @@ try {{
         {
             _selectedHistoryLog = null;
             _selectedHistoryLogs = [];
-            _historyChangedFilesTree.Nodes.Clear();
+            ClearHistoryChangedFiles();
             ShowHistorySummary("");
             return;
         }
@@ -5063,7 +5133,7 @@ try {{
         if (committedLogs.Count == 0)
         {
             ShowHistorySummary("当前选择只包含未提交改动，请单选 Uncommitted changes 查看。");
-            _historyChangedFilesTree.Nodes.Clear();
+            ClearHistoryChangedFiles();
             return;
         }
 
@@ -5093,10 +5163,34 @@ try {{
         PopulateHistoryChangedFiles($"Changed files ({log.ChangedFiles.Count})", log.ChangedFiles);
     }
 
+    private void ClearHistoryChangedFiles()
+    {
+        _historyChangedFilesAll = [];
+        _historyChangedFilesRootText = "Changed files";
+        _historyChangedFilesTree.Nodes.Clear();
+    }
+
     private void PopulateHistoryChangedFiles(string rootText, IReadOnlyList<ChangedFileEntry> files)
+    {
+        _historyChangedFilesRootText = rootText;
+        _historyChangedFilesAll = files
+            .Where(file => !string.IsNullOrWhiteSpace(file.TreePath))
+            .OrderBy(file => file.TreePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        ApplyHistoryChangedFilesFilter();
+    }
+
+    private void ApplyHistoryChangedFilesFilter()
     {
         _historyChangedFilesTree.BeginUpdate();
         _historyChangedFilesTree.Nodes.Clear();
+        var files = ChangedFilesFilter.Apply(
+            _historyChangedFilesAll,
+            _historyChangedFilesSearchText.Text,
+            ChangedFilesFilter.GetMode(_historyChangedFilesFilterCombo));
+        var rootText = files.Count == _historyChangedFilesAll.Count
+            ? _historyChangedFilesRootText
+            : $"{_historyChangedFilesRootText} - 显示 {files.Count}/{_historyChangedFilesAll.Count}";
         var root = new TreeNode(rootText)
         {
             ImageKey = "folder",
@@ -7817,6 +7911,87 @@ internal sealed record ChangedFileEntry(string Action, string RepositoryPath, st
     }
 }
 
+internal enum ChangedFilesFilterMode
+{
+    All,
+    Xml,
+    Lua,
+    Conflict,
+    Added,
+    Deleted,
+    Modified,
+}
+
+internal static class ChangedFilesFilter
+{
+    public static IReadOnlyList<string> Options { get; } =
+    [
+        "全部",
+        "只看 XML",
+        "只看 Lua",
+        "只看冲突",
+        "只看新增",
+        "只看删除",
+        "只看修改",
+    ];
+
+    public static ChangedFilesFilterMode GetMode(ComboBox combo)
+    {
+        return combo.SelectedIndex switch
+        {
+            1 => ChangedFilesFilterMode.Xml,
+            2 => ChangedFilesFilterMode.Lua,
+            3 => ChangedFilesFilterMode.Conflict,
+            4 => ChangedFilesFilterMode.Added,
+            5 => ChangedFilesFilterMode.Deleted,
+            6 => ChangedFilesFilterMode.Modified,
+            _ => ChangedFilesFilterMode.All,
+        };
+    }
+
+    public static IReadOnlyList<ChangedFileEntry> Apply(
+        IEnumerable<ChangedFileEntry> files,
+        string searchText,
+        ChangedFilesFilterMode mode)
+    {
+        var keyword = (searchText ?? "").Trim();
+        return files
+            .Where(file => MatchesMode(file, mode))
+            .Where(file => string.IsNullOrWhiteSpace(keyword) || MatchesText(file, keyword))
+            .OrderBy(file => file.TreePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static bool MatchesMode(ChangedFileEntry file, ChangedFilesFilterMode mode)
+    {
+        return mode switch
+        {
+            ChangedFilesFilterMode.Xml => HasExtension(file, ".xml"),
+            ChangedFilesFilterMode.Lua => HasExtension(file, ".lua"),
+            ChangedFilesFilterMode.Conflict => string.Equals(file.Action, "C", StringComparison.OrdinalIgnoreCase),
+            ChangedFilesFilterMode.Added => string.Equals(file.Action, "A", StringComparison.OrdinalIgnoreCase),
+            ChangedFilesFilterMode.Deleted => string.Equals(file.Action, "D", StringComparison.OrdinalIgnoreCase),
+            ChangedFilesFilterMode.Modified => string.Equals(file.Action, "M", StringComparison.OrdinalIgnoreCase),
+            _ => true,
+        };
+    }
+
+    private static bool HasExtension(ChangedFileEntry file, string extension)
+    {
+        return Path.GetExtension(file.TreePath).Equals(extension, StringComparison.OrdinalIgnoreCase) ||
+            Path.GetExtension(file.RelativePath).Equals(extension, StringComparison.OrdinalIgnoreCase) ||
+            Path.GetExtension(file.RepositoryPath).Equals(extension, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool MatchesText(ChangedFileEntry file, string keyword)
+    {
+        return file.DisplayText.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+            file.TreePath.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+            file.RelativePath.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+            file.RepositoryPath.Contains(keyword, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
 internal sealed class HistorySearchFilter
 {
     private HistorySearchFilter()
@@ -9129,9 +9304,13 @@ internal sealed class FileHistoryForm : Form
     private readonly TextBox _detailText = new();
     private readonly Panel _diffPanel = new();
     private readonly TreeView _changedFilesTree = new();
+    private readonly TextBox _changedFilesSearchText = new();
+    private readonly ComboBox _changedFilesFilterCombo = new();
     private readonly ImageList _treeImages = new();
     private readonly Dictionary<string, DiffPreviewData> _diffPreviewCache = new(StringComparer.Ordinal);
     private List<SvnLogEntry> _logs;
+    private IReadOnlyList<ChangedFileEntry> _changedFilesAll = [];
+    private string _changedFilesRootText = "Changed files";
     private CancellationTokenSource? _diffPreviewCts;
     private int _loadedLimit = InitialHistoryLimit;
     private bool _loadingHistory;
@@ -9233,7 +9412,12 @@ internal sealed class FileHistoryForm : Form
         _changedFilesTree.ImageList = _treeImages;
         _changedFilesTree.TreeViewNodeSorter = new FileTreeNodeSorter();
         _changedFilesTree.AfterSelect += async (_, _) => await ShowSelectedChangedFileDiffAsync();
-        right.Panel1.Controls.Add(CreateTitledPanel("Changed files", _changedFilesTree));
+        right.Panel1.Controls.Add(Form1.CreateChangedFilesFilterPanel(
+            "Changed files",
+            _changedFilesTree,
+            _changedFilesSearchText,
+            _changedFilesFilterCombo,
+            ApplyChangedFilesFilter));
 
         _diffPanel.Dock = DockStyle.Fill;
         right.Panel2.Controls.Add(CreateTitledPanel("Diff preview", _diffPanel));
@@ -9342,7 +9526,7 @@ internal sealed class FileHistoryForm : Form
             _detailText.Text = filter.IsEmpty
                 ? ""
                 : $"没有匹配的提交。当前只在已加载的 {_logs.Count} 条历史里搜索；可以点击“深度搜索”读取更早提交。";
-            _changedFilesTree.Nodes.Clear();
+            ClearChangedFiles();
             ShowDiffMessage(_detailText.Text);
             return;
         }
@@ -9527,17 +9711,41 @@ internal sealed class FileHistoryForm : Form
 
     private void PopulateChangedFilesTree(SvnLogEntry log)
     {
+        _changedFilesRootText = $"Changed files ({log.ChangedFiles.Count})";
+        _changedFilesAll = log.ChangedFiles
+            .Where(file => !string.IsNullOrWhiteSpace(file.TreePath))
+            .OrderBy(file => file.TreePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        ApplyChangedFilesFilter();
+    }
+
+    private void ClearChangedFiles()
+    {
+        _changedFilesAll = [];
+        _changedFilesRootText = "Changed files";
+        _changedFilesTree.Nodes.Clear();
+    }
+
+    private void ApplyChangedFilesFilter()
+    {
         _changedFilesTree.BeginUpdate();
         _changedFilesTree.Nodes.Clear();
         try
         {
-            var root = new TreeNode($"Changed files ({log.ChangedFiles.Count})")
+            var files = ChangedFilesFilter.Apply(
+                _changedFilesAll,
+                _changedFilesSearchText.Text,
+                ChangedFilesFilter.GetMode(_changedFilesFilterCombo));
+            var rootText = files.Count == _changedFilesAll.Count
+                ? _changedFilesRootText
+                : $"{_changedFilesRootText} - 显示 {files.Count}/{_changedFilesAll.Count}";
+            var root = new TreeNode(rootText)
             {
                 ImageKey = "folder",
                 SelectedImageKey = "folder",
             };
             _changedFilesTree.Nodes.Add(root);
-            foreach (var file in log.ChangedFiles.OrderBy(file => file.TreePath, StringComparer.OrdinalIgnoreCase))
+            foreach (var file in files)
             {
                 AddChangedFileNode(root, file);
             }
