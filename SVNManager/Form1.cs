@@ -3999,7 +3999,7 @@ try {{
     {
         if (!filter.IsEmpty)
         {
-            var matched = FindChangedFileNode(nodes, file => filter.MatchesFile(file));
+            var matched = FindChangedFileNode(nodes, file => filter.MatchesFileForNavigation(file));
             if (matched != null)
             {
                 return matched;
@@ -7950,10 +7950,25 @@ internal sealed class HistorySearchFilter
             return false;
         }
 
-        return file.DisplayText.Contains(FileKeyword, StringComparison.OrdinalIgnoreCase) ||
-            file.TreePath.Contains(FileKeyword, StringComparison.OrdinalIgnoreCase) ||
-            file.RelativePath.Contains(FileKeyword, StringComparison.OrdinalIgnoreCase) ||
-            file.RepositoryPath.Contains(FileKeyword, StringComparison.OrdinalIgnoreCase);
+        return MatchesFileText(file, FileKeyword);
+    }
+
+    public bool MatchesFileForNavigation(ChangedFileEntry file)
+    {
+        if (!string.IsNullOrWhiteSpace(FileKeyword))
+        {
+            return MatchesFileText(file, FileKeyword);
+        }
+
+        return !string.IsNullOrWhiteSpace(Keyword) && MatchesFileText(file, Keyword);
+    }
+
+    private static bool MatchesFileText(ChangedFileEntry file, string text)
+    {
+        return file.DisplayText.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+            file.TreePath.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+            file.RelativePath.Contains(text, StringComparison.OrdinalIgnoreCase) ||
+            file.RepositoryPath.Contains(text, StringComparison.OrdinalIgnoreCase);
     }
 
     private static IReadOnlyList<string> SplitTokens(string text)
@@ -9184,6 +9199,7 @@ internal sealed class FileHistoryForm : Form
         _historyList.Columns.Add("Author", 120);
         _historyList.Columns.Add("Commit", 90);
         _historyList.SelectedIndexChanged += async (_, _) => await ShowSelectedFileRevisionAsync();
+        _historyList.DoubleClick += (_, _) => FocusBestChangedFileInSelectedLog();
         top.Controls.Add(_historyList, 0, 2);
         root.Panel1.Controls.Add(top);
 
@@ -9533,6 +9549,82 @@ internal sealed class FileHistoryForm : Form
         {
             _changedFilesTree.EndUpdate();
         }
+    }
+
+    private void FocusBestChangedFileInSelectedLog()
+    {
+        if (_historyList.SelectedItems.Count != 1 || _historyList.SelectedItems[0].Tag is not SvnLogEntry log)
+        {
+            return;
+        }
+
+        if (_changedFilesTree.Nodes.Count == 0)
+        {
+            PopulateChangedFilesTree(log);
+        }
+
+        var filter = HistorySearchFilter.Parse(_searchText.Text);
+        var target = FindBestChangedFileNode(_changedFilesTree.Nodes.Cast<TreeNode>(), filter);
+        if (target == null)
+        {
+            return;
+        }
+
+        target.EnsureVisible();
+        _changedFilesTree.SelectedNode = target;
+        _changedFilesTree.Focus();
+    }
+
+    private static TreeNode? FindBestChangedFileNode(IEnumerable<TreeNode> nodes, HistorySearchFilter filter)
+    {
+        if (!filter.IsEmpty)
+        {
+            var matched = FindChangedFileNode(nodes, file => filter.MatchesFileForNavigation(file));
+            if (matched != null)
+            {
+                return matched;
+            }
+        }
+
+        return FindFirstChangedFileNode(nodes);
+    }
+
+    private static TreeNode? FindChangedFileNode(IEnumerable<TreeNode> nodes, Func<ChangedFileEntry, bool> predicate)
+    {
+        foreach (var node in nodes)
+        {
+            if (node.Tag is ChangedFileEntry file && predicate(file))
+            {
+                return node;
+            }
+
+            var child = FindChangedFileNode(node.Nodes.Cast<TreeNode>(), predicate);
+            if (child != null)
+            {
+                return child;
+            }
+        }
+
+        return null;
+    }
+
+    private static TreeNode? FindFirstChangedFileNode(IEnumerable<TreeNode> nodes)
+    {
+        foreach (var node in nodes)
+        {
+            if (node.Tag is ChangedFileEntry)
+            {
+                return node;
+            }
+
+            var child = FindFirstChangedFileNode(node.Nodes.Cast<TreeNode>());
+            if (child != null)
+            {
+                return child;
+            }
+        }
+
+        return null;
     }
 
     private async Task ShowSelectedChangedFileDiffAsync()
