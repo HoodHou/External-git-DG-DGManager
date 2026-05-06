@@ -14,6 +14,9 @@ public partial class Form1 : Form
     private readonly TextBox _workingCopyText = new();
     private readonly TextBox _outputText = new();
     private readonly ListView _changesList = new();
+    private readonly TextBox _statusSearchText = new();
+    private readonly ComboBox _statusFilterCombo = new();
+    private readonly Label _statusFilterSummaryLabel = new();
     private readonly DataGridView _conflictGrid = new();
     private readonly Label _conflictSummaryLabel = new();
     private readonly TreeView _repositoryTree = new();
@@ -66,6 +69,7 @@ public partial class Form1 : Form
     private bool _loadingRepository;
     private bool _loadingFileTree;
     private bool _loadingCurrentTab;
+    private bool _updatingChangesList;
     private bool _checkingToolUpdate;
     private bool _checkingRemote;
     private SvnLogEntry? _latestRemoteLog;
@@ -79,6 +83,8 @@ public partial class Form1 : Form
     private List<SvnLogEntry> _selectedHistoryLogs = [];
     private List<SvnLogEntry> _historyRows = [];
     private int _historyLoadedLimit = InitialHistoryLimit;
+    private List<SvnChange> _statusChangesAll = [];
+    private readonly HashSet<string> _checkedStatusPaths = new(StringComparer.OrdinalIgnoreCase);
     private IReadOnlyList<ChangedFileEntry> _historyChangedFilesAll = [];
     private string _historyChangedFilesRootText = "Changed files";
     private List<SvnChange> _currentConflicts = [];
@@ -224,6 +230,7 @@ public partial class Form1 : Form
         _changesList.Columns.Add("文件", 650);
         _changesList.Columns.Add("说明", 260);
         _changesList.MouseDown += (_, args) => SelectChangeItemForContextMenu(args);
+        _changesList.ItemChecked += (_, args) => TrackStatusItemChecked(args.Item);
         BuildChangesListMenu();
         _changesList.ContextMenuStrip = _changesListMenu;
 
@@ -808,14 +815,16 @@ public partial class Form1 : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 2,
+            RowCount = 3,
             Padding = new Padding(8),
             BackColor = Color.White,
         };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.Controls.Add(CreateStatusToolbar(), 0, 0);
-        root.Controls.Add(_changesList, 0, 1);
+        root.Controls.Add(CreateStatusFilterBar(), 0, 1);
+        root.Controls.Add(_changesList, 0, 2);
         return root;
     }
 
@@ -844,6 +853,45 @@ public partial class Form1 : Form
         panel.Controls.Add(CreateSmallToolbarButton("刷新改动", async () => await RefreshStatusAsync()), 1, 0);
         panel.Controls.Add(CreateSmallToolbarButton("全选", () => SetAllChecks(true)), 2, 0);
         panel.Controls.Add(CreateSmallToolbarButton("全不选", () => SetAllChecks(false)), 3, 0);
+        return panel;
+    }
+
+    private Control CreateStatusFilterBar()
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
+            BackColor = Color.White,
+        };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
+
+        _statusSearchText.Dock = DockStyle.Fill;
+        _statusSearchText.Margin = new Padding(0, 4, 6, 4);
+        _statusSearchText.PlaceholderText = "搜索文件名 / 路径";
+        _statusSearchText.TextChanged += (_, _) => ApplyStatusFilter();
+        panel.Controls.Add(_statusSearchText, 0, 0);
+
+        _statusFilterCombo.Dock = DockStyle.Fill;
+        _statusFilterCombo.Margin = new Padding(0, 4, 6, 4);
+        _statusFilterCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        foreach (var text in ChangedFilesFilter.Options)
+        {
+            _statusFilterCombo.Items.Add(text);
+        }
+
+        _statusFilterCombo.SelectedIndex = 0;
+        _statusFilterCombo.SelectedIndexChanged += (_, _) => ApplyStatusFilter();
+        panel.Controls.Add(_statusFilterCombo, 1, 0);
+
+        _statusFilterSummaryLabel.Dock = DockStyle.Fill;
+        _statusFilterSummaryLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _statusFilterSummaryLabel.ForeColor = Color.FromArgb(90, 100, 115);
+        _statusFilterSummaryLabel.Text = "显示 0/0，已勾选 0";
+        panel.Controls.Add(_statusFilterSummaryLabel, 2, 0);
         return panel;
     }
 
@@ -1819,22 +1867,15 @@ public partial class Form1 : Form
         try
         {
             SaveSettings();
-            var changes = await _svn.GetStatusAsync(_workingCopyText.Text.Trim());
-            _changesList.BeginUpdate();
-            _changesList.Items.Clear();
-            foreach (var change in changes)
+            var changes = (await _svn.GetStatusAsync(_workingCopyText.Text.Trim())).ToList();
+            _statusChangesAll = changes.OrderBy(change => change.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
+            _checkedStatusPaths.Clear();
+            foreach (var change in _statusChangesAll.Where(change => change.CanCommit))
             {
-                var item = new ListViewItem(change.DisplayStatus) { Tag = change, Checked = change.CanCommit };
-                item.SubItems.Add(change.RelativePath);
-                item.SubItems.Add(change.Description);
-                if (change.Status == SvnStatusKind.Conflicted)
-                {
-                    item.ForeColor = Color.DarkRed;
-                    item.Checked = false;
-                }
-                _changesList.Items.Add(item);
+                _checkedStatusPaths.Add(NormalizeRelativePath(change.RelativePath));
             }
-            _changesList.EndUpdate();
+
+            ApplyStatusFilter();
             var conflicts = changes.Where(change => change.Status == SvnStatusKind.Conflicted).ToList();
             RefreshConflictPanel(conflicts);
             UpdateStatusBadges(changes.Count, conflicts.Count);
@@ -1870,6 +1911,102 @@ public partial class Form1 : Form
         _conflictGrid.DataSource = _currentConflicts
             .Select(change => new ConflictGridRow(change.RelativePath, change.Description))
             .ToList();
+    }
+
+    private void ApplyStatusFilter()
+    {
+        var selectedPath = GetSelectedChange()?.RelativePath;
+        var filtered = ChangedFilesFilter.ApplyStatusChanges(
+            _statusChangesAll,
+            _statusSearchText.Text,
+            ChangedFilesFilter.GetMode(_statusFilterCombo));
+
+        _updatingChangesList = true;
+        _changesList.BeginUpdate();
+        _changesList.Items.Clear();
+        try
+        {
+            ListViewItem? itemToSelect = null;
+            foreach (var change in filtered)
+            {
+                var item = CreateStatusListItem(change);
+                _changesList.Items.Add(item);
+                if (selectedPath != null &&
+                    string.Equals(NormalizeRelativePath(selectedPath), NormalizeRelativePath(change.RelativePath), StringComparison.OrdinalIgnoreCase))
+                {
+                    itemToSelect = item;
+                }
+            }
+
+            if (itemToSelect != null)
+            {
+                itemToSelect.Selected = true;
+                itemToSelect.Focused = true;
+                itemToSelect.EnsureVisible();
+            }
+        }
+        finally
+        {
+            _changesList.EndUpdate();
+            _updatingChangesList = false;
+        }
+
+        UpdateStatusFilterSummary(filtered.Count);
+    }
+
+    private ListViewItem CreateStatusListItem(SvnChange change)
+    {
+        var item = new ListViewItem(change.DisplayStatus)
+        {
+            Tag = change,
+            Checked = change.CanCommit && _checkedStatusPaths.Contains(NormalizeRelativePath(change.RelativePath)),
+        };
+        item.SubItems.Add(change.RelativePath);
+        item.SubItems.Add(change.Description);
+        if (change.Status == SvnStatusKind.Conflicted)
+        {
+            item.ForeColor = Color.DarkRed;
+            item.Checked = false;
+        }
+
+        return item;
+    }
+
+    private void TrackStatusItemChecked(ListViewItem item)
+    {
+        if (_updatingChangesList || item.Tag is not SvnChange change)
+        {
+            return;
+        }
+
+        var key = NormalizeRelativePath(change.RelativePath);
+        if (!change.CanCommit)
+        {
+            if (item.Checked)
+            {
+                item.Checked = false;
+            }
+
+            _checkedStatusPaths.Remove(key);
+            UpdateStatusFilterSummary(_changesList.Items.Count);
+            return;
+        }
+
+        if (item.Checked)
+        {
+            _checkedStatusPaths.Add(key);
+        }
+        else
+        {
+            _checkedStatusPaths.Remove(key);
+        }
+
+        UpdateStatusFilterSummary(_changesList.Items.Count);
+    }
+
+    private void UpdateStatusFilterSummary(int visibleCount)
+    {
+        _statusFilterSummaryLabel.Text = $"显示 {visibleCount}/{_statusChangesAll.Count}，已勾选 {_checkedStatusPaths.Count}";
     }
 
     private void UpdateStatusBadges(int changeCount, int conflictCount)
@@ -2939,9 +3076,7 @@ try {{
             return;
         }
 
-        var selectedPaths = _changesList.CheckedItems
-            .Cast<ListViewItem>()
-            .Select(item => ((SvnChange)item.Tag!).RelativePath)
+        var selectedPaths = _checkedStatusPaths
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -4246,7 +4381,7 @@ try {{
         _latestRemoteLog = null;
         _remoteStatusLabel.Text = "远端：未检查";
         _remoteStatusLabel.ForeColor = SystemColors.ControlText;
-        _changesList.Items.Clear();
+        ClearStatusChanges();
         RefreshConflictPanel([]);
         UpdateStatusBadges(0, 0);
         _historyLoadedLimit = InitialHistoryLimit;
@@ -5017,7 +5152,7 @@ try {{
         var selected = _settings.GetCurrentRepository();
         _repoUrlText.Text = selected?.RepositoryUrl ?? "";
         _workingCopyText.Text = selected?.WorkingCopyPath ?? "";
-        _changesList.Items.Clear();
+        ClearStatusChanges();
         RefreshConflictPanel([]);
         UpdateStatusBadges(0, 0);
         _historyLoadedLimit = InitialHistoryLimit;
@@ -5031,6 +5166,14 @@ try {{
         LoadAllFiles();
     }
 
+    private void ClearStatusChanges()
+    {
+        _statusChangesAll.Clear();
+        _checkedStatusPaths.Clear();
+        _changesList.Items.Clear();
+        UpdateStatusFilterSummary(0);
+    }
+
     private void SetAllChecks(bool isChecked)
     {
         foreach (ListViewItem item in _changesList.Items)
@@ -5040,6 +5183,8 @@ try {{
                 item.Checked = isChecked;
             }
         }
+
+        UpdateStatusFilterSummary(_changesList.Items.Count);
     }
 
     private void SetBusy(bool busy, string text)
@@ -7962,6 +8107,19 @@ internal static class ChangedFilesFilter
             .ToList();
     }
 
+    public static IReadOnlyList<SvnChange> ApplyStatusChanges(
+        IEnumerable<SvnChange> changes,
+        string searchText,
+        ChangedFilesFilterMode mode)
+    {
+        var keyword = (searchText ?? "").Trim();
+        return changes
+            .Where(change => MatchesStatusMode(change, mode))
+            .Where(change => string.IsNullOrWhiteSpace(keyword) || MatchesStatusText(change, keyword))
+            .OrderBy(change => change.RelativePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     private static bool MatchesMode(ChangedFileEntry file, ChangedFilesFilterMode mode)
     {
         return mode switch
@@ -7976,11 +8134,30 @@ internal static class ChangedFilesFilter
         };
     }
 
+    private static bool MatchesStatusMode(SvnChange change, ChangedFilesFilterMode mode)
+    {
+        return mode switch
+        {
+            ChangedFilesFilterMode.Xml => HasExtension(change.RelativePath, ".xml"),
+            ChangedFilesFilterMode.Lua => HasExtension(change.RelativePath, ".lua"),
+            ChangedFilesFilterMode.Conflict => change.Status == SvnStatusKind.Conflicted,
+            ChangedFilesFilterMode.Added => change.Status is SvnStatusKind.Added or SvnStatusKind.Unversioned,
+            ChangedFilesFilterMode.Deleted => change.Status is SvnStatusKind.Deleted or SvnStatusKind.Missing,
+            ChangedFilesFilterMode.Modified => change.Status is SvnStatusKind.Modified or SvnStatusKind.Replaced,
+            _ => true,
+        };
+    }
+
     private static bool HasExtension(ChangedFileEntry file, string extension)
     {
-        return Path.GetExtension(file.TreePath).Equals(extension, StringComparison.OrdinalIgnoreCase) ||
-            Path.GetExtension(file.RelativePath).Equals(extension, StringComparison.OrdinalIgnoreCase) ||
-            Path.GetExtension(file.RepositoryPath).Equals(extension, StringComparison.OrdinalIgnoreCase);
+        return HasExtension(file.TreePath, extension) ||
+            HasExtension(file.RelativePath, extension) ||
+            HasExtension(file.RepositoryPath, extension);
+    }
+
+    private static bool HasExtension(string path, string extension)
+    {
+        return Path.GetExtension(path).Equals(extension, StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool MatchesText(ChangedFileEntry file, string keyword)
@@ -7989,6 +8166,13 @@ internal static class ChangedFilesFilter
             file.TreePath.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
             file.RelativePath.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
             file.RepositoryPath.Contains(keyword, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool MatchesStatusText(SvnChange change, string keyword)
+    {
+        return change.RelativePath.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+            change.DisplayStatus.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+            change.Description.Contains(keyword, StringComparison.OrdinalIgnoreCase);
     }
 }
 
