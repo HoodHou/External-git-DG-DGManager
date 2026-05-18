@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using NPOI.SS.UserModel;
 
@@ -27,6 +28,8 @@ public partial class Form1 : Form
     private readonly Button _fileTreeExpandButton = new();
     private readonly Button _fileTreeCollapseButton = new();
     private readonly Button _fileTreeRefreshButton = new();
+    private readonly System.Windows.Forms.Timer _fileTreeLoadDebounceTimer = new();
+    private readonly System.Windows.Forms.Timer _treeExpansionSaveTimer = new();
     private readonly ListView _historyList = new();
     private readonly TextBox _historySearchText = new();
     private readonly Label _historySearchScopeLabel = new();
@@ -38,7 +41,13 @@ public partial class Form1 : Form
     private readonly TextBox _historyChangedFilesSearchText = new();
     private readonly ComboBox _historyChangedFilesFilterCombo = new();
     private readonly Panel _historyDiffPanel = new();
-    private readonly TabControl _mainTabs = new();
+    private readonly Button _historyDiffMaximizeButton = new();
+    private readonly Label _historyDiffHeaderLabel = new();
+    private readonly ImageList _historyListRowImages = new();
+    private readonly TabControl _mainTabs = new ShellTabControl();
+    private readonly FlowLayoutPanel _shellNav = new();
+    private readonly List<ShellNavButton> _shellNavButtons = [];
+    private ListViewItem? _hoveredHistoryItem;
     private readonly TabPage _configPage = new("配置");
     private readonly TabPage _statusPage = new("File Status");
     private readonly TabPage _conflictPage = new("冲突");
@@ -62,6 +71,7 @@ public partial class Form1 : Form
     private readonly ContextMenuStrip _moreActionsMenu = new();
     private readonly ImageList _treeImages = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
+    private readonly ToolStripStatusLabel _localRevisionStatusLabel = new();
     private readonly ToolStripStatusLabel _toolUpdateStatusLabel = new();
     private readonly ToolStripStatusLabel _remoteStatusLabel = new();
     private readonly System.Windows.Forms.Timer _remoteCheckTimer = new();
@@ -73,13 +83,18 @@ public partial class Form1 : Form
     private bool _updatingChangesList;
     private bool _checkingToolUpdate;
     private bool _checkingRemote;
+    private bool _historyDiffMaximized;
+    private WorkingCopyInfo _currentWorkingCopyInfo = WorkingCopyInfo.Empty;
     private SvnLogEntry? _latestRemoteLog;
     private GitUpdateStatus? _lastToolUpdateStatus;
     private string? _lastToolRepositoryRoot;
     private ReleaseUpdateStatus? _lastReleaseUpdateStatus;
     private readonly HashSet<string> _selectedFileTreePaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _styledFileTreeSelectionPaths = new(StringComparer.OrdinalIgnoreCase);
     private string? _fileTreeSelectionAnchorPath;
     private CancellationTokenSource? _fileTreeLoadCts;
+    private int _lastFileTreeFileCount;
+    private IReadOnlyDictionary<string, SvnStatusKind> _fileTreeStatusMap = new Dictionary<string, SvnStatusKind>(StringComparer.OrdinalIgnoreCase);
     private SvnLogEntry? _selectedHistoryLog;
     private List<SvnLogEntry> _selectedHistoryLogs = [];
     private List<SvnLogEntry> _historyRows = [];
@@ -96,11 +111,28 @@ public partial class Form1 : Form
     private const int HistoryDeepSearchLimit = 1000;
     private const int HistoryRevisionRangeLimit = 5000;
     private const int MaxDiffPreviewCacheEntries = 40;
+    private const int MaxFileTreeDisplayFiles = 8000;
+    private const int MaxFileTreeAutoExpandFiles = 1200;
+    private const int MaxFileTreeExpandAllFiles = 2000;
+    private const int FileTreeLoadDebounceMilliseconds = 350;
 
     public Form1()
     {
         InitializeComponent();
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.ResizeRedraw, true);
         _settings = AppSettings.Load();
+        _fileTreeLoadDebounceTimer.Interval = FileTreeLoadDebounceMilliseconds;
+        _fileTreeLoadDebounceTimer.Tick += (_, _) =>
+        {
+            _fileTreeLoadDebounceTimer.Stop();
+            LoadAllFiles();
+        };
+        _treeExpansionSaveTimer.Interval = 600;
+        _treeExpansionSaveTimer.Tick += (_, _) =>
+        {
+            _treeExpansionSaveTimer.Stop();
+            SaveTreeExpansionStateCore();
+        };
         BuildUi();
         LoadSettingsIntoUi();
         Shown += async (_, _) =>
@@ -227,6 +259,7 @@ public partial class Form1 : Form
         _changesList.GridLines = true;
         _changesList.CheckBoxes = true;
         _changesList.HideSelection = false;
+        WinFormsRendering.EnableDoubleBuffering(_changesList);
         _changesList.Columns.Add("状态", 90);
         _changesList.Columns.Add("文件", 650);
         _changesList.Columns.Add("说明", 260);
@@ -272,7 +305,27 @@ public partial class Form1 : Form
         _fileTree.ShowNodeToolTips = true;
         _fileTree.ImageList = _treeImages;
         _fileTree.TreeViewNodeSorter = new FileTreeNodeSorter();
-        _fileTree.NodeMouseDoubleClick += (_, args) => OpenTreeFile(args.Node);
+        _fileTree.BeforeExpand += (_, args) =>
+        {
+            if (args.Node != null)
+            {
+                EnsureLazyFileTreeChildren(args.Node);
+            }
+        };
+        _fileTree.NodeMouseDoubleClick += (_, args) =>
+        {
+            if (IsModernTreeArrowHit(_fileTree, args.Node, new Point(args.X, args.Y)))
+            {
+                return;
+            }
+
+            if (ToggleExpandableNode(args.Node))
+            {
+                return;
+            }
+
+            OpenTreeFile(args.Node);
+        };
         _fileTree.AfterExpand += (_, _) => SaveTreeExpansionState();
         _fileTree.AfterCollapse += (_, _) => SaveTreeExpansionState();
         _fileTree.NodeMouseClick += (_, args) =>
@@ -346,17 +399,46 @@ public partial class Form1 : Form
         _historyList.Dock = DockStyle.Fill;
         _historyList.View = View.Details;
         _historyList.FullRowSelect = true;
-        _historyList.GridLines = true;
+        _historyList.GridLines = false;
         _historyList.HideSelection = false;
+        _historyList.BorderStyle = System.Windows.Forms.BorderStyle.None;
         _historyList.BackColor = Color.White;
+        _historyList.OwnerDraw = true;
+        WinFormsRendering.EnableDoubleBuffering(_historyList);
+        _historyList.HeaderStyle = ColumnHeaderStyle.None;
+        _historyListRowImages.ColorDepth = ColorDepth.Depth32Bit;
+        _historyListRowImages.ImageSize = new Size(1, 58);
+        _historyListRowImages.Images.Add("row-height", new Bitmap(1, 58));
+        _historyList.SmallImageList = _historyListRowImages;
         _historyList.Columns.Add("Graph", 70);
         _historyList.Columns.Add("Description", 760);
         _historyList.Columns.Add("Date", 150);
         _historyList.Columns.Add("Author", 130);
         _historyList.Columns.Add("Commit", 90);
+        _historyList.DrawColumnHeader += (_, args) => args.DrawDefault = false;
+        _historyList.DrawSubItem += DrawHistoryListSubItem;
         _historyList.SelectedIndexChanged += (_, _) => ShowSelectedHistoryDetail();
         _historyList.DoubleClick += (_, _) => FocusFirstChangedFileInSelectedHistory();
         _historyList.MouseDown += (_, args) => SelectHistoryItemForContextMenu(args);
+        _historyList.MouseMove += (_, args) =>
+        {
+            var previous = _hoveredHistoryItem;
+            var item = _historyList.GetItemAt(args.X, args.Y);
+            if (!ReferenceEquals(item, _hoveredHistoryItem))
+            {
+                _hoveredHistoryItem = item;
+                WinFormsRendering.InvalidateListViewItems(_historyList, previous, item);
+            }
+        };
+        _historyList.MouseLeave += (_, _) =>
+        {
+            if (_hoveredHistoryItem != null)
+            {
+                var previous = _hoveredHistoryItem;
+                _hoveredHistoryItem = null;
+                WinFormsRendering.InvalidateListViewItems(_historyList, previous, null);
+            }
+        };
         BuildHistoryListMenu();
         _historyList.ContextMenuStrip = _historyListMenu;
         historyListPanel.Controls.Add(_historyList, 0, 1);
@@ -376,7 +458,20 @@ public partial class Form1 : Form
                 _historyChangedFilesTree.SelectedNode = args.Node;
             }
         };
-        _historyChangedFilesTree.NodeMouseDoubleClick += async (_, args) => await OpenHistoryChangedFileAsync(args.Node);
+        _historyChangedFilesTree.NodeMouseDoubleClick += async (_, args) =>
+        {
+            if (IsModernTreeArrowHit(_historyChangedFilesTree, args.Node, new Point(args.X, args.Y)))
+            {
+                return;
+            }
+
+            if (ToggleExpandableNode(args.Node))
+            {
+                return;
+            }
+
+            await OpenHistoryChangedFileAsync(args.Node);
+        };
         _historyChangedFilesTree.AfterSelect += async (_, args) => await ShowSelectedHistoryFileDiffAsync(args.Node);
         BuildHistoryChangedFilesMenu();
         _historyChangedFilesTree.ContextMenuStrip = _historyChangedFilesMenu;
@@ -395,12 +490,16 @@ public partial class Form1 : Form
         _historyDetailText.ScrollBars = ScrollBars.Both;
         _historyDetailText.WordWrap = false;
         _historyDiffPanel.Controls.Add(_historyDetailText);
-        _changedFilesSplit.Panel2.Controls.Add(CreateTitledPanel("Diff preview", _historyDiffPanel));
+        _changedFilesSplit.Panel2.Controls.Add(CreateHistoryDiffPreviewPanel());
         _historySplit.Panel2.Controls.Add(_changedFilesSplit);
         _historyPage.Controls.Add(_historySplit);
         _mainTabs.TabPages.Add(_historyPage);
-        _mainTabs.SelectedIndexChanged += async (_, _) => await LoadCurrentTabAsync();
-        _workspaceSplit.Panel2.Controls.Add(_mainTabs);
+        _mainTabs.SelectedIndexChanged += async (_, _) =>
+        {
+            UpdateShellNavigationSelection();
+            await LoadCurrentTabAsync();
+        };
+        _workspaceSplit.Panel2.Controls.Add(CreateShellHost());
 
         _outputText.Dock = DockStyle.Fill;
         _outputText.Multiline = true;
@@ -413,6 +512,10 @@ public partial class Form1 : Form
         var statusStrip = new StatusStrip();
         statusStrip.Items.Add(_statusLabel);
         statusStrip.Items.Add(new ToolStripStatusLabel { Spring = true });
+        _localRevisionStatusLabel.Text = "本地：未检查";
+        _localRevisionStatusLabel.IsLink = true;
+        _localRevisionStatusLabel.Click += (_, _) => RefreshWorkingCopyRevisionStatus(showFailure: true);
+        statusStrip.Items.Add(_localRevisionStatusLabel);
         _toolUpdateStatusLabel.Text = "工具：未检查";
         _toolUpdateStatusLabel.IsLink = true;
         _toolUpdateStatusLabel.Click += async (_, _) => await ShowToolUpdatePanelAsync();
@@ -489,6 +592,68 @@ public partial class Form1 : Form
         return root;
     }
 
+    private Control CreateShellHost()
+    {
+        var host = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            BackColor = Color.FromArgb(245, 247, 250),
+        };
+        host.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
+        host.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        _shellNav.Dock = DockStyle.Fill;
+        _shellNav.FlowDirection = FlowDirection.TopDown;
+        _shellNav.WrapContents = false;
+        _shellNav.Padding = new Padding(8, 10, 8, 8);
+        _shellNav.BackColor = Color.FromArgb(24, 31, 42);
+        _shellNavButtons.Clear();
+        _shellNav.Controls.Clear();
+
+        AddShellNavButton("配置", "CFG", "配置");
+        AddShellNavButton("改动", "STS", "File Status");
+        AddShellNavButton("冲突", "CNF", "冲突");
+        AddShellNavButton("文件", "ALL", "全部文件");
+        AddShellNavButton("历史", "HIS", "History");
+        UpdateShellNavigationSelection();
+
+        _mainTabs.Dock = DockStyle.Fill;
+        _mainTabs.Appearance = TabAppearance.FlatButtons;
+        _mainTabs.ItemSize = new Size(0, 1);
+        _mainTabs.SizeMode = TabSizeMode.Fixed;
+
+        host.Controls.Add(_shellNav, 0, 0);
+        host.Controls.Add(_mainTabs, 1, 0);
+        return host;
+    }
+
+    private void AddShellNavButton(string title, string glyph, string tabText)
+    {
+        var button = new ShellNavButton
+        {
+            Title = title,
+            Glyph = glyph,
+            TabText = tabText,
+            Width = 96,
+            Height = 58,
+            Margin = new Padding(0, 0, 0, 8),
+        };
+        button.Click += (_, _) => SelectTab(tabText);
+        _shellNavButtons.Add(button);
+        _shellNav.Controls.Add(button);
+    }
+
+    private void UpdateShellNavigationSelection()
+    {
+        var current = GetBaseTabText(_mainTabs.SelectedTab?.Text ?? "");
+        foreach (var button in _shellNavButtons)
+        {
+            button.Active = string.Equals(button.TabText, current, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
     private static Button CreateActionButton(string text, Action action, int width)
     {
         var button = new Button
@@ -527,6 +692,54 @@ public partial class Form1 : Form
         return panel;
     }
 
+    private Control CreateHistoryDiffPreviewPanel()
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Color.White,
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var header = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            BackColor = Color.FromArgb(241, 243, 245),
+        };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
+        _historyDiffHeaderLabel.Text = "Diff preview";
+        _historyDiffHeaderLabel.Dock = DockStyle.Fill;
+        _historyDiffHeaderLabel.Padding = new Padding(8, 0, 0, 0);
+        _historyDiffHeaderLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _historyDiffHeaderLabel.BackColor = Color.FromArgb(241, 243, 245);
+        _historyDiffHeaderLabel.ForeColor = Color.FromArgb(55, 65, 81);
+        _historyDiffHeaderLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        header.Controls.Add(_historyDiffHeaderLabel, 0, 0);
+        _historyDiffMaximizeButton.Text = "最大化差异";
+        _historyDiffMaximizeButton.Dock = DockStyle.Fill;
+        _historyDiffMaximizeButton.Margin = new Padding(4, 2, 6, 2);
+        _historyDiffMaximizeButton.Click += (_, _) => ToggleHistoryDiffMaximized();
+        header.Controls.Add(_historyDiffMaximizeButton, 1, 0);
+
+        panel.Controls.Add(header, 0, 0);
+        panel.Controls.Add(_historyDiffPanel, 0, 1);
+        return panel;
+    }
+
+    private void ToggleHistoryDiffMaximized()
+    {
+        _historyDiffMaximized = !_historyDiffMaximized;
+        _historySplit.Panel1Collapsed = _historyDiffMaximized;
+        _changedFilesSplit.Panel1Collapsed = _historyDiffMaximized;
+        _historyDiffMaximizeButton.Text = _historyDiffMaximized ? "还原布局" : "最大化差异";
+    }
+
     private void ConfigureTreeImages()
     {
         _treeImages.ColorDepth = ColorDepth.Depth32Bit;
@@ -538,21 +751,210 @@ public partial class Form1 : Form
         _treeImages.Images.Add("xml", CreateTreeIcon(Color.FromArgb(39, 132, 85), false));
         _treeImages.Images.Add("lua", CreateTreeIcon(Color.FromArgb(72, 99, 180), false));
         _treeImages.Images.Add("changed", CreateTreeIcon(Color.FromArgb(209, 92, 56), false));
+        _treeImages.Images.Add("action-added", CreateActionTreeIcon("A", Color.FromArgb(35, 134, 83)));
+        _treeImages.Images.Add("action-modified", CreateActionTreeIcon("M", Color.FromArgb(184, 107, 25)));
+        _treeImages.Images.Add("action-deleted", CreateActionTreeIcon("D", Color.FromArgb(184, 66, 66)));
+        _treeImages.Images.Add("action-conflicted", CreateActionTreeIcon("C", Color.FromArgb(164, 62, 176)));
+        _treeImages.Images.Add("action-replaced", CreateActionTreeIcon("R", Color.FromArgb(109, 85, 184)));
+        _treeImages.Images.Add("action-unknown", CreateActionTreeIcon("?", Color.FromArgb(100, 116, 139)));
     }
 
     private static void ConfigureNavigationTree(TreeView tree)
     {
+        WinFormsRendering.EnableDoubleBuffering(tree);
         tree.HideSelection = false;
         tree.FullRowSelect = true;
         tree.ShowLines = false;
         tree.ShowRootLines = false;
-        tree.ShowPlusMinus = true;
-        tree.HotTracking = true;
-        tree.ItemHeight = 24;
+        tree.ShowPlusMinus = false;
+        tree.HotTracking = false;
+        tree.ItemHeight = 28;
         tree.BorderStyle = System.Windows.Forms.BorderStyle.None;
         tree.BackColor = Color.White;
         tree.ForeColor = Color.FromArgb(35, 43, 51);
         tree.LineColor = Color.FromArgb(226, 232, 240);
+        tree.DrawMode = TreeViewDrawMode.OwnerDrawAll;
+        tree.DrawNode -= DrawModernTreeNode;
+        tree.DrawNode += DrawModernTreeNode;
+        tree.MouseDown -= ToggleModernTreeNodeFromMouseDown;
+        tree.MouseDown += ToggleModernTreeNodeFromMouseDown;
+    }
+
+    private static void ToggleModernTreeNodeFromMouseDown(object? sender, MouseEventArgs args)
+    {
+        if (sender is not TreeView tree || args.Button != MouseButtons.Left || args.Clicks > 1)
+        {
+            return;
+        }
+
+        var node = tree.GetNodeAt(args.Location);
+        if (node == null || node.Nodes.Count == 0)
+        {
+            return;
+        }
+
+        if (!IsModernTreeArrowHit(tree, node, args.Location))
+        {
+            return;
+        }
+
+        tree.SelectedNode = node;
+        ToggleExpandableNode(node);
+    }
+
+    private static bool ToggleExpandableNode(TreeNode? node)
+    {
+        if (node == null || node.Nodes.Count == 0)
+        {
+            return false;
+        }
+
+        if (node.IsExpanded)
+        {
+            node.Collapse();
+        }
+        else
+        {
+            node.Expand();
+        }
+
+        return true;
+    }
+
+    private static bool IsModernTreeArrowHit(TreeView tree, TreeNode? node, Point location)
+    {
+        return node != null &&
+            node.Nodes.Count > 0 &&
+            GetModernTreeNodeArrowBounds(tree, node).Contains(location);
+    }
+
+    private static Rectangle GetModernTreeNodeArrowBounds(TreeView tree, TreeNode node)
+    {
+        var top = node.Bounds.Top > 0 ? node.Bounds.Top : 0;
+        return new Rectangle(8 + node.Level * 18, top + 2, 24, Math.Max(20, tree.ItemHeight - 2));
+    }
+
+    private static void DrawModernTreeNode(object? sender, DrawTreeNodeEventArgs args)
+    {
+        if (sender is not TreeView tree || args.Node == null)
+        {
+            return;
+        }
+
+        args.DrawDefault = false;
+        var graphics = args.Graphics;
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        var fullBounds = new Rectangle(4, args.Bounds.Top + 2, Math.Max(1, tree.ClientSize.Width - 8), tree.ItemHeight - 4);
+        var selected = (args.State & TreeNodeStates.Selected) == TreeNodeStates.Selected;
+        var markedSelected = args.Node.BackColor != Color.Empty && args.Node.BackColor != tree.BackColor;
+        var backgroundColor = selected
+            ? Color.FromArgb(226, 241, 255)
+            : markedSelected ? args.Node.BackColor : tree.BackColor;
+        using var backgroundBrush = new SolidBrush(backgroundColor);
+        graphics.FillRoundedRectangle(backgroundBrush, fullBounds, 7);
+
+        var x = 10 + args.Node.Level * 18;
+        var arrowRect = GetModernTreeNodeArrowBounds(tree, args.Node);
+        if (args.Node.Nodes.Count > 0)
+        {
+            using var arrowFont = new Font("Segoe UI", 7F, FontStyle.Regular);
+            TextRenderer.DrawText(
+                graphics,
+                args.Node.IsExpanded ? "▼" : "▶",
+                arrowFont,
+                arrowRect,
+                Color.FromArgb(100, 116, 139),
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
+
+        x += 18;
+        var imageKey = args.Node.IsSelected ? args.Node.SelectedImageKey : args.Node.ImageKey;
+        if (tree.ImageList != null && !string.IsNullOrWhiteSpace(imageKey) && tree.ImageList.Images.ContainsKey(imageKey))
+        {
+            var image = tree.ImageList.Images[imageKey];
+            if (image != null)
+            {
+                graphics.DrawImage(image, new Rectangle(x, args.Bounds.Top + 6, 16, 16));
+                x += 22;
+            }
+        }
+
+        var font = args.Node.NodeFont ?? tree.Font;
+        var color = selected ? Color.FromArgb(15, 76, 129) : args.Node.ForeColor == Color.Empty ? tree.ForeColor : args.Node.ForeColor;
+        var textBounds = new Rectangle(x, args.Bounds.Top + 1, Math.Max(1, tree.ClientSize.Width - x - 8), tree.ItemHeight - 2);
+        TextRenderer.DrawText(
+            graphics,
+            args.Node.Text,
+            font,
+            textBounds,
+            color,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+    }
+
+    private void DrawHistoryListSubItem(object? sender, DrawListViewSubItemEventArgs args)
+    {
+        args.DrawDefault = false;
+        if (sender is not ListView list || args.Item?.Tag is not SvnLogEntry log || args.ColumnIndex != 0)
+        {
+            return;
+        }
+
+        var graphics = args.Graphics;
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        var bounds = new Rectangle(6, args.Item.Bounds.Top + 5, Math.Max(1, list.ClientSize.Width - 12), args.Item.Bounds.Height - 8);
+        var selected = args.Item.Selected;
+        var hovered = ReferenceEquals(args.Item, _hoveredHistoryItem);
+        var cardColor = selected ? Color.FromArgb(226, 241, 255) : Color.White;
+        if (!selected && hovered)
+        {
+            cardColor = Color.FromArgb(248, 250, 252);
+        }
+
+        var borderColor = selected
+            ? Color.FromArgb(147, 197, 253)
+            : hovered ? Color.FromArgb(203, 213, 225) : Color.FromArgb(226, 232, 240);
+        using var cardBrush = new SolidBrush(cardColor);
+        using var borderPen = new Pen(borderColor);
+        using var revisionFont = new Font("Consolas", 9F, FontStyle.Bold);
+        using var authorFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        using var dateFont = new Font("Microsoft YaHei UI", 8F);
+        using var messageFont = new Font("Microsoft YaHei UI", 9F);
+        graphics.FillRoundedRectangle(cardBrush, bounds, 8);
+        graphics.DrawRoundedRectangle(borderPen, bounds, 8);
+
+        var actionColor = log.IsUncommitted
+            ? Color.FromArgb(184, 107, 25)
+            : log.IsWorkingCopyRevision ? Color.FromArgb(37, 99, 235) : Color.FromArgb(100, 116, 139);
+        using var markerBrush = new SolidBrush(actionColor);
+        graphics.FillEllipse(markerBrush, bounds.Left + 12, bounds.Top + 17, 10, 10);
+        if (log.IsWorkingCopyRevision)
+        {
+            graphics.FillRectangle(markerBrush, bounds.Left + 16, bounds.Top + 27, 2, 12);
+        }
+
+        var revision = log.IsUncommitted ? "LOCAL" : $"r{log.Revision}";
+        var revisionBounds = new Rectangle(bounds.Left + 34, bounds.Top + 8, 92, 18);
+        TextRenderer.DrawText(graphics, revision, revisionFont, revisionBounds, actionColor, TextFormatFlags.Left | TextFormatFlags.NoPadding);
+
+        var authorBounds = new Rectangle(bounds.Left + 130, bounds.Top + 8, 130, 18);
+        TextRenderer.DrawText(graphics, log.Author, authorFont, authorBounds, Color.FromArgb(31, 41, 55), TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+
+        var dateBounds = new Rectangle(bounds.Right - 150, bounds.Top + 8, 134, 18);
+        TextRenderer.DrawText(graphics, log.LocalDateText, dateFont, dateBounds, Color.FromArgb(100, 116, 139), TextFormatFlags.Right | TextFormatFlags.NoPadding);
+
+        if (log.ChangedFiles.Count > 0)
+        {
+            var countText = $"{log.ChangedFiles.Count} files";
+            var countBounds = new Rectangle(bounds.Right - 84, bounds.Top + 29, 68, 18);
+            using var countBrush = new SolidBrush(Color.FromArgb(241, 245, 249));
+            using var countPen = new Pen(Color.FromArgb(203, 213, 225));
+            graphics.FillRoundedRectangle(countBrush, countBounds, 5);
+            graphics.DrawRoundedRectangle(countPen, countBounds, 5);
+            TextRenderer.DrawText(graphics, countText, dateFont, countBounds, Color.FromArgb(71, 85, 105), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
+
+        var messageBounds = new Rectangle(bounds.Left + 34, bounds.Top + 28, Math.Max(1, bounds.Width - 128), 20);
+        TextRenderer.DrawText(graphics, log.DescriptionText, messageFont, messageBounds, Color.FromArgb(51, 65, 85), TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
     }
 
     private static Bitmap CreateTreeIcon(Color color, bool folder)
@@ -579,6 +981,21 @@ public partial class Form1 : Form
         return bitmap;
     }
 
+    private static Bitmap CreateActionTreeIcon(string text, Color color)
+    {
+        var bitmap = new Bitmap(16, 16);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.Clear(Color.Transparent);
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using var brush = new SolidBrush(color);
+        using var font = new Font("Segoe UI", 8F, FontStyle.Bold, GraphicsUnit.Pixel);
+        using var textBrush = new SolidBrush(Color.White);
+        graphics.FillRectangle(brush, 1, 2, 14, 12);
+        var size = graphics.MeasureString(text, font);
+        graphics.DrawString(text, font, textBrush, (16 - size.Width) / 2F, (16 - size.Height) / 2F - 0.5F);
+        return bitmap;
+    }
+
     private void BuildMoreActionsMenu()
     {
         _moreActionsMenu.Items.Clear();
@@ -588,6 +1005,8 @@ public partial class Form1 : Form
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("查看改动", null, async (_, _) => await RefreshStatusAsync());
         _moreActionsMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
+        _moreActionsMenu.Items.Add("内置表格三方合并", null, async (_, _) => await RunInternalSpreadsheetMergeAsync());
+        _moreActionsMenu.Items.Add("跨库表格三方合并", null, async (_, _) => await RunCrossRepositorySpreadsheetMergeAsync());
         _moreActionsMenu.Items.Add("外部对比/合并", null, async (_, _) => await RunExternalCompareOrMergeAsync());
         _moreActionsMenu.Items.Add("冲突处理", null, async (_, _) => await RunConflictWorkflowAsync());
         _moreActionsMenu.Items.Add("文件历史", null, async (_, _) => await RunFileHistoryAsync());
@@ -596,8 +1015,31 @@ public partial class Form1 : Form
         _moreActionsMenu.Items.Add("查看忽略清单", null, async (_, _) => await ShowIgnoreListAsync());
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("全部文件：刷新", null, (_, _) => LoadAllFiles());
+        AddFavoritePathsMenuItems(_moreActionsMenu.Items);
+        _moreActionsMenu.Items.Add(new ToolStripSeparator());
+        _moreActionsMenu.Items.Add(_settings.UiLayout.LayoutLocked ? "解锁当前布局" : "锁定当前布局", null, (_, _) => ToggleLayoutLock());
+        _moreActionsMenu.Items.Add("重置界面布局", null, (_, _) => ResetUiLayout());
         _moreActionsMenu.Items.Add("检查工具更新", null, async (_, _) => await ShowToolUpdatePanelAsync());
+        _moreActionsMenu.Items.Add("最近操作时间线", null, (_, _) => ShowRecentOperations());
         _moreActionsMenu.Items.Add("打开操作日志", null, (_, _) => OpenOperationLog());
+    }
+
+    private void AddFavoritePathsMenuItems(ToolStripItemCollection items)
+    {
+        var favoritesMenu = new ToolStripMenuItem("常用目录");
+        if (_settings.FavoriteFileTreePaths.Count == 0)
+        {
+            favoritesMenu.DropDownItems.Add("暂无收藏", null, (_, _) => { }).Enabled = false;
+        }
+        else
+        {
+            foreach (var path in _settings.FavoriteFileTreePaths.OrderBy(path => path, StringComparer.CurrentCultureIgnoreCase))
+            {
+                favoritesMenu.DropDownItems.Add(path, null, async (_, _) => await NavigateToFavoriteFileTreePathAsync(path));
+            }
+        }
+
+        items.Add(favoritesMenu);
     }
 
     private void ShowSettingsDialog()
@@ -810,6 +1252,40 @@ public partial class Form1 : Form
         Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true });
     }
 
+    private void ShowRecentOperations()
+    {
+        try
+        {
+            var logPath = OperationLogger.EnsureLogFile();
+            var lines = File.Exists(logPath)
+                ? File.ReadLines(logPath).Reverse().Take(160).Reverse().ToList()
+                : [];
+            using var form = new Form
+            {
+                Text = "最近操作时间线",
+                StartPosition = FormStartPosition.CenterParent,
+                Size = new Size(980, 620),
+                MinimumSize = new Size(760, 420),
+                Font = new Font("Microsoft YaHei UI", 9F),
+            };
+            form.Controls.Add(new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                Font = new Font("Consolas", 9F),
+                Text = lines.Count == 0 ? "暂无操作记录。" : string.Join(Environment.NewLine, lines),
+            });
+            form.ShowDialog(this);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+    }
+
     private Control CreateStatusPanel()
     {
         var root = new TableLayoutPanel
@@ -908,6 +1384,9 @@ public partial class Form1 : Form
     {
         _changesListMenu.Items.Clear();
         _changesListMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
+        _changesListMenu.Items.Add("和另一个表快速比对...", null, async (_, _) => await CompareSelectedTableWithAnotherAsync());
+        _changesListMenu.Items.Add("内置表格三方合并", null, async (_, _) => await RunInternalSpreadsheetMergeAsync());
+        _changesListMenu.Items.Add("跨库表格三方合并", null, async (_, _) => await RunCrossRepositorySpreadsheetMergeAsync());
         _changesListMenu.Items.Add("打开文件", null, (_, _) => OpenSelectedStatusFile());
         _changesListMenu.Items.Add("打开所在目录", null, (_, _) => OpenSelectedStatusFileFolder());
         _changesListMenu.Items.Add(new ToolStripSeparator());
@@ -1000,19 +1479,19 @@ public partial class Form1 : Form
         _fileTreeSearchText.Dock = DockStyle.Fill;
         _fileTreeSearchText.PlaceholderText = "搜索文件名 / 路径";
         _fileTreeSearchText.Margin = new Padding(0, 3, 8, 3);
-        _fileTreeSearchText.TextChanged += (_, _) => LoadAllFiles();
+        _fileTreeSearchText.TextChanged += (_, _) => ScheduleFileTreeLoad();
         toolbar.Controls.Add(_fileTreeSearchText, 0, 0);
 
         _fileTreeChangedOnlyCheck.Text = "仅改动";
         _fileTreeChangedOnlyCheck.Dock = DockStyle.Fill;
         _fileTreeChangedOnlyCheck.TextAlign = ContentAlignment.MiddleCenter;
-        _fileTreeChangedOnlyCheck.CheckedChanged += (_, _) => LoadAllFiles();
+        _fileTreeChangedOnlyCheck.CheckedChanged += (_, _) => ScheduleFileTreeLoad();
         toolbar.Controls.Add(_fileTreeChangedOnlyCheck, 1, 0);
 
         _fileTreeExpandButton.Text = "展开";
         _fileTreeExpandButton.Dock = DockStyle.Fill;
         _fileTreeExpandButton.Margin = new Padding(0, 3, 6, 3);
-        _fileTreeExpandButton.Click += (_, _) => _fileTree.ExpandAll();
+        _fileTreeExpandButton.Click += (_, _) => ExpandFileTreeSafely();
         toolbar.Controls.Add(_fileTreeExpandButton, 2, 0);
 
         _fileTreeCollapseButton.Text = "折叠";
@@ -1024,7 +1503,16 @@ public partial class Form1 : Form
         _fileTreeRefreshButton.Text = "刷新";
         _fileTreeRefreshButton.Dock = DockStyle.Fill;
         _fileTreeRefreshButton.Margin = new Padding(0, 3, 6, 3);
-        _fileTreeRefreshButton.Click += (_, _) => LoadAllFiles();
+        _fileTreeRefreshButton.Click += (_, _) =>
+        {
+            if (_fileTreeLoadCts != null)
+            {
+                CancelFileTreeLoad();
+                return;
+            }
+
+            LoadAllFiles();
+        };
         toolbar.Controls.Add(_fileTreeRefreshButton, 4, 0);
 
         root.Controls.Add(toolbar, 0, 0);
@@ -1182,7 +1670,8 @@ public partial class Form1 : Form
         _conflictGrid.CellContentClick += async (_, args) => await HandleConflictGridClickAsync(args);
         _conflictGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "冲突文件", DataPropertyName = nameof(ConflictGridRow.RelativePath), Width = 620 });
         _conflictGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "说明", DataPropertyName = nameof(ConflictGridRow.Description), Width = 220 });
-        _conflictGrid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "打开合并", Name = "OpenMerge", Text = "打开合并", UseColumnTextForButtonValue = true, Width = 110 });
+        _conflictGrid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "内置合并", Name = "InternalMerge", Text = "内置合并", UseColumnTextForButtonValue = true, Width = 110 });
+        _conflictGrid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "外部合并", Name = "OpenMerge", Text = "外部合并", UseColumnTextForButtonValue = true, Width = 110 });
         _conflictGrid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "打开目录", Name = "OpenFolder", Text = "打开目录", UseColumnTextForButtonValue = true, Width = 110 });
         _conflictGrid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "标记解决", Name = "Resolve", Text = "标记解决", UseColumnTextForButtonValue = true, Width = 110 });
         root.Controls.Add(_conflictGrid, 0, 2);
@@ -1236,6 +1725,11 @@ public partial class Form1 : Form
 
     private void SaveUiLayout()
     {
+        if (_settings.UiLayout.LayoutLocked)
+        {
+            return;
+        }
+
         var bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
         _settings.UiLayout.WindowX = bounds.X;
         _settings.UiLayout.WindowY = bounds.Y;
@@ -1249,9 +1743,50 @@ public partial class Form1 : Form
         _settings.Save();
     }
 
-    private static void SafeSetSplitterDistance(SplitContainer split, int distance)
+    private void ToggleLayoutLock()
     {
-        if (distance <= 0 || split.Width <= 0 || split.Height <= 0)
+        _settings.UiLayout.LayoutLocked = !_settings.UiLayout.LayoutLocked;
+        if (!_settings.UiLayout.LayoutLocked)
+        {
+            SaveUiLayout();
+        }
+        else
+        {
+            _settings.Save();
+        }
+
+        BuildMoreActionsMenu();
+        WriteOutput(_settings.UiLayout.LayoutLocked ? "已锁定当前界面布局。" : "已解锁界面布局。");
+    }
+
+    private void ResetUiLayout()
+    {
+        var result = MessageBox.Show(
+            this,
+            "确认重置窗口大小、分栏位置和当前页签？",
+            "重置界面布局",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Question);
+        if (result != DialogResult.OK)
+        {
+            return;
+        }
+
+        _settings.UiLayout = new UiLayoutSettings();
+        _settings.Save();
+        WindowState = FormWindowState.Normal;
+        Size = new Size(1280, 820);
+        StartPosition = FormStartPosition.CenterScreen;
+        SafeSetSplitterDistance(_workspaceSplit, 170);
+        SafeSetSplitterDistance(_historySplit, 240);
+        SafeSetSplitterDistance(_changedFilesSplit, 430);
+        SelectTab("History");
+        WriteOutput("界面布局已重置。");
+    }
+
+    internal static void SafeSetSplitterDistance(SplitContainer split, int distance)
+    {
+        if (split.IsDisposed || distance <= 0 || split.Width <= 0 || split.Height <= 0)
         {
             return;
         }
@@ -1264,7 +1799,33 @@ public partial class Form1 : Form
             return;
         }
 
-        split.SplitterDistance = Math.Max(min, Math.Min(distance, max));
+        try
+        {
+            split.SplitterDistance = Math.Max(min, Math.Min(distance, max));
+        }
+        catch (InvalidOperationException)
+        {
+            // WinForms can reject splitter updates during transient layout states.
+        }
+    }
+
+    internal static void BindSafeSplitterDistance(SplitContainer split, int distance)
+    {
+        split.HandleCreated += (_, _) =>
+        {
+            if (!split.IsDisposed)
+            {
+                try
+                {
+                    split.BeginInvoke(new Action(() => SafeSetSplitterDistance(split, distance)));
+                }
+                catch (InvalidOperationException)
+                {
+                    SafeSetSplitterDistance(split, distance);
+                }
+            }
+        };
+        split.SizeChanged += (_, _) => SafeSetSplitterDistance(split, distance);
     }
 
     private static bool IsVisibleOnAnyScreen(Rectangle bounds)
@@ -2292,6 +2853,71 @@ try {{
         return "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
     }
 
+    private WorkingCopyInfo RefreshWorkingCopyRevisionStatus(bool showFailure = false)
+    {
+        var workingCopy = _workingCopyText.Text.Trim();
+        if (string.IsNullOrWhiteSpace(workingCopy))
+        {
+            SetWorkingCopyRevisionStatus(WorkingCopyInfo.Empty, "本地：未选择", SystemColors.ControlText, "未选择工作副本。");
+            return WorkingCopyInfo.Empty;
+        }
+
+        if (!Directory.Exists(workingCopy))
+        {
+            SetWorkingCopyRevisionStatus(WorkingCopyInfo.Empty, "本地：目录不存在", Color.FromArgb(166, 103, 34), workingCopy);
+            return WorkingCopyInfo.Empty;
+        }
+
+        if (!Directory.Exists(Path.Combine(workingCopy, ".svn")))
+        {
+            SetWorkingCopyRevisionStatus(WorkingCopyInfo.Empty, "本地：非 SVN", Color.FromArgb(166, 103, 34), workingCopy);
+            return WorkingCopyInfo.Empty;
+        }
+
+        try
+        {
+            var info = _svn.GetWorkingCopyInfo(workingCopy);
+            if (info == WorkingCopyInfo.Empty)
+            {
+                SetWorkingCopyRevisionStatus(WorkingCopyInfo.Empty, "本地：未知", Color.FromArgb(166, 103, 34), "svn info 没有返回可用版本信息。");
+                return WorkingCopyInfo.Empty;
+            }
+
+            var text = info.IsMixedRevision
+                ? $"本地 {info.DisplayRevisionText}"
+                : $"本地 r{info.CurrentContentRevision}";
+            var color = info.IsMixedRevision
+                ? Color.FromArgb(166, 103, 34)
+                : Color.FromArgb(45, 100, 65);
+            var detail = $"工作副本版本：{info.DisplayRevisionText}{Environment.NewLine}当前内容版本：r{info.CurrentContentRevision}{Environment.NewLine}{info.Url}";
+            SetWorkingCopyRevisionStatus(info, text, color, detail);
+            if (showFailure)
+            {
+                WriteOutput(detail.Replace(Environment.NewLine, "  ", StringComparison.Ordinal));
+            }
+
+            return info;
+        }
+        catch (Exception ex)
+        {
+            SetWorkingCopyRevisionStatus(WorkingCopyInfo.Empty, "本地：读取失败", Color.FromArgb(166, 103, 34), ex.Message);
+            if (showFailure)
+            {
+                WriteOutput("本地工作副本版本读取失败：" + ex.Message);
+            }
+
+            return WorkingCopyInfo.Empty;
+        }
+    }
+
+    private void SetWorkingCopyRevisionStatus(WorkingCopyInfo info, string text, Color color, string toolTip)
+    {
+        _currentWorkingCopyInfo = info;
+        _localRevisionStatusLabel.Text = text;
+        _localRevisionStatusLabel.ForeColor = color;
+        _localRevisionStatusLabel.ToolTipText = toolTip;
+    }
+
     private async Task CheckRemoteChangesAsync(bool showUpToDateMessage)
     {
         if (_checkingRemote || !ValidateWorkingCopyPathForBackground())
@@ -2303,6 +2929,7 @@ try {{
         try
         {
             var workingCopy = _workingCopyText.Text.Trim();
+            var info = RefreshWorkingCopyRevisionStatus();
             var latest = await _svn.GetLatestRepositoryLogAsync(workingCopy);
             if (latest == null)
             {
@@ -2311,8 +2938,21 @@ try {{
                 return;
             }
 
-            var info = _svn.GetWorkingCopyInfo(workingCopy);
-            var hasRemoteUpdates = info.MaxRevision > 0 && latest.Revision > info.MaxRevision;
+            var localRevision = info.CurrentContentRevision;
+            if (localRevision <= 0)
+            {
+                _remoteStatusLabel.Text = $"远端 r{latest.Revision}，本地未知";
+                _remoteStatusLabel.ForeColor = Color.FromArgb(166, 103, 34);
+                if (showUpToDateMessage)
+                {
+                    WriteOutput($"已读取远端最新 r{latest.Revision}，但本地工作副本版本未知，暂时无法判断是否落后。");
+                }
+
+                _latestRemoteLog = latest;
+                return;
+            }
+
+            var hasRemoteUpdates = localRevision > 0 && latest.Revision > localRevision;
             if (hasRemoteUpdates)
             {
                 _remoteStatusLabel.Text = $"远端有新提交 r{latest.Revision}";
@@ -2367,6 +3007,9 @@ try {{
             var columnName = _conflictGrid.Columns[args.ColumnIndex].Name;
         switch (columnName)
         {
+            case "InternalMerge":
+                await RunInternalSpreadsheetMergeAsync(row.RelativePath);
+                break;
             case "OpenMerge":
                 OpenConflictMerge(row.RelativePath);
                 break;
@@ -2431,6 +3074,653 @@ try {{
         {
             TryDelete(tempBaseFile);
             SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task CompareSelectedFileWithRemoteHeadAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var relativePath = GetSelectedRelativePath();
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个本地文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        await CompareLocalFileWithRemoteHeadAsync(relativePath);
+    }
+
+    private async Task CompareSelectedHistoryFileWithRemoteHeadAsync()
+    {
+        if (!ValidateWorkingCopyPath() || _historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file)
+        {
+            return;
+        }
+
+        await CompareLocalFileWithRemoteHeadAsync(GetHistoryChangedWorkingCopyRelativePath(file));
+    }
+
+    private async Task CompareLocalFileWithRemoteHeadAsync(string relativePath)
+    {
+        var workingCopy = _workingCopyText.Text.Trim();
+        var localFile = Path.Combine(workingCopy, relativePath);
+        if (!File.Exists(localFile))
+        {
+            MessageBox.Show("本地文件不存在，无法和远端 HEAD 对比。", "无法对比", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var tempHeadFile = Path.Combine(Path.GetTempPath(), $"SVNManager_HEAD_{Guid.NewGuid():N}{GetComparableExtension(relativePath)}");
+        SetBusy(true, "正在读取远端 HEAD 文件...");
+        try
+        {
+            await _svn.WriteHeadFileAsync(workingCopy, relativePath, tempHeadFile);
+            ShowDiffWindow($"当前本地 -> 远端 HEAD：{relativePath}", localFile, tempHeadFile);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            TryDelete(tempHeadFile);
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task CompareSelectedTableWithAnotherAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var relativePath = GetSelectedRelativePath();
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个表格文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var firstFile = Path.Combine(_workingCopyText.Text.Trim(), relativePath);
+        if (!File.Exists(firstFile))
+        {
+            MessageBox.Show("选中的本地文件不存在，无法快速比对。", "无法比对", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!SpreadsheetThreeWayMergeService.IsSupportedPath(firstFile))
+        {
+            MessageBox.Show("快速表格比对只支持 .xls / .xlsx / .xlsm / SpreadsheetML XML。", "文件类型不适合", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var secondFile = PromptSpreadsheetFile("选择要比对的另一个表", firstFile);
+        if (string.IsNullOrWhiteSpace(secondFile))
+        {
+            return;
+        }
+
+        ShowDiffWindow($"快速表格比对：{Path.GetFileName(firstFile)} -> {Path.GetFileName(secondFile)}", firstFile, secondFile);
+        await Task.CompletedTask;
+    }
+
+    private async Task CompareSelectedHistoryFileWithAnotherTableAsync()
+    {
+        if (!ValidateWorkingCopyPath() || _historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file)
+        {
+            return;
+        }
+
+        var otherFile = PromptSpreadsheetFile("选择要比对的另一个表", GetHistoryChangedLocalPath(file));
+        if (string.IsNullOrWhiteSpace(otherFile))
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var tempVersionFile = "";
+        SetBusy(true, "正在准备历史表格版本...");
+        try
+        {
+            string firstFile;
+            string firstLabel;
+            if (_selectedHistoryLog is { IsUncommitted: false, Revision: > 0 } log)
+            {
+                if (string.IsNullOrWhiteSpace(file.RepositoryPath))
+                {
+                    MessageBox.Show("这条历史记录没有仓库路径，无法读取提交版本。", "无法比对", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                var revision = file.Action == "D" ? log.Revision - 1 : log.Revision;
+                if (revision <= 0)
+                {
+                    MessageBox.Show("无法确定这个文件可比对的历史版本。", "无法比对", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                tempVersionFile = CreateHistoryOpenTempPath($"r{revision}", file.TreePath);
+                await _svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision, tempVersionFile);
+                firstFile = tempVersionFile;
+                firstLabel = $"r{revision} {file.TreePath}";
+            }
+            else
+            {
+                firstFile = GetHistoryChangedLocalPath(file);
+                firstLabel = $"当前本地 {file.TreePath}";
+            }
+
+            if (!File.Exists(firstFile) || !SpreadsheetThreeWayMergeService.IsSupportedPath(firstFile))
+            {
+                MessageBox.Show("选中的历史文件不是可读取的表格文件。", "文件类型不适合", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            ShowDiffWindow($"快速表格比对：{firstLabel} -> {Path.GetFileName(otherFile)}", firstFile, otherFile);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            TryDelete(tempVersionFile);
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task RunInternalSpreadsheetMergeAsync(string? forcedRelativePath = null)
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var relativePath = string.IsNullOrWhiteSpace(forcedRelativePath)
+            ? GetSelectedRelativePath()
+            : SvnConflictArtifact.NormalizeToBasePath(forcedRelativePath);
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个 XML / Excel 表格文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var localFile = Path.Combine(workingCopy, relativePath);
+        if (!File.Exists(localFile))
+        {
+            MessageBox.Show("本地文件不存在，无法执行内置三方合并。", "无法合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!SpreadsheetThreeWayMergeService.IsSupportedPath(localFile))
+        {
+            MessageBox.Show("内置三方合并当前支持 .xls / .xlsx / .xlsm / SpreadsheetML XML 表格。", "文件类型不适合", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var selectedChange = GetSelectedChange();
+        if (selectedChange?.Status is SvnStatusKind.Unversioned or SvnStatusKind.Added)
+        {
+            MessageBox.Show("这是新增文件，没有 SVN BASE 版本可做三方合并。", "无法合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (selectedChange?.Status is SvnStatusKind.Missing or SvnStatusKind.Deleted)
+        {
+            MessageBox.Show("本地文件不存在或已删除，无法执行表格合并。", "无法合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var extension = GetComparableExtension(relativePath);
+        var tempBaseFile = Path.Combine(Path.GetTempPath(), $"SVNManager_MERGE_BASE_{Guid.NewGuid():N}{extension}");
+        var tempRemoteFile = Path.Combine(Path.GetTempPath(), $"SVNManager_MERGE_HEAD_{Guid.NewGuid():N}{extension}");
+        var wasConflict = selectedChange?.Status == SvnStatusKind.Conflicted || ConflictFileSet.Find(workingCopy, relativePath) != null;
+
+        SetBusy(true, "正在准备内置表格三方合并...");
+        try
+        {
+            await _svn.WriteBaseFileAsync(workingCopy, relativePath, tempBaseFile);
+            await _svn.WriteHeadFileAsync(workingCopy, relativePath, tempRemoteFile);
+            var plan = await Task.Run(() => SpreadsheetThreeWayMergeService.BuildPlan(tempBaseFile, localFile, tempRemoteFile));
+            if (plan.RelevantChangeCount == 0)
+            {
+                MessageBox.Show("BASE、本地和远端 HEAD 没有需要合并的表格差异。", "无需合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            SetBusy(false, "等待确认合并项目");
+            using (var form = new SpreadsheetMergeConflictForm(
+                relativePath,
+                plan,
+                "内置表格三方合并 - 合并项目预览",
+                "本地",
+                "远端 HEAD",
+                "写入工作副本"))
+            {
+                if (form.ShowDialog(this) != DialogResult.OK)
+                {
+                    WriteOutput($"已取消内置三方合并：{relativePath}");
+                    return;
+                }
+            }
+
+            SetBusy(true, "正在写入合并结果...");
+            var writes = plan.BuildWrites();
+            if (writes.Count == 0)
+            {
+                MessageBox.Show("当前选择全部保留本地，没有需要写入工作副本的远端表格改动。", "无需写入", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                await OfferResolveAfterInternalMergeAsync(relativePath, wasConflict);
+                return;
+            }
+
+            var backupPath = SpreadsheetThreeWayMergeService.CreateBackup(localFile);
+            await Task.Run(() => SpreadsheetThreeWayMergeService.ApplyWrites(localFile, writes));
+            OperationLogger.Log("InternalSpreadsheetMergeSuccess", workingCopy, $"{relativePath}; writes={writes.Count}; backup={backupPath}");
+            WriteOutput($"内置三方合并已写入 {writes.Count} 个单元格：{relativePath}\r\n备份：{backupPath}");
+            await OfferResolveAfterInternalMergeAsync(relativePath, wasConflict);
+            await RefreshStatusAsync();
+            LoadAllFiles();
+            await LoadRepositoryHistoryAsync();
+        }
+        catch (Exception ex)
+        {
+            OperationLogger.Log("InternalSpreadsheetMergeFailed", workingCopy, $"{relativePath}; {ex.Message}");
+            ShowError(ex);
+        }
+        finally
+        {
+            TryDelete(tempBaseFile);
+            TryDelete(tempRemoteFile);
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task RunCrossRepositorySpreadsheetMergeAsync()
+    {
+        var defaultTargetFile = "";
+        if (ValidateWorkingCopyPathForBackground())
+        {
+            var relativePath = GetSelectedRelativePath();
+            if (!string.IsNullOrWhiteSpace(relativePath))
+            {
+                var candidate = Path.Combine(_workingCopyText.Text.Trim(), relativePath);
+                if (File.Exists(candidate))
+                {
+                    defaultTargetFile = candidate;
+                }
+            }
+        }
+
+        using var picker = new CrossRepositorySpreadsheetMergeForm(defaultTargetFile);
+        if (picker.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var baseFile = picker.BaseFilePath;
+        var changedFile = picker.ChangedFilePath;
+        var targetFile = picker.TargetFilePath;
+        var displayName = Path.GetFileName(targetFile);
+
+        SetBusy(true, "正在计算跨库表格三方合并...");
+        try
+        {
+            var plan = await Task.Run(() => SpreadsheetThreeWayMergeService.BuildPlan(baseFile, targetFile, changedFile));
+            if (plan.RelevantChangeCount == 0)
+            {
+                MessageBox.Show(
+                    "A、B、C 三个文件没有需要合并的表格差异。",
+                    "无需合并",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            SetBusy(false, "等待确认跨库合并项目");
+            using (var conflictForm = new SpreadsheetMergeConflictForm(
+                displayName,
+                plan,
+                "跨库表格三方合并 - 合并项目预览",
+                "目标 C",
+                "B 改动后",
+                "写入目标 C"))
+            {
+                if (conflictForm.ShowDialog(this) != DialogResult.OK)
+                {
+                    WriteOutput($"已取消跨库表格三方合并：{targetFile}");
+                    return;
+                }
+            }
+
+            SetBusy(true, "正在写入跨库合并结果...");
+            var writes = plan.BuildWrites();
+            if (writes.Count == 0)
+            {
+                MessageBox.Show(
+                    "当前选择全部保留目标 C，没有需要写入的 A->B 改动。",
+                    "无需写入",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var backupPath = SpreadsheetThreeWayMergeService.CreateBackup(targetFile);
+            await Task.Run(() => SpreadsheetThreeWayMergeService.ApplyWrites(targetFile, writes));
+            OperationLogger.Log("CrossRepositorySpreadsheetMergeSuccess", _workingCopyText.Text.Trim(), $"{targetFile}; writes={writes.Count}; backup={backupPath}");
+            WriteOutput(
+                $"跨库表格三方合并已写入 {writes.Count} 个单元格到目标 C：{targetFile}\r\n" +
+                $"A 改动前：{baseFile}\r\n" +
+                $"B 改动后：{changedFile}\r\n" +
+                $"备份：{backupPath}");
+
+            if (IsCurrentWorkingCopyFile(targetFile))
+            {
+                await RefreshStatusAsync();
+                LoadAllFiles();
+            }
+        }
+        catch (Exception ex)
+        {
+            OperationLogger.Log("CrossRepositorySpreadsheetMergeFailed", _workingCopyText.Text.Trim(), $"{targetFile}; {ex.Message}");
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task RunSelectedCommitSpreadsheetMergeAsync()
+    {
+        if (!ValidateWorkingCopyPath() ||
+            _historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file)
+        {
+            return;
+        }
+
+        var committedLogs = GetSelectedCommittedHistoryLogs();
+        if (committedLogs.Count == 0)
+        {
+            return;
+        }
+
+        var firstRevision = committedLogs.First().Revision;
+        var lastRevision = committedLogs.Last().Revision;
+        var scopeLabel = firstRevision == lastRevision
+            ? $"r{lastRevision}"
+            : $"r{firstRevision}-r{lastRevision}";
+
+        if (file.Action is "A" or "D")
+        {
+            MessageBox.Show(
+                "新增或删除文件没有完整的“范围开始前 -> 范围结束后”两侧表格版本，暂不支持用这段提交做三方合并。",
+                "无法三方合并",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(file.RepositoryPath))
+        {
+            MessageBox.Show("这条历史记录没有仓库路径，无法读取提交前后的文件。", "无法三方合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var defaultTargetFile = GetHistoryChangedLocalPath(file);
+        var targetFile = PromptSpreadsheetFile("选择要写入的目标表 C", defaultTargetFile);
+        if (string.IsNullOrWhiteSpace(targetFile))
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var tempBaseFile = CreateHistoryOpenTempPath($"r{firstRevision - 1}_before", file.TreePath);
+        var tempChangedFile = CreateHistoryOpenTempPath($"r{lastRevision}_after", file.TreePath);
+        SetBusy(true, "正在准备所选提交范围的三方合并...");
+        try
+        {
+            await _svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, firstRevision - 1, tempBaseFile);
+            await _svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, lastRevision, tempChangedFile);
+
+            if (!SpreadsheetThreeWayMergeService.IsSupportedPath(tempBaseFile) ||
+                !SpreadsheetThreeWayMergeService.IsSupportedPath(tempChangedFile) ||
+                !SpreadsheetThreeWayMergeService.IsSupportedPath(targetFile))
+            {
+                MessageBox.Show(
+                    "所选提交/范围三方合并只支持 .xls / .xlsx / .xlsm / SpreadsheetML XML 表格。",
+                    "文件类型不适合",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var plan = await Task.Run(() => SpreadsheetThreeWayMergeService.BuildPlan(tempBaseFile, targetFile, tempChangedFile));
+            if (plan.RelevantChangeCount == 0)
+            {
+                MessageBox.Show(
+                    $"{scopeLabel} 对这个表没有可合并的单元格差异。",
+                    "无需合并",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            SetBusy(false, "等待确认所选提交范围合并项目");
+            using (var conflictForm = new SpreadsheetMergeConflictForm(
+                file.TreePath,
+                plan,
+                $"用 {scopeLabel} 提交范围三方合并 - 合并项目预览",
+                "目标 C",
+                scopeLabel,
+                "写入目标 C"))
+            {
+                if (conflictForm.ShowDialog(this) != DialogResult.OK)
+                {
+                    WriteOutput($"已取消用 {scopeLabel} 三方合并：{file.TreePath}");
+                    return;
+                }
+            }
+
+            SetBusy(true, "正在写入所选提交范围三方合并结果...");
+            var writes = plan.BuildWrites();
+            if (writes.Count == 0)
+            {
+                MessageBox.Show(
+                    "当前选择全部保留目标 C，没有需要写入的提交范围改动。",
+                    "无需写入",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var backupPath = SpreadsheetThreeWayMergeService.CreateBackup(targetFile);
+            await Task.Run(() => SpreadsheetThreeWayMergeService.ApplyWrites(targetFile, writes));
+            OperationLogger.Log("CommitSpreadsheetMergeSuccess", workingCopy, $"range={firstRevision}-{lastRevision}; file={file.TreePath}; target={targetFile}; writes={writes.Count}; backup={backupPath}");
+            WriteOutput(
+                $"已把 {scopeLabel} 对表格的累计改动三方合并到目标 C，写入 {writes.Count} 个单元格。\r\n" +
+                $"历史文件：{file.TreePath}\r\n" +
+                $"目标 C：{targetFile}\r\n" +
+                $"备份：{backupPath}");
+
+            if (IsCurrentWorkingCopyFile(targetFile))
+            {
+                await RefreshStatusAsync();
+                LoadAllFiles();
+            }
+        }
+        catch (Exception ex)
+        {
+            OperationLogger.Log("CommitSpreadsheetMergeFailed", workingCopy, $"range={firstRevision}-{lastRevision}; file={file.TreePath}; {ex.Message}");
+            ShowError(ex);
+        }
+        finally
+        {
+            TryDelete(tempBaseFile);
+            TryDelete(tempChangedFile);
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private bool ConfirmCrossRepositorySpreadsheetMergeWrite(string baseFile, string changedFile, string targetFile, SpreadsheetMergePlan plan)
+    {
+        var message =
+            $"准备把 A->B 的表格改动写入目标 C。{Environment.NewLine}{Environment.NewLine}" +
+            $"A 改动前：{baseFile}{Environment.NewLine}" +
+            $"B 改动后：{changedFile}{Environment.NewLine}" +
+            $"C 目标文件：{targetFile}{Environment.NewLine}{Environment.NewLine}" +
+            $"自动应用 A->B 改动：{plan.AutoRemoteChanges.Count} 项{Environment.NewLine}" +
+            $"保留目标 C 独有改动：{plan.LocalOnlyChanges.Count} 项{Environment.NewLine}" +
+            $"两边相同：{plan.SameBothChanges.Count} 项{Environment.NewLine}" +
+            $"冲突：0 项{Environment.NewLine}{Environment.NewLine}" +
+            "写入前会自动备份目标 C。继续？";
+        return MessageBox.Show(
+            message,
+            "跨库表格三方合并",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Information,
+            MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+
+    private bool ConfirmCommitSpreadsheetMergeWrite(
+        ChangedFileEntry file,
+        long firstRevision,
+        long lastRevision,
+        string scopeLabel,
+        string targetFile,
+        SpreadsheetMergePlan plan)
+    {
+        var message =
+            $"准备把 {scopeLabel} 对这个表的累计改动写入目标 C。{Environment.NewLine}{Environment.NewLine}" +
+            $"历史文件：{file.TreePath}{Environment.NewLine}" +
+            $"改动范围：r{firstRevision - 1} -> r{lastRevision}{Environment.NewLine}" +
+            $"目标 C：{targetFile}{Environment.NewLine}{Environment.NewLine}" +
+            $"自动应用提交范围改动：{plan.AutoRemoteChanges.Count} 项{Environment.NewLine}" +
+            $"保留目标 C 独有改动：{plan.LocalOnlyChanges.Count} 项{Environment.NewLine}" +
+            $"两边相同：{plan.SameBothChanges.Count} 项{Environment.NewLine}" +
+            $"冲突：0 项{Environment.NewLine}{Environment.NewLine}" +
+            "写入前会自动备份目标 C。继续？";
+        return MessageBox.Show(
+            message,
+            "用所选提交/范围三方合并",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Information,
+            MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+
+    private IReadOnlyList<SvnLogEntry> GetSelectedCommittedHistoryLogs()
+    {
+        var logs = _selectedHistoryLogs.Count > 0
+            ? _selectedHistoryLogs
+            : _selectedHistoryLog != null ? [_selectedHistoryLog] : [];
+        return logs
+            .Where(log => !log.IsUncommitted && log.Revision > 0)
+            .OrderBy(log => log.Revision)
+            .ToList();
+    }
+
+    private string? PromptSpreadsheetFile(string title, string initialFile = "")
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = title,
+            Filter = "表格文件 (*.xml;*.xls;*.xlsx;*.xlsm)|*.xml;*.xls;*.xlsx;*.xlsm|所有文件 (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false,
+        };
+
+        if (!string.IsNullOrWhiteSpace(initialFile))
+        {
+            var initialDirectory = File.Exists(initialFile)
+                ? Path.GetDirectoryName(initialFile)
+                : Directory.Exists(initialFile) ? initialFile : Path.GetDirectoryName(initialFile);
+            if (!string.IsNullOrWhiteSpace(initialDirectory) && Directory.Exists(initialDirectory))
+            {
+                dialog.InitialDirectory = initialDirectory;
+            }
+
+            if (File.Exists(initialFile))
+            {
+                dialog.FileName = Path.GetFileName(initialFile);
+            }
+        }
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return null;
+        }
+
+        if (!SpreadsheetThreeWayMergeService.IsSupportedPath(dialog.FileName))
+        {
+            MessageBox.Show(
+                "请选择 .xls / .xlsx / .xlsm / SpreadsheetML XML 表格文件。",
+                "文件类型不适合",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return null;
+        }
+
+        return dialog.FileName;
+    }
+
+    private bool IsCurrentWorkingCopyFile(string filePath)
+    {
+        var workingCopy = _workingCopyText.Text.Trim();
+        if (string.IsNullOrWhiteSpace(workingCopy) || !Directory.Exists(workingCopy))
+        {
+            return false;
+        }
+
+        try
+        {
+            var root = Path.GetFullPath(workingCopy)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var target = Path.GetFullPath(filePath);
+            return target.StartsWith(root, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool ConfirmSpreadsheetMergeWrite(string relativePath, SpreadsheetMergePlan plan)
+    {
+        var message =
+            $"准备把远端 HEAD 的非冲突表格改动写入工作副本：{relativePath}{Environment.NewLine}{Environment.NewLine}" +
+            $"自动应用远端：{plan.AutoRemoteChanges.Count} 项{Environment.NewLine}" +
+            $"保留本地：{plan.LocalOnlyChanges.Count} 项{Environment.NewLine}" +
+            $"两边相同：{plan.SameBothChanges.Count} 项{Environment.NewLine}" +
+            $"冲突：0 项{Environment.NewLine}{Environment.NewLine}" +
+            "写入前会自动备份当前本地文件。继续？";
+        return MessageBox.Show(
+            message,
+            "内置表格三方合并",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Information,
+            MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+
+    private async Task OfferResolveAfterInternalMergeAsync(string relativePath, bool wasConflict)
+    {
+        if (!wasConflict)
+        {
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"表格合并结果已经保存到工作副本。是否现在执行 svn resolve --accept working？{Environment.NewLine}{Environment.NewLine}{relativePath}",
+            "标记冲突已解决",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Question);
+        if (confirm == DialogResult.OK)
+        {
+            await ResolveConflictPathCoreAsync(relativePath);
         }
     }
 
@@ -2835,7 +4125,9 @@ try {{
     {
         var extension = GetComparableExtension(path);
         return extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xls", StringComparison.OrdinalIgnoreCase) ||
             extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xlsm", StringComparison.OrdinalIgnoreCase) ||
             extension.Equals(".csv", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -2935,21 +4227,113 @@ try {{
         };
     }
 
+    private async Task<CommitPreflightResult> BuildCommitPreflightAsync(string workingCopy, IReadOnlyList<SvnChange> selectedChanges, IReadOnlyList<SvnChange> conflicts)
+    {
+        var blockers = new List<string>();
+        var warnings = new List<string>();
+        if (conflicts.Count > 0)
+        {
+            blockers.Add($"工作副本仍有 {conflicts.Count} 个冲突，必须先处理冲突。");
+        }
+
+        var unsafePaths = selectedChanges.Where(change => IsUnsafeCommitPath(change.RelativePath)).Select(change => change.RelativePath).ToList();
+        if (unsafePaths.Count > 0)
+        {
+            blockers.Add($"选择了 {unsafePaths.Count} 个冲突辅助/临时/备份文件，禁止提交：" + FormatPathPreview(unsafePaths));
+        }
+
+        var missing = selectedChanges.Where(change => change.Status == SvnStatusKind.Missing).Select(change => change.RelativePath).ToList();
+        if (missing.Count > 0)
+        {
+            blockers.Add($"选择了 {missing.Count} 个本地缺失文件，当前不自动提交删除：" + FormatPathPreview(missing));
+        }
+
+        var unversioned = selectedChanges.Where(change => change.Status == SvnStatusKind.Unversioned).Select(change => change.RelativePath).ToList();
+        if (unversioned.Count > 0)
+        {
+            warnings.Add($"将自动 svn add {unversioned.Count} 个未加入版本控制的文件：" + FormatPathPreview(unversioned));
+        }
+
+        var info = WorkingCopyInfo.Empty;
+        try
+        {
+            info = _svn.GetWorkingCopyInfo(workingCopy);
+            if (info.MinRevision > 0 && info.MaxRevision > 0 && info.MinRevision != info.MaxRevision)
+            {
+                warnings.Add($"工作副本是混合版本：r{info.MinRevision}:r{info.MaxRevision}。提交前请确认这正是你想要的状态。");
+            }
+        }
+        catch (Exception ex)
+        {
+            warnings.Add("无法读取工作副本版本信息：" + ex.Message);
+        }
+
+        try
+        {
+            var latest = await _svn.GetLatestRepositoryLogAsync(workingCopy);
+            if (latest is { Revision: > 0 } && info.MaxRevision > 0 && latest.Revision > info.MaxRevision)
+            {
+                warnings.Add($"远端最新是 r{latest.Revision}，当前本地最高内容版本是 r{info.MaxRevision}，本地落后 {latest.Revision - info.MaxRevision} 个版本。");
+            }
+        }
+        catch (Exception ex)
+        {
+            warnings.Add("无法检查远端最新版本：" + ex.Message);
+        }
+
+        return new CommitPreflightResult(blockers, warnings);
+    }
+
+    private bool ConfirmCommitPreflight(CommitPreflightResult result)
+    {
+        if (result.Blocked)
+        {
+            MessageBox.Show(
+                result.FormatMessage("提交前检查未通过"),
+                "提交被拦截",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return false;
+        }
+
+        if (!result.HasWarnings)
+        {
+            return true;
+        }
+
+        return MessageBox.Show(
+            result.FormatMessage("提交前检查发现风险"),
+            "提交前检查",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+
+    private static string FormatPathPreview(IReadOnlyList<string> paths)
+    {
+        if (paths.Count == 0)
+        {
+            return "";
+        }
+
+        var preview = string.Join("、", paths.Take(5));
+        return paths.Count > 5 ? preview + $" 等 {paths.Count} 个" : preview;
+    }
+
     private void ShowDiffWindow(string title, string oldFilePath, string newFilePath)
     {
-        if (DiffFileKindDetector.IsSpreadsheet(oldFilePath) && DiffFileKindDetector.IsSpreadsheet(newFilePath))
+        var data = CreateDiffPreviewData(oldFilePath, newFilePath);
+        if (data.ExcelDifferences != null)
         {
-            var differences = ExcelDiffService.Compare(oldFilePath, newFilePath);
-            using var form = new ExcelDiffForm(title, differences);
+            using var form = new ExcelDiffForm(title, data);
             form.ShowDialog(this);
-            WriteOutput(differences.Count == 0 ? $"没有发现单元格差异：{title}" : $"发现 {differences.Count} 个单元格差异：{title}");
+            WriteOutput($"{data.Summary}：{title}");
             return;
         }
 
-        var lineDiffs = TextDiffService.Compare(oldFilePath, newFilePath);
-        using var textForm = new TextDiffForm(title, lineDiffs);
+        using var textForm = new TextDiffForm(title, data);
         textForm.ShowDialog(this);
-        WriteOutput(lineDiffs.Count == 0 ? $"没有发现文本差异：{title}" : $"发现 {lineDiffs.Count} 行文本差异：{title}");
+        WriteOutput($"{data.Summary}：{title}");
     }
 
     private async Task RunFileHistoryAsync()
@@ -3138,8 +4522,15 @@ try {{
             return;
         }
 
+        var preflight = await BuildCommitPreflightAsync(workingCopy, selectedChanges, conflicts);
+        if (!ConfirmCommitPreflight(preflight))
+        {
+            OperationLogger.Log("CommitPreflightCancelled", workingCopy, preflight.ToLogText());
+            return;
+        }
+
         var message = "";
-        using (var preview = new CommitPreviewForm(_settings.LastCommitMessage, selectedChanges, CommitBlockReason, globalBlockReason))
+        using (var preview = new CommitPreviewForm(_settings.LastCommitMessage, selectedChanges, CommitBlockReason, preflight.Blocked ? preflight.BlockMessage : globalBlockReason))
         {
             if (preview.ShowDialog(this) != DialogResult.OK)
             {
@@ -3253,8 +4644,20 @@ try {{
         _ = LoadAllFilesAsync();
     }
 
+    private void ScheduleFileTreeLoad()
+    {
+        if (!IsTab(_mainTabs.SelectedTab, "全部文件"))
+        {
+            return;
+        }
+
+        _fileTreeLoadDebounceTimer.Stop();
+        _fileTreeLoadDebounceTimer.Start();
+    }
+
     private async Task LoadAllFilesAsync()
     {
+        _fileTreeLoadDebounceTimer.Stop();
         var root = _workingCopyText.Text.Trim();
         var search = _fileTreeSearchText.Text.Trim();
         var changedOnly = _fileTreeChangedOnlyCheck.Checked;
@@ -3271,7 +4674,12 @@ try {{
         var token = loadCts.Token;
         var request = new FileTreeLoadRequest(root, search, changedOnly, isFiltering, expandedPaths);
         ShowFileTreeMessage(string.IsNullOrWhiteSpace(root) ? "请选择本地目录。" : "正在加载文件树...");
-        _fileTreeRefreshButton.Enabled = false;
+        _fileTreeRefreshButton.Enabled = true;
+        _fileTreeRefreshButton.Text = "停止";
+        _fileTreeSearchText.Enabled = false;
+        _fileTreeChangedOnlyCheck.Enabled = false;
+        _fileTreeExpandButton.Enabled = false;
+        _fileTreeCollapseButton.Enabled = false;
         _statusLabel.Text = "正在加载全部文件...";
         try
         {
@@ -3282,10 +4690,20 @@ try {{
             }
 
             ApplyFileTreeBuildResult(result);
-            _statusLabel.Text = result.RootNode == null ? "就绪" : $"已加载 {result.FileCount} 个文件";
+            _statusLabel.Text = result.RootNode == null
+                ? "就绪"
+                : result.IsLazy
+                    ? $"已加载根目录，展开文件夹时继续读取。SVN 状态 {result.StatusMap.Count} 项"
+                    : result.IsTruncated
+                    ? $"已显示前 {result.FileCount} 个匹配文件，建议搜索缩小范围"
+                    : $"已加载 {result.FileCount} 个文件";
         }
         catch (OperationCanceledException)
         {
+            if (IsCurrentFileTreeLoad(loadCts))
+            {
+                _statusLabel.Text = "已取消加载全部文件";
+            }
         }
         catch (Exception ex)
         {
@@ -3302,6 +4720,11 @@ try {{
             {
                 _fileTreeLoadCts = null;
                 _fileTreeRefreshButton.Enabled = true;
+                _fileTreeRefreshButton.Text = "刷新";
+                _fileTreeSearchText.Enabled = true;
+                _fileTreeChangedOnlyCheck.Enabled = true;
+                _fileTreeExpandButton.Enabled = true;
+                _fileTreeCollapseButton.Enabled = true;
             }
         }
     }
@@ -3322,17 +4745,262 @@ try {{
         return ReferenceEquals(_fileTreeLoadCts, loadCts);
     }
 
+    private static IEnumerable<string> EnumerateWorkingCopyFiles(string rootPath, CancellationToken token)
+    {
+        var pendingDirectories = new Stack<string>();
+        pendingDirectories.Push(rootPath);
+        while (pendingDirectories.Count > 0)
+        {
+            token.ThrowIfCancellationRequested();
+            var directory = pendingDirectories.Pop();
+            IEnumerable<string> subDirectories;
+            try
+            {
+                subDirectories = Directory.EnumerateDirectories(directory).ToList();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                continue;
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            foreach (var childDirectory in subDirectories.Reverse())
+            {
+                token.ThrowIfCancellationRequested();
+                if (string.Equals(Path.GetFileName(childDirectory), ".svn", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                pendingDirectories.Push(childDirectory);
+            }
+
+            IEnumerable<string> files;
+            try
+            {
+                files = Directory.EnumerateFiles(directory).ToList();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                continue;
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            foreach (var file in files)
+            {
+                token.ThrowIfCancellationRequested();
+                yield return file;
+            }
+        }
+    }
+
+    private static IEnumerable<FileTreeFileEntry> EnumerateFilteredWorkingCopyFiles(string rootPath, string search, CancellationToken token)
+    {
+        foreach (var filePath in EnumerateWorkingCopyFiles(rootPath, token))
+        {
+            token.ThrowIfCancellationRequested();
+            var relativePath = Path.GetRelativePath(rootPath, filePath);
+            if (SvnConflictArtifact.IsAuxiliaryPath(relativePath))
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(search) &&
+                !relativePath.Contains(search, StringComparison.OrdinalIgnoreCase) &&
+                !Path.GetFileName(filePath).Contains(search, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            yield return new FileTreeFileEntry(relativePath, filePath, SvnStatusKind.None);
+        }
+    }
+
+    private static IEnumerable<FileTreeFileEntry> EnumerateChangedStatusFiles(
+        string rootPath,
+        string search,
+        IReadOnlyDictionary<string, SvnStatusKind> statusMap,
+        CancellationToken token)
+    {
+        foreach (var item in statusMap.OrderBy(item => item.Key, StringComparer.CurrentCultureIgnoreCase))
+        {
+            token.ThrowIfCancellationRequested();
+            if (item.Value is SvnStatusKind.None or SvnStatusKind.Normal)
+            {
+                continue;
+            }
+
+            if (SvnConflictArtifact.IsAuxiliaryPath(item.Key))
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(search) &&
+                !item.Key.Contains(search, StringComparison.OrdinalIgnoreCase) &&
+                !Path.GetFileName(item.Key).Contains(search, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            yield return new FileTreeFileEntry(item.Key, Path.Combine(rootPath, item.Key), item.Value);
+        }
+    }
+
+    private static int PopulateLazyDirectoryNode(
+        TreeNode directoryNode,
+        string rootPath,
+        string relativeDirectory,
+        IReadOnlyDictionary<string, SvnStatusKind> statusMap,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        directoryNode.Nodes.Clear();
+        var fullDirectory = string.IsNullOrWhiteSpace(relativeDirectory)
+            ? rootPath
+            : Path.Combine(rootPath, relativeDirectory);
+        if (!Directory.Exists(fullDirectory))
+        {
+            return 0;
+        }
+
+        var added = 0;
+        foreach (var directory in SafeEnumerateDirectories(fullDirectory).OrderBy(Path.GetFileName, StringComparer.CurrentCultureIgnoreCase))
+        {
+            token.ThrowIfCancellationRequested();
+            if (string.Equals(Path.GetFileName(directory), ".svn", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var relativePath = Path.GetRelativePath(rootPath, directory);
+            if (IsReservedDevicePath(relativePath))
+            {
+                continue;
+            }
+
+            var node = CreateFileTreeFolderNode(relativePath, Path.GetFileName(directory));
+            if (DirectoryMayHaveChildren(directory))
+            {
+                node.Nodes.Add(CreateLazyFileTreePlaceholder());
+            }
+
+            directoryNode.Nodes.Add(node);
+            added++;
+        }
+
+        foreach (var file in SafeEnumerateFiles(fullDirectory).OrderBy(Path.GetFileName, StringComparer.CurrentCultureIgnoreCase))
+        {
+            token.ThrowIfCancellationRequested();
+            var relativePath = Path.GetRelativePath(rootPath, file);
+            if (SvnConflictArtifact.IsAuxiliaryPath(relativePath) || IsReservedDevicePath(relativePath))
+            {
+                continue;
+            }
+
+            statusMap.TryGetValue(NormalizeRelativePath(relativePath), out var status);
+            directoryNode.Nodes.Add(CreateFileTreeFileNode(relativePath, new FileInfo(file), status));
+            added++;
+        }
+
+        return added;
+    }
+
+    private void EnsureLazyFileTreeChildren(TreeNode node)
+    {
+        if (node.Tag is not FileTreeNodeInfo { IsFile: false } info ||
+            node.Nodes.Count != 1 ||
+            node.Nodes[0].Tag is not LazyFileTreePlaceholder)
+        {
+            return;
+        }
+
+        var root = _workingCopyText.Text.Trim();
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+        {
+            return;
+        }
+
+        _loadingFileTree = true;
+        WinFormsRendering.SetRedraw(_fileTree, false);
+        _fileTree.BeginUpdate();
+        try
+        {
+            PopulateLazyDirectoryNode(node, root, info.RelativePath, _fileTreeStatusMap, CancellationToken.None);
+        }
+        finally
+        {
+            _fileTree.EndUpdate();
+            WinFormsRendering.SetRedraw(_fileTree, true);
+            _loadingFileTree = false;
+        }
+    }
+
+    private static IEnumerable<string> SafeEnumerateDirectories(string directory)
+    {
+        try
+        {
+            return Directory.EnumerateDirectories(directory).ToList();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return [];
+        }
+        catch (IOException)
+        {
+            return [];
+        }
+    }
+
+    private static IEnumerable<string> SafeEnumerateFiles(string directory)
+    {
+        try
+        {
+            return Directory.EnumerateFiles(directory).ToList();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return [];
+        }
+        catch (IOException)
+        {
+            return [];
+        }
+    }
+
+    private static bool DirectoryMayHaveChildren(string directory)
+    {
+        try
+        {
+            return Directory.EnumerateFileSystemEntries(directory)
+                .Any(path => !string.Equals(Path.GetFileName(path), ".svn", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
     private FileTreeBuildResult BuildFileTree(FileTreeLoadRequest request, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(request.RootPath))
         {
-            return new FileTreeBuildResult(null, "请选择本地目录。", 0, request.IsFiltering, request.ExpandedPaths);
+            return new FileTreeBuildResult(null, "请选择本地目录。", 0, false, false, request.IsFiltering, request.ExpandedPaths, new Dictionary<string, SvnStatusKind>(StringComparer.OrdinalIgnoreCase));
         }
 
         if (!Directory.Exists(request.RootPath))
         {
-            return new FileTreeBuildResult(null, "本地目录不存在。", 0, request.IsFiltering, request.ExpandedPaths);
+            return new FileTreeBuildResult(null, "本地目录不存在。", 0, false, false, request.IsFiltering, request.ExpandedPaths, new Dictionary<string, SvnStatusKind>(StringComparer.OrdinalIgnoreCase));
         }
 
         var rootInfo = new DirectoryInfo(request.RootPath);
@@ -3346,42 +5014,58 @@ try {{
 
         var statusMap = GetStatusMapForTree(request.RootPath);
         token.ThrowIfCancellationRequested();
-        var files = Directory.EnumerateFiles(request.RootPath, "*", SearchOption.AllDirectories)
-            .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}.svn{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
-            .Where(path => !SvnConflictArtifact.IsAuxiliaryPath(Path.GetRelativePath(request.RootPath, path)))
-            .Select(path => new FileInfo(path))
-            .Where(file =>
-            {
-                token.ThrowIfCancellationRequested();
-                var relativePath = Path.GetRelativePath(request.RootPath, file.FullName);
-                var normalized = NormalizeRelativePath(relativePath);
-                var hasStatus = statusMap.TryGetValue(normalized, out var status) && status != SvnStatusKind.None && status != SvnStatusKind.Normal;
-                if (request.ChangedOnly && !hasStatus)
-                {
-                    return false;
-                }
+        if (!request.IsFiltering)
+        {
+            var topLevelCount = PopulateLazyDirectoryNode(rootNode, request.RootPath, "", statusMap, token);
+            return new FileTreeBuildResult(rootNode, "", topLevelCount, false, true, request.IsFiltering, request.ExpandedPaths, statusMap);
+        }
 
-                return string.IsNullOrWhiteSpace(request.Search) ||
-                    relativePath.Contains(request.Search, StringComparison.OrdinalIgnoreCase) ||
-                    file.Name.Contains(request.Search, StringComparison.OrdinalIgnoreCase);
-            })
-            .OrderBy(file => Path.GetRelativePath(request.RootPath, file.FullName), StringComparer.CurrentCultureIgnoreCase)
-            .ToList();
+        var files = new List<FileTreeFileEntry>();
+        var isTruncated = false;
+        var filteredFiles = request.ChangedOnly
+            ? EnumerateChangedStatusFiles(request.RootPath, request.Search, statusMap, token)
+            : EnumerateFilteredWorkingCopyFiles(request.RootPath, request.Search, token);
+        foreach (var file in filteredFiles)
+        {
+            token.ThrowIfCancellationRequested();
+            var normalized = NormalizeRelativePath(file.RelativePath);
+            var hasStatus = statusMap.TryGetValue(normalized, out var status) && status != SvnStatusKind.None && status != SvnStatusKind.Normal;
+            if (request.ChangedOnly && !hasStatus)
+            {
+                continue;
+            }
+
+            if (files.Count >= MaxFileTreeDisplayFiles)
+            {
+                isTruncated = true;
+                break;
+            }
+
+            files.Add(file with { Status = status });
+        }
+
+        files.Sort((left, right) => string.Compare(left.RelativePath, right.RelativePath, StringComparison.CurrentCultureIgnoreCase));
+        if (isTruncated)
+        {
+            rootNode.Nodes.Add(new TreeNode($"只显示前 {MaxFileTreeDisplayFiles} 个匹配文件，请用搜索或“仅改动”缩小范围。"));
+        }
 
         foreach (var file in files)
         {
             token.ThrowIfCancellationRequested();
-            var relativePath = Path.GetRelativePath(request.RootPath, file.FullName);
-            statusMap.TryGetValue(NormalizeRelativePath(relativePath), out var status);
-            AddFileNode(rootNode, relativePath, file, status);
+            AddFileNode(rootNode, file.RelativePath, new FileInfo(file.FullPath), file.Status);
         }
 
-        return new FileTreeBuildResult(rootNode, "", files.Count, request.IsFiltering, request.ExpandedPaths);
+        return new FileTreeBuildResult(rootNode, "", files.Count, isTruncated, false, request.IsFiltering, request.ExpandedPaths, statusMap);
     }
 
     private void ApplyFileTreeBuildResult(FileTreeBuildResult result)
     {
         _loadingFileTree = true;
+        _lastFileTreeFileCount = result.FileCount;
+        _fileTreeStatusMap = result.StatusMap;
+        _styledFileTreeSelectionPaths.Clear();
+        WinFormsRendering.SetRedraw(_fileTree, false);
         _fileTree.BeginUpdate();
         _fileTree.Nodes.Clear();
         try
@@ -3395,20 +5079,28 @@ try {{
             _fileTree.Nodes.Add(result.RootNode);
             if (result.IsFiltering)
             {
-                result.RootNode.ExpandAll();
+                if (result.FileCount <= MaxFileTreeAutoExpandFiles)
+                {
+                    result.RootNode.ExpandAll();
+                }
+                else
+                {
+                    result.RootNode.Expand();
+                }
             }
             else
             {
                 RestoreExpandedTreePaths(result.ExpandedPaths);
             }
 
-            _fileTree.Sort();
             PruneFileTreeSelection();
             ApplyFileTreeSelectionStyles();
         }
         finally
         {
             _fileTree.EndUpdate();
+            WinFormsRendering.SetRedraw(_fileTree, true);
+            _fileTree.Invalidate();
             _loadingFileTree = false;
         }
     }
@@ -3416,6 +5108,7 @@ try {{
     private void ShowFileTreeMessage(string message)
     {
         _loadingFileTree = true;
+        WinFormsRendering.SetRedraw(_fileTree, false);
         _fileTree.BeginUpdate();
         try
         {
@@ -3425,6 +5118,8 @@ try {{
         finally
         {
             _fileTree.EndUpdate();
+            WinFormsRendering.SetRedraw(_fileTree, true);
+            _fileTree.Invalidate();
             _loadingFileTree = false;
         }
     }
@@ -3436,6 +5131,27 @@ try {{
         {
             _fileTree.Nodes[0].Expand();
         }
+    }
+
+    private void ExpandFileTreeSafely()
+    {
+        if (_lastFileTreeFileCount > MaxFileTreeExpandAllFiles)
+        {
+            MessageBox.Show(
+                this,
+                $"当前文件树有 {_lastFileTreeFileCount} 个文件，一次性全部展开会明显卡顿。\r\n\r\n请先使用搜索或“仅改动”，或者手动展开需要查看的目录。",
+                "文件过多",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            if (_fileTree.Nodes.Count > 0)
+            {
+                _fileTree.Nodes[0].Expand();
+            }
+
+            return;
+        }
+
+        _fileTree.ExpandAll();
     }
 
     private void HandleFileTreeNodeMouseClick(TreeNode? node, MouseButtons button)
@@ -3567,29 +5283,39 @@ try {{
 
     private void ApplyFileTreeSelectionStyles()
     {
-        foreach (TreeNode node in _fileTree.Nodes)
+        var pathsToRefresh = _styledFileTreeSelectionPaths
+            .Concat(_selectedFileTreePaths)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        foreach (var path in pathsToRefresh)
         {
-            ApplyFileTreeSelectionStyles(node);
+            var node = FindFileTreeNodeByPath(path);
+            if (node != null)
+            {
+                ApplyFileTreeSelectionStyle(node);
+                WinFormsRendering.InvalidateTreeNodeRow(_fileTree, node);
+            }
+        }
+
+        _styledFileTreeSelectionPaths.Clear();
+        foreach (var path in _selectedFileTreePaths)
+        {
+            _styledFileTreeSelectionPaths.Add(path);
         }
     }
 
-    private void ApplyFileTreeSelectionStyles(TreeNode node)
+    private void ApplyFileTreeSelectionStyle(TreeNode node)
     {
         var selected = IsFileTreeNodeSelected(node);
         if (selected)
         {
-            node.BackColor = Color.FromArgb(0, 120, 215);
-            node.ForeColor = Color.White;
+            node.BackColor = Color.FromArgb(226, 241, 255);
+            node.ForeColor = Color.FromArgb(15, 76, 129);
         }
         else
         {
             node.BackColor = _fileTree.BackColor;
             node.ForeColor = GetFileTreeDefaultForeColor(node);
-        }
-
-        foreach (TreeNode child in node.Nodes)
-        {
-            ApplyFileTreeSelectionStyles(child);
         }
     }
 
@@ -3761,6 +5487,51 @@ try {{
         }
     }
 
+    private static TreeNode CreateFileTreeFolderNode(string relativePath, string name)
+    {
+        return new TreeNode(name)
+        {
+            Tag = new FileTreeNodeInfo(relativePath, false),
+            ToolTipText = relativePath,
+            ImageKey = "folder",
+            SelectedImageKey = "folder",
+            ForeColor = Color.FromArgb(55, 65, 81),
+            NodeFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        };
+    }
+
+    private static TreeNode CreateFileTreeFileNode(string relativePath, FileInfo file, SvnStatusKind status)
+    {
+        var name = Path.GetFileName(relativePath);
+        var node = new TreeNode(name)
+        {
+            Tag = new FileTreeNodeInfo(relativePath, true),
+            ToolTipText = BuildFileTooltip(relativePath, file),
+            ImageKey = FileImageKey(relativePath, status),
+            SelectedImageKey = FileImageKey(relativePath, status),
+            ForeColor = SystemColors.WindowText,
+        };
+        if (status != SvnStatusKind.None && status != SvnStatusKind.Normal)
+        {
+            node.Text = $"{StatusPrefix(status)} {name}";
+            node.ForeColor = StatusColor(status);
+            node.ToolTipText += $"\r\n状态：{StatusText(status)}";
+            node.ImageKey = "changed";
+            node.SelectedImageKey = "changed";
+        }
+
+        return node;
+    }
+
+    private static TreeNode CreateLazyFileTreePlaceholder()
+    {
+        return new TreeNode("正在加载...")
+        {
+            Tag = LazyFileTreePlaceholder.Instance,
+            ForeColor = Color.FromArgb(100, 116, 139),
+        };
+    }
+
     private static string BuildFileTooltip(string relativePath, FileInfo file)
     {
         try
@@ -3819,7 +5590,10 @@ try {{
         }
 
         var extension = Path.GetExtension(path);
-        if (extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) || extension.Equals(".xls", StringComparison.OrdinalIgnoreCase) || extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase))
+        if (extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xls", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xlsm", StringComparison.OrdinalIgnoreCase))
         {
             return "xml";
         }
@@ -4043,6 +5817,85 @@ try {{
         }
     }
 
+    private void AddSelectedFileTreeFavorite()
+    {
+        if (_fileTree.SelectedNode?.Tag is not FileTreeNodeInfo info)
+        {
+            MessageBox.Show("请先在全部文件里选中一个目录或文件。", "未选择目录", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var favoritePath = info.IsFile
+            ? NormalizeRelativePath(Path.GetDirectoryName(info.RelativePath) ?? "")
+            : NormalizeRelativePath(info.RelativePath);
+        if (string.IsNullOrWhiteSpace(favoritePath))
+        {
+            favoritePath = ".";
+        }
+
+        if (!_settings.FavoriteFileTreePaths.Any(path => string.Equals(path, favoritePath, StringComparison.OrdinalIgnoreCase)))
+        {
+            _settings.FavoriteFileTreePaths.Add(favoritePath);
+            _settings.FavoriteFileTreePaths.Sort(StringComparer.CurrentCultureIgnoreCase);
+            _settings.Save();
+            BuildMoreActionsMenu();
+        }
+
+        WriteOutput($"已收藏目录：{favoritePath}");
+    }
+
+    private async Task NavigateToFavoriteFileTreePathAsync(string relativePath)
+    {
+        SelectTab("全部文件");
+        if (_fileTree.Nodes.Count == 0 || _fileTree.Nodes[0].Tag is not FileTreeNodeInfo)
+        {
+            await LoadAllFilesAsync();
+        }
+
+        var node = FindOrLoadFileTreeNode(relativePath == "." ? "" : relativePath);
+        if (node == null)
+        {
+            MessageBox.Show($"没有找到收藏目录：{relativePath}", "无法跳转", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        node.EnsureVisible();
+        _fileTree.SelectedNode = node;
+        SelectFileTreeNode(node, Keys.None);
+    }
+
+    private TreeNode? FindOrLoadFileTreeNode(string relativePath)
+    {
+        if (_fileTree.Nodes.Count == 0)
+        {
+            return null;
+        }
+
+        var current = _fileTree.Nodes[0];
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            current.Expand();
+            return current;
+        }
+
+        foreach (var part in relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            EnsureLazyFileTreeChildren(current);
+            current.Expand();
+            var next = current.Nodes
+                .Cast<TreeNode>()
+                .FirstOrDefault(node => string.Equals(CleanTreeNodeText(node.Text), part, StringComparison.OrdinalIgnoreCase));
+            if (next == null)
+            {
+                return null;
+            }
+
+            current = next;
+        }
+
+        return current;
+    }
+
     private string CurrentWorkingCopyKey()
     {
         return _workingCopyText.Text.Trim();
@@ -4101,7 +5954,18 @@ try {{
 
     private void SaveTreeExpansionState()
     {
-        if (_loadingFileTree)
+        if (_loadingFileTree || _lastFileTreeFileCount > MaxFileTreeExpandAllFiles)
+        {
+            return;
+        }
+
+        _treeExpansionSaveTimer.Stop();
+        _treeExpansionSaveTimer.Start();
+    }
+
+    private void SaveTreeExpansionStateCore()
+    {
+        if (_loadingFileTree || _lastFileTreeFileCount > MaxFileTreeExpandAllFiles)
         {
             return;
         }
@@ -4113,12 +5977,29 @@ try {{
     private void FillHistoryList(IReadOnlyList<SvnLogEntry> logs)
     {
         var workingCopy = _workingCopyText.Text.Trim();
-        var info = Directory.Exists(workingCopy) ? _svn.GetWorkingCopyInfo(workingCopy) : WorkingCopyInfo.Empty;
-        var changes = Directory.Exists(workingCopy) ? _svn.GetStatus(workingCopy) : [];
+        var hasWorkingCopy = Directory.Exists(workingCopy) && Directory.Exists(Path.Combine(workingCopy, ".svn"));
+        var info = hasWorkingCopy ? RefreshWorkingCopyRevisionStatus() : WorkingCopyInfo.Empty;
+        var changes = hasWorkingCopy ? _svn.GetStatus(workingCopy) : [];
+        var workingCopyRevision = info.CurrentContentRevision;
+        var latestRemoteRevision = logs
+            .Where(log => !log.IsUncommitted && log.Revision > 0)
+            .Select(log => log.Revision)
+            .DefaultIfEmpty(0)
+            .Max();
         _historyRows = [];
-        ShowHistorySummary(info == WorkingCopyInfo.Empty
+        var summary = info == WorkingCopyInfo.Empty
             ? ""
-            : $"当前工作副本版本：{info.DisplayRevisionText}{Environment.NewLine}当前文件内容最高版本：r{info.MaxRevision}{Environment.NewLine}{info.Url}");
+            : $"当前工作副本版本：{info.DisplayRevisionText}{Environment.NewLine}当前文件内容最高版本：r{workingCopyRevision}{Environment.NewLine}{info.Url}";
+        if (latestRemoteRevision > 0 && info != WorkingCopyInfo.Empty)
+        {
+            summary += $"{Environment.NewLine}远端最新历史版本：r{latestRemoteRevision}";
+            if (workingCopyRevision > 0 && latestRemoteRevision > workingCopyRevision)
+            {
+                summary += $"（本地未更新，落后 {latestRemoteRevision - workingCopyRevision} 个版本）";
+            }
+        }
+
+        ShowHistorySummary(summary);
         if (changes.Count > 0)
         {
             var uncommitted = new SvnLogEntry(0, "*", DateTimeOffset.Now, $"Uncommitted changes ({changes.Count} files)")
@@ -4129,9 +6010,22 @@ try {{
             _historyRows.Add(uncommitted);
         }
 
+        var hasWorkingCopyRevisionInLoadedLogs = workingCopyRevision > 0 && logs.Any(log => log.Revision == workingCopyRevision);
+        if (info != WorkingCopyInfo.Empty && workingCopyRevision > 0 && !hasWorkingCopyRevisionInLoadedLogs)
+        {
+            _historyRows.Add(new SvnLogEntry(
+                workingCopyRevision,
+                "LOCAL",
+                DateTimeOffset.MinValue,
+                $"当前工作副本位于 r{workingCopyRevision}。这个版本不在当前已加载的最近 {logs.Count} 条历史中；可以点击“加载更多”“深度搜索”，或搜索 rev:{workingCopyRevision} 查看完整提交详情。")
+            {
+                IsWorkingCopyRevision = true,
+            });
+        }
+
         foreach (var log in logs.OrderByDescending(log => log.Revision))
         {
-            _historyRows.Add(log with { IsWorkingCopyRevision = log.Revision == info.MaxRevision });
+            _historyRows.Add(log with { IsWorkingCopyRevision = log.Revision == workingCopyRevision });
         }
         ApplyHistoryFilter(selectWorkingCopyRevision: true);
     }
@@ -4188,7 +6082,7 @@ try {{
 
     private void AddHistoryItem(SvnLogEntry log)
     {
-        var item = new ListViewItem(log.GraphText) { Tag = log };
+        var item = new ListViewItem(log.GraphText) { Tag = log, ImageKey = "row-height" };
         item.SubItems.Add(log.DescriptionText);
         item.SubItems.Add(log.LocalDateText);
         item.SubItems.Add(log.Author);
@@ -4290,6 +6184,7 @@ try {{
         _historyListMenu.Items.Add("加载更多历史", null, async (_, _) => await LoadMoreRepositoryHistoryAsync());
         _historyListMenu.Items.Add(new ToolStripSeparator());
         _historyListMenu.Items.Add("复制版本号", null, (_, _) => CopySelectedHistoryRevision());
+        _historyListMenu.Items.Add("复制提交摘要", null, (_, _) => CopySelectedHistorySummary());
         _historyListMenu.Items.Add("刷新历史", null, async (_, _) => await LoadRepositoryHistoryAsync());
         _historyListMenu.Opening += (_, args) =>
         {
@@ -4343,6 +6238,22 @@ try {{
 
         Clipboard.SetText(log.Revision.ToString());
         WriteOutput($"已复制版本号：r{log.Revision}");
+    }
+
+    private void CopySelectedHistorySummary()
+    {
+        var log = GetSingleSelectedHistoryLog();
+        if (log == null)
+        {
+            return;
+        }
+
+        var text = log.IsUncommitted
+            ? $"本地未提交改动：{log.ChangedFiles.Count} 个文件"
+            : $"r{log.Revision}  {log.Author}  {log.LocalDateText}{Environment.NewLine}{log.Message}{Environment.NewLine}{Environment.NewLine}Changed files ({log.ChangedFiles.Count}){Environment.NewLine}" +
+              string.Join(Environment.NewLine, log.ChangedFiles.Select(file => $"{file.Action} {file.DisplayText}"));
+        Clipboard.SetText(text);
+        WriteOutput(log.IsUncommitted ? "已复制本地改动摘要。" : $"已复制提交摘要：r{log.Revision}");
     }
 
     private async Task RunUpdateWorkingCopyToSelectedHistoryRevisionAsync()
@@ -4415,7 +6326,10 @@ try {{
         _historyLoadedLimit = InitialHistoryLimit;
         _historyList.Items.Clear();
         UpdateHistoryBadge(0);
-        _historyDetailText.Clear();
+        if (!_historyDetailText.IsDisposed)
+        {
+            _historyDetailText.Clear();
+        }
         LoadAllFiles();
         await LoadCurrentTabAsync();
     }
@@ -4442,7 +6356,11 @@ try {{
         _fileTreeMenu.Items.Add("打开所在目录", null, (_, _) => OpenSelectedTreeFileFolder());
         _fileTreeMenu.Items.Add(new ToolStripSeparator());
         _fileTreeMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
+        _fileTreeMenu.Items.Add("和另一个表快速比对...", null, async (_, _) => await CompareSelectedTableWithAnotherAsync());
+        _fileTreeMenu.Items.Add("当前本地 vs 远端 HEAD", null, async (_, _) => await CompareSelectedFileWithRemoteHeadAsync());
         _fileTreeMenu.Items.Add("查看冲突", null, async (_, _) => await RunConflictViewerAsync());
+        _fileTreeMenu.Items.Add("内置表格三方合并", null, async (_, _) => await RunInternalSpreadsheetMergeAsync());
+        _fileTreeMenu.Items.Add("跨库表格三方合并", null, async (_, _) => await RunCrossRepositorySpreadsheetMergeAsync());
         _fileTreeMenu.Items.Add("用分久必合对比/合并", null, async (_, _) => await RunExternalCompareOrMergeAsync());
         _fileTreeMenu.Items.Add("冲突处理流程", null, async (_, _) => await RunConflictWorkflowAsync());
         _fileTreeMenu.Items.Add("文件/文件夹历史", null, async (_, _) => await RunFileHistoryAsync());
@@ -4455,6 +6373,7 @@ try {{
         _fileTreeMenu.Items.Add("加入版本控制", null, async (_, _) => await AddSelectedTreeFileAsync());
         _fileTreeMenu.Items.Add("加入忽略清单", null, async (_, _) => await AddSelectedPathsToIgnoreAsync());
         _fileTreeMenu.Items.Add("移出忽略清单", null, async (_, _) => await RemoveSelectedPathsFromIgnoreAsync());
+        _fileTreeMenu.Items.Add("收藏此目录", null, (_, _) => AddSelectedFileTreeFavorite());
         _fileTreeMenu.Items.Add("标记冲突已解决", null, async (_, _) => await ResolveSelectedTreeFileAsync());
         _fileTreeMenu.Opening += (_, args) =>
         {
@@ -4468,6 +6387,9 @@ try {{
                     item.Text is "文件/文件夹历史" && hasTreePath ||
                     item.Text is "打开文件" && hasFile ||
                     item.Text is "查看差异" && hasFile ||
+                    item.Text is "和另一个表快速比对..." && hasFile ||
+                    item.Text is "内置表格三方合并" && hasFile ||
+                    item.Text is "跨库表格三方合并" ||
                     item.Text is "查看冲突" && hasFile ||
                     item.Text is "用分久必合对比/合并" && hasFile ||
                     item.Text is "冲突处理流程" && hasFile ||
@@ -4490,8 +6412,11 @@ try {{
         _historyChangedFilesMenu.Items.Add("打开所在目录", null, (_, _) => OpenSelectedHistoryChangedFileFolder());
         _historyChangedFilesMenu.Items.Add(new ToolStripSeparator());
         _historyChangedFilesMenu.Items.Add("用分久必合对比", null, async (_, _) => await RunSelectedHistoryChangedFileExternalCompareAsync());
+        _historyChangedFilesMenu.Items.Add("和另一个表快速比对...", null, async (_, _) => await CompareSelectedHistoryFileWithAnotherTableAsync());
         _historyChangedFilesMenu.Items.Add("文件历史", null, async (_, _) => await RunSelectedHistoryChangedFileHistoryAsync());
+        _historyChangedFilesMenu.Items.Add("当前本地 vs 远端 HEAD", null, async (_, _) => await CompareSelectedHistoryFileWithRemoteHeadAsync());
         _historyChangedFilesMenu.Items.Add(new ToolStripSeparator());
+        _historyChangedFilesMenu.Items.Add("用所选提交/范围三方合并到目标表...", null, async (_, _) => await RunSelectedCommitSpreadsheetMergeAsync());
         _historyChangedFilesMenu.Items.Add("将此文件更新到本次提交版本...", null, async (_, _) => await UpdateSelectedHistoryFileToRevisionAsync());
         _historyChangedFilesMenu.Items.Add("撤销本次提交对这个文件的改动...", null, async (_, _) => await ReverseMergeSelectedHistoryFileAsync());
         _historyChangedFilesMenu.Items.Add(new ToolStripSeparator());
@@ -4500,6 +6425,7 @@ try {{
         {
             var hasFile = _historyChangedFilesTree.SelectedNode?.Tag is ChangedFileEntry;
             var hasSingleCommittedRevision = hasFile && _selectedHistoryLog is { IsUncommitted: false, Revision: > 0 };
+            var hasCommittedSelection = hasFile && GetSelectedCommittedHistoryLogs().Count > 0;
             foreach (ToolStripItem item in _historyChangedFilesMenu.Items)
             {
                 if (item is ToolStripSeparator)
@@ -4508,7 +6434,9 @@ try {{
                     continue;
                 }
 
-                item.Enabled = item.Text is "将此文件更新到本次提交版本..." or "撤销本次提交对这个文件的改动..."
+                item.Enabled = item.Text is "用所选提交/范围三方合并到目标表..."
+                    ? hasCommittedSelection
+                    : item.Text is "将此文件更新到本次提交版本..." or "撤销本次提交对这个文件的改动..."
                     ? hasSingleCommittedRevision
                     : hasFile;
             }
@@ -5049,17 +6977,7 @@ try {{
             return;
         }
 
-        _settings.IgnoreWorkingCopy(repository.WorkingCopyPath);
-        _settings.Repositories.RemoveAll(item => item.Id == repository.Id);
-        if (string.Equals(_settings.CurrentRepositoryId, repository.Id, StringComparison.OrdinalIgnoreCase))
-        {
-            _settings.CurrentRepositoryId = _settings.Repositories.FirstOrDefault()?.Id;
-        }
-
-        if (_settings.Repositories.Count == 0)
-        {
-            _settings.CurrentRepositoryId = null;
-        }
+        _settings.RemoveRepository(repository);
 
         _settings.Save();
         RefreshRepositorySelector();
@@ -5187,9 +7105,15 @@ try {{
         _historyList.Items.Clear();
         _historyRows.Clear();
         UpdateHistoryBadge(0);
-        _historyDetailText.Clear();
+            if (!_historyDetailText.IsDisposed)
+            {
+                _historyDetailText.Clear();
+            }
         ClearHistoryChangedFiles();
-        _historyDiffPanel.Controls.Clear();
+        ClearHistoryDiffPanel();
+        SetWorkingCopyRevisionStatus(WorkingCopyInfo.Empty, "本地：未检查", SystemColors.ControlText, "尚未读取当前工作副本版本。");
+        _remoteStatusLabel.Text = "远端：未检查";
+        _remoteStatusLabel.ForeColor = SystemColors.ControlText;
         UpdateHistorySearchControls();
         LoadAllFiles();
     }
@@ -5281,24 +7205,11 @@ try {{
         PopulateHistoryChangedFiles(log);
         if (log.IsUncommitted)
         {
-            ShowHistorySummary(
-                "Uncommitted changes" + Environment.NewLine +
-                Environment.NewLine +
-                string.Join(Environment.NewLine, log.ChangedFiles.Select(file => file.DisplayText)));
+            ShowHistorySummary(HistorySummaryData.FromLog(log));
             return;
         }
 
-        ShowHistorySummary(
-            $"版本：r{log.Revision}{(log.IsWorkingCopyRevision ? "  [当前工作副本位置]" : "")}{Environment.NewLine}" +
-            $"作者：{log.Author}{Environment.NewLine}" +
-            $"时间：{log.LocalDateText}{Environment.NewLine}" +
-            Environment.NewLine +
-            log.Message +
-            Environment.NewLine +
-            Environment.NewLine +
-            $"Changed files ({log.ChangedFiles.Count})" +
-            Environment.NewLine +
-            string.Join(Environment.NewLine, log.ChangedFiles.Select(file => file.DisplayText)));
+        ShowHistorySummary(HistorySummaryData.FromLog(log));
     }
 
     private void ShowSelectedHistoryRangeDetail(IReadOnlyList<SvnLogEntry> logs)
@@ -5315,21 +7226,48 @@ try {{
         PopulateHistoryChangedFiles($"Selected commits ({committedLogs.Count}) - Changed files ({changedFiles.Count})", changedFiles);
         var first = committedLogs.First();
         var last = committedLogs.Last();
-        ShowHistorySummary(
-            $"已选择 {committedLogs.Count} 条提交{Environment.NewLine}" +
-            $"范围：r{first.Revision} -> r{last.Revision}{Environment.NewLine}" +
-            $"时间：{first.LocalDateText} -> {last.LocalDateText}{Environment.NewLine}" +
-            $"改动文件：{changedFiles.Count}{Environment.NewLine}{Environment.NewLine}" +
-            string.Join(Environment.NewLine, committedLogs.OrderByDescending(log => log.Revision).Select(log =>
-                $"r{log.Revision}  {log.LocalDateText}  {log.Author}  {log.ShortMessage}")));
+        ShowHistorySummary(HistorySummaryData.FromRange(committedLogs, changedFiles));
     }
 
     private void ShowHistorySummary(string text)
     {
+        ShowHistorySummary(HistorySummaryData.Plain(text));
+    }
+
+    private void ShowHistorySummary(HistorySummaryData data)
+    {
+        _historyDiffHeaderLabel.Text = "提交详情";
+        _historyDiffMaximizeButton.Visible = false;
+
         CancelHistoryDiffPreview();
-        _historyDiffPanel.Controls.Clear();
-        _historyDetailText.Text = text;
-        _historyDiffPanel.Controls.Add(_historyDetailText);
+        ClearHistoryDiffPanel();
+        var summaryControl = new HistorySummaryPanel(data);
+        summaryControl.FileClicked += async summaryFile =>
+        {
+            var entry = _historyChangedFilesAll.FirstOrDefault(f => f.TreePath == summaryFile.TreePath);
+            if (entry != null)
+            {
+                var node = FindNodeByTag(_historyChangedFilesTree.Nodes, entry);
+                if (node != null)
+                {
+                    _historyChangedFilesTree.SelectedNode = node;
+                }
+                var tempNode = new TreeNode { Tag = entry };
+                await OpenHistoryChangedFileAsync(node ?? tempNode);
+            }
+        };
+        _historyDiffPanel.Controls.Add(summaryControl);
+    }
+
+    private TreeNode? FindNodeByTag(TreeNodeCollection nodes, object tag)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            if (node.Tag == tag) return node;
+            var found = FindNodeByTag(node.Nodes, tag);
+            if (found != null) return found;
+        }
+        return null;
     }
 
     private void PopulateHistoryChangedFiles(SvnLogEntry log)
@@ -5376,7 +7314,18 @@ try {{
             AddChangedFileNode(root, file);
         }
 
-        root.Expand();
+        if (files.Count <= 50)
+        {
+            _historyChangedFilesTree.ExpandAll();
+            if (_historyChangedFilesTree.Nodes.Count > 0)
+            {
+                _historyChangedFilesTree.Nodes[0].EnsureVisible();
+            }
+        }
+        else
+        {
+            root.Expand();
+        }
         _historyChangedFilesTree.EndUpdate();
     }
 
@@ -5418,8 +7367,8 @@ try {{
                 {
                     Tag = isFile ? file : null,
                     ToolTipText = file.DisplayText,
-                    ImageKey = isFile ? FileImageKey(file.TreePath, SvnStatusKind.None) : "folder",
-                    SelectedImageKey = isFile ? FileImageKey(file.TreePath, SvnStatusKind.None) : "folder",
+                    ImageKey = isFile ? ChangedFileActionImageKey(file.Action) : "folder",
+                    SelectedImageKey = isFile ? ChangedFileActionImageKey(file.Action) : "folder",
                 };
                 if (isFile)
                 {
@@ -5428,13 +7377,10 @@ try {{
                         "A" => Color.FromArgb(38, 128, 72),
                         "D" => Color.FromArgb(170, 67, 67),
                         "M" => Color.FromArgb(166, 103, 34),
+                        "C" => Color.FromArgb(144, 65, 170),
+                        "R" => Color.FromArgb(109, 85, 184),
                         _ => SystemColors.WindowText,
                     };
-                    if (file.Action is "A" or "D" or "M")
-                    {
-                        existing.ImageKey = "changed";
-                        existing.SelectedImageKey = "changed";
-                    }
                 }
                 else
                 {
@@ -5447,6 +7393,19 @@ try {{
             current = existing;
         }
         root.TreeView?.Sort();
+    }
+
+    private static string ChangedFileActionImageKey(string action)
+    {
+        return action switch
+        {
+            "A" => "action-added",
+            "M" => "action-modified",
+            "D" => "action-deleted",
+            "C" => "action-conflicted",
+            "R" => "action-replaced",
+            _ => "action-unknown",
+        };
     }
 
     private async Task ShowSelectedHistoryFileDiffAsync(TreeNode? node)
@@ -5620,6 +7579,8 @@ try {{
             return false;
         }
 
+        _historyDiffHeaderLabel.Text = "Diff preview";
+        _historyDiffMaximizeButton.Visible = true;
         RenderDiffPreviewInPanel(_historyDiffPanel, null, title + "    [缓存]", data);
         return true;
     }
@@ -5631,6 +7592,8 @@ try {{
         var data = await Task.Run(() => CreateDiffPreviewData(oldFilePath, newFilePath), token);
         token.ThrowIfCancellationRequested();
         AddHistoryDiffPreviewCache(cacheKey, data);
+        _historyDiffHeaderLabel.Text = "Diff preview";
+        _historyDiffMaximizeButton.Visible = true;
         RenderDiffPreviewInPanel(_historyDiffPanel, null, title, data);
     }
 
@@ -5652,7 +7615,10 @@ try {{
 
     private void ShowHistoryDiffLoading(string title, string message)
     {
-        _historyDiffPanel.Controls.Clear();
+        _historyDiffHeaderLabel.Text = "Diff preview";
+        _historyDiffMaximizeButton.Visible = true;
+
+        ClearHistoryDiffPanel();
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -5778,12 +7744,12 @@ try {{
             return DiffPreviewData.FromExcel(ExcelDiffService.Compare(oldFilePath, newFilePath));
         }
 
-        return DiffPreviewData.FromText(TextDiffService.Compare(oldFilePath, newFilePath));
+        return DiffPreviewData.FromText(TextDiffService.CreatePreview(oldFilePath, newFilePath));
     }
 
     internal static void RenderDiffPreviewInPanel(Panel panel, Label? headerLabel, string title, DiffPreviewData data)
     {
-        panel.Controls.Clear();
+        ClearControlsDisposing(panel);
         var header = headerLabel ?? new Label
         {
             Text = title,
@@ -5800,6 +7766,29 @@ try {{
         diffControl.Dock = DockStyle.Fill;
         panel.Controls.Add(diffControl);
         diffControl.BringToFront();
+    }
+
+    private void ClearHistoryDiffPanel()
+    {
+        ClearControlsDisposing(_historyDiffPanel, _historyDetailText);
+    }
+
+    internal static void ClearControlsDisposing(Control parent, params Control[] keepAlive)
+    {
+        var keep = keepAlive
+            .Where(control => control != null)
+            .ToHashSet();
+        var oldControls = parent.Controls.Cast<Control>().ToList();
+        parent.Controls.Clear();
+        foreach (var control in oldControls)
+        {
+            if (keep.Contains(control))
+            {
+                continue;
+            }
+
+            control.Dispose();
+        }
     }
 
     private void ShowDiffPreview(string title, string oldFilePath, string newFilePath)
@@ -5830,30 +7819,52 @@ try {{
 
 internal sealed class DiffPreviewData
 {
-    private DiffPreviewData(IReadOnlyList<ExcelCellDifference>? excelDifferences, IReadOnlyList<TextDiffRow>? textDifferences)
+    private DiffPreviewData(IReadOnlyList<ExcelCellDifference>? excelDifferences, TextDiffContent? textContent)
     {
         ExcelDifferences = excelDifferences;
-        TextDifferences = textDifferences;
+        TextContent = textContent;
     }
 
     public IReadOnlyList<ExcelCellDifference>? ExcelDifferences { get; }
-    public IReadOnlyList<TextDiffRow>? TextDifferences { get; }
+    public TextDiffContent? TextContent { get; }
+    public IReadOnlyList<TextDiffRow>? TextDifferences => TextContent?.Differences;
+
+    public string Summary
+    {
+        get
+        {
+            if (ExcelDifferences != null)
+            {
+                return ExcelDifferences.Count == 0 ? "没有发现单元格差异" : $"发现 {ExcelDifferences.Count} 个单元格差异";
+            }
+
+            var rows = TextContent?.Differences ?? [];
+            return rows.Count == 0 ? "没有发现文本差异" : $"发现 {rows.Count} 行文本差异";
+        }
+    }
 
     public static DiffPreviewData FromExcel(IReadOnlyList<ExcelCellDifference> differences)
     {
         return new DiffPreviewData(differences.ToList(), null);
     }
 
-    public static DiffPreviewData FromText(IReadOnlyList<TextDiffRow> differences)
+    public static DiffPreviewData FromText(TextDiffContent content)
     {
-        return new DiffPreviewData(null, differences.ToList());
+        return new DiffPreviewData(null, content with { Differences = content.Differences.ToList() });
+    }
+
+    public static DiffPreviewData FromTextRows(IReadOnlyList<TextDiffRow> differences)
+    {
+        return new DiffPreviewData(
+            null,
+            new TextDiffContent("", "", "plaintext", "旧版本", "新版本", differences.ToList()));
     }
 
     public Control CreateView()
     {
         return ExcelDifferences != null
             ? ExcelDiffForm.CreateExcelDiffView(ExcelDifferences)
-            : TextDiffForm.CreateTextDiffView(TextDifferences ?? []);
+            : TextContent != null ? TextDiffForm.CreateTextDiffView(TextContent) : TextDiffForm.CreateTextDiffView(TextDifferences ?? []);
     }
 }
 
@@ -6530,6 +8541,15 @@ internal sealed class SvnClient
         }
     }
 
+    public async Task WriteHeadFileAsync(string workingCopyPath, string relativePath, string outputPath, CancellationToken cancellationToken = default)
+    {
+        var result = await RunBinaryToFileAsync(workingCopyPath, outputPath, cancellationToken, "cat", "-r", "HEAD", relativePath);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.CombinedOutput);
+        }
+    }
+
     public async Task WriteRepositoryFileAtRevisionAsync(string workingCopyPath, string repositoryPath, long revision, string outputPath, CancellationToken cancellationToken = default)
     {
         var path = repositoryPath.StartsWith("^", StringComparison.Ordinal) ? repositoryPath : "^" + repositoryPath;
@@ -6721,7 +8741,7 @@ internal sealed class SvnClient
 
     private async Task<IReadOnlyList<SvnLogEntry>> GetLogForSingleTargetAsync(string workingCopyPath, string relativePath, int limit)
     {
-        var args = new List<string> { "log", "-v", "--limit", limit.ToString() };
+        var args = new List<string> { "log", "-v", "-r", "HEAD:1", "--limit", limit.ToString() };
         args.Add(relativePath);
         var result = await RunTextAsync(workingCopyPath, args.ToArray());
         if (result.ExitCode != 0)
@@ -6777,7 +8797,7 @@ internal sealed class SvnClient
 
     public async Task<IReadOnlyList<SvnLogEntry>> GetRepositoryLogAsync(string workingCopyPath, int limit)
     {
-        var result = await RunTextAsync(workingCopyPath, "log", "-v", "--limit", limit.ToString());
+        var result = await RunTextAsync(workingCopyPath, "log", "-v", "-r", "HEAD:1", "--limit", limit.ToString());
         if (result.ExitCode != 0)
         {
             throw new InvalidOperationException(result.CombinedOutput);
@@ -7049,20 +9069,8 @@ internal static class ExcelDiffService
 {
     public static IReadOnlyList<ExcelCellDifference> Compare(string oldFilePath, string newFilePath)
     {
-        if (IsXmlSpreadsheet(oldFilePath) || IsXmlSpreadsheet(newFilePath))
-        {
-            return CompareXmlSpreadsheet(oldFilePath, newFilePath);
-        }
-
-        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-
-        using var oldStream = File.OpenRead(oldFilePath);
-        using var newStream = File.OpenRead(newFilePath);
-        var oldWorkbook = WorkbookFactory.Create(oldStream);
-        var newWorkbook = WorkbookFactory.Create(newStream);
-
-        var oldCells = ReadCells(oldWorkbook);
-        var newCells = ReadCells(newWorkbook);
+        var oldCells = ReadCellValues(oldFilePath);
+        var newCells = ReadCellValues(newFilePath);
         var keys = oldCells.Keys
             .Union(newCells.Keys)
             .OrderBy(key => key.Sheet)
@@ -7085,30 +9093,23 @@ internal static class ExcelDiffService
         return differences;
     }
 
-    private static IReadOnlyList<ExcelCellDifference> CompareXmlSpreadsheet(string oldFilePath, string newFilePath)
+    public static Dictionary<ExcelCellKey, string> ReadCellValues(string filePath)
     {
-        var oldCells = ReadXmlSpreadsheetCells(oldFilePath);
-        var newCells = ReadXmlSpreadsheetCells(newFilePath);
-        var keys = oldCells.Keys
-            .Union(newCells.Keys)
-            .OrderBy(key => key.Sheet)
-            .ThenBy(key => key.Row)
-            .ThenBy(key => key.Column);
-        var differences = new List<ExcelCellDifference>();
-
-        foreach (var key in keys)
+        if (IsXmlSpreadsheet(filePath))
         {
-            oldCells.TryGetValue(key, out var oldValue);
-            newCells.TryGetValue(key, out var newValue);
-            oldValue ??= "";
-            newValue ??= "";
-            if (!string.Equals(oldValue, newValue, StringComparison.Ordinal))
-            {
-                differences.Add(CreateDifference(key, oldCells, newCells, oldValue, newValue));
-            }
+            return ReadXmlSpreadsheetCells(filePath);
         }
 
-        return differences;
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
+        using var stream = File.OpenRead(filePath);
+        var workbook = WorkbookFactory.Create(stream);
+        return ReadCells(workbook);
+    }
+
+    public static bool IsXmlSpreadsheetFile(string filePath)
+    {
+        return IsXmlSpreadsheet(filePath);
     }
 
     private static ExcelCellDifference CreateDifference(
@@ -7270,7 +9271,7 @@ internal static class ExcelDiffService
         return cells;
     }
 
-    private static string ToColumnName(int zeroBasedColumn)
+    public static string ToColumnName(int zeroBasedColumn)
     {
         var column = zeroBasedColumn + 1;
         var name = "";
@@ -7285,8 +9286,1611 @@ internal static class ExcelDiffService
     }
 }
 
+internal enum SpreadsheetMergeChangeKind
+{
+    AutoRemote,
+    LocalOnly,
+    SameBoth,
+    Conflict,
+}
+
+internal enum SpreadsheetMergeResolution
+{
+    UseLocal,
+    UseRemote,
+}
+
+internal sealed class SpreadsheetMergePlan
+{
+    public SpreadsheetMergePlan(
+        IReadOnlyList<SpreadsheetMergeChange> autoRemoteChanges,
+        IReadOnlyList<SpreadsheetMergeChange> localOnlyChanges,
+        IReadOnlyList<SpreadsheetMergeChange> sameBothChanges,
+        IReadOnlyList<SpreadsheetMergeChange> conflicts)
+    {
+        AutoRemoteChanges = autoRemoteChanges;
+        LocalOnlyChanges = localOnlyChanges;
+        SameBothChanges = sameBothChanges;
+        Conflicts = conflicts;
+    }
+
+    public IReadOnlyList<SpreadsheetMergeChange> AutoRemoteChanges { get; }
+    public IReadOnlyList<SpreadsheetMergeChange> LocalOnlyChanges { get; }
+    public IReadOnlyList<SpreadsheetMergeChange> SameBothChanges { get; }
+    public IReadOnlyList<SpreadsheetMergeChange> Conflicts { get; }
+    public IReadOnlyList<SpreadsheetMergeChange> AllChanges => AutoRemoteChanges
+        .Concat(LocalOnlyChanges)
+        .Concat(SameBothChanges)
+        .Concat(Conflicts)
+        .ToList();
+    public int ResolvedConflictCount => Conflicts.Count(change => change.Resolution == SpreadsheetMergeResolution.UseRemote);
+    public int PlannedWriteCount => AllChanges.Count(change =>
+        change.Resolution == SpreadsheetMergeResolution.UseRemote &&
+        !string.Equals(change.LocalValue, change.RemoteValue, StringComparison.Ordinal));
+    public int RelevantChangeCount => AutoRemoteChanges.Count + LocalOnlyChanges.Count + SameBothChanges.Count + Conflicts.Count;
+
+    public IReadOnlyList<SpreadsheetMergeWrite> BuildWrites()
+    {
+        return AllChanges
+            .Where(change => change.Resolution == SpreadsheetMergeResolution.UseRemote)
+            .Where(change => !string.Equals(change.LocalValue, change.RemoteValue, StringComparison.Ordinal))
+            .Select(change => new SpreadsheetMergeWrite(change.WriteCell, change.RemoteValue))
+            .GroupBy(write => write.Cell)
+            .Select(group => group.Last())
+            .ToList();
+    }
+}
+
+internal sealed class SpreadsheetMergeChange
+{
+    public SpreadsheetMergeChange(
+        SpreadsheetMergeChangeKind kind,
+        ExcelCellKey targetCell,
+        string fieldName,
+        string rowId,
+        string baseValue,
+        string localValue,
+        string remoteValue)
+    {
+        Kind = kind;
+        TargetCell = targetCell;
+        WriteCell = targetCell;
+        FieldName = string.IsNullOrWhiteSpace(fieldName) ? "(未命名字段)" : fieldName;
+        RowId = string.IsNullOrWhiteSpace(rowId) ? "(无 ID)" : rowId;
+        BaseValue = baseValue;
+        LocalValue = localValue;
+        RemoteValue = remoteValue;
+        Resolution = kind == SpreadsheetMergeChangeKind.AutoRemote
+            ? SpreadsheetMergeResolution.UseRemote
+            : SpreadsheetMergeResolution.UseLocal;
+    }
+
+    public SpreadsheetMergeChangeKind Kind { get; }
+    public ExcelCellKey TargetCell { get; }
+    public ExcelCellKey WriteCell { get; set; }
+    public string FieldName { get; }
+    public string RowId { get; }
+    public string BaseValue { get; }
+    public string LocalValue { get; }
+    public string RemoteValue { get; }
+    public SpreadsheetMergeResolution Resolution { get; set; }
+    public string Sheet => TargetCell.Sheet;
+    public string ColumnName => ExcelDiffService.ToColumnName(TargetCell.Column);
+    public string Address => $"{ColumnName}{TargetCell.Row + 1}";
+}
+
+internal sealed record SpreadsheetMergeWrite(ExcelCellKey Cell, string Value);
+
+internal sealed record SpreadsheetMergeRawCell(
+    ExcelCellKey Cell,
+    string Value,
+    string FieldName,
+    string RowId,
+    string SemanticKey,
+    bool HasSemanticKey)
+{
+    public string PhysicalKey => SpreadsheetThreeWayMergeService.CreatePhysicalKey(Cell);
+}
+
+internal sealed record SpreadsheetMergeCell(
+    string MergeKey,
+    ExcelCellKey Cell,
+    string Value,
+    string FieldName,
+    string RowId);
+
+internal sealed class SpreadsheetMergeSheetLayout
+{
+    public SpreadsheetMergeSheetLayout(string sheet, int fieldHeaderRow, Dictionary<int, string> headers, IReadOnlyList<int> keyColumns)
+    {
+        Sheet = sheet;
+        FieldHeaderRow = fieldHeaderRow;
+        Headers = headers;
+        KeyColumns = keyColumns;
+    }
+
+    public string Sheet { get; }
+    public int FieldHeaderRow { get; }
+    public Dictionary<int, string> Headers { get; }
+    public IReadOnlyList<int> KeyColumns { get; }
+    public bool HasKey => KeyColumns.Count > 0;
+
+    public string FieldName(int column)
+    {
+        return Headers.TryGetValue(column, out var header) && !string.IsNullOrWhiteSpace(header)
+            ? header
+            : $"col_{column + 1}";
+    }
+
+    public string RowKey(Dictionary<ExcelCellKey, string> cells, int row)
+    {
+        if (KeyColumns.Count == 0)
+        {
+            return "";
+        }
+
+        var values = KeyColumns
+            .Select(column => GetCellValue(cells, Sheet, row, column).Trim())
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .ToList();
+        return values.Count == KeyColumns.Count ? string.Join("/", values) : "";
+    }
+
+    private static string GetCellValue(Dictionary<ExcelCellKey, string> cells, string sheet, int row, int column)
+    {
+        return cells.TryGetValue(new ExcelCellKey(sheet, row, column), out var value) ? value : "";
+    }
+}
+
+internal static class SpreadsheetThreeWayMergeService
+{
+    private static readonly Regex FieldTokenRegex = new("^[a-zA-Z0-9_]+$", RegexOptions.Compiled);
+    private static readonly Regex HeaderNonWordRegex = new(@"[^\w\u4e00-\u9fff]+", RegexOptions.Compiled);
+    private static readonly Regex HeaderUnderscoreRegex = new("_+", RegexOptions.Compiled);
+    private static readonly Regex KeyFieldRegex = new(@"(?:^|_)(id|level|key|code|name|type)(?:$|_)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public static bool IsSupportedPath(string filePath)
+    {
+        return DiffFileKindDetector.IsSpreadsheet(filePath);
+    }
+
+    public static SpreadsheetMergePlan BuildPlan(string baseFilePath, string localFilePath, string remoteFilePath)
+    {
+        var baseRaw = ReadRawCells(baseFilePath);
+        var localRaw = ReadRawCells(localFilePath);
+        var remoteRaw = ReadRawCells(remoteFilePath);
+        var unsafeSemanticKeys = FindUnsafeSemanticKeys(baseRaw, localRaw, remoteRaw);
+        var baseCells = MaterializeCells(baseRaw, unsafeSemanticKeys);
+        var localCells = MaterializeCells(localRaw, unsafeSemanticKeys);
+        var remoteCells = MaterializeCells(remoteRaw, unsafeSemanticKeys);
+
+        var keys = baseCells.Keys
+            .Union(localCells.Keys)
+            .Union(remoteCells.Keys)
+            .OrderBy(key => PickCell(key, localCells, baseCells, remoteCells)?.Cell.Sheet)
+            .ThenBy(key => PickCell(key, localCells, baseCells, remoteCells)?.Cell.Row)
+            .ThenBy(key => PickCell(key, localCells, baseCells, remoteCells)?.Cell.Column)
+            .ToList();
+
+        var autoRemote = new List<SpreadsheetMergeChange>();
+        var localOnly = new List<SpreadsheetMergeChange>();
+        var sameBoth = new List<SpreadsheetMergeChange>();
+        var conflicts = new List<SpreadsheetMergeChange>();
+
+        foreach (var key in keys)
+        {
+            baseCells.TryGetValue(key, out var baseCell);
+            localCells.TryGetValue(key, out var localCell);
+            remoteCells.TryGetValue(key, out var remoteCell);
+
+            var baseValue = baseCell?.Value ?? "";
+            var localValue = localCell?.Value ?? "";
+            var remoteValue = remoteCell?.Value ?? "";
+            var localChanged = !string.Equals(localValue, baseValue, StringComparison.Ordinal);
+            var remoteChanged = !string.Equals(remoteValue, baseValue, StringComparison.Ordinal);
+            if (!localChanged && !remoteChanged)
+            {
+                continue;
+            }
+
+            var target = PickCell(key, localCells, baseCells, remoteCells) ?? throw new InvalidOperationException("无法定位合并单元格。");
+            var fieldName = FirstNonEmpty(localCell?.FieldName, remoteCell?.FieldName, baseCell?.FieldName);
+            var rowId = FirstNonEmpty(localCell?.RowId, remoteCell?.RowId, baseCell?.RowId);
+
+            if (remoteChanged && !localChanged)
+            {
+                autoRemote.Add(new SpreadsheetMergeChange(SpreadsheetMergeChangeKind.AutoRemote, target.Cell, fieldName, rowId, baseValue, localValue, remoteValue));
+                continue;
+            }
+
+            if (localChanged && !remoteChanged)
+            {
+                localOnly.Add(new SpreadsheetMergeChange(SpreadsheetMergeChangeKind.LocalOnly, target.Cell, fieldName, rowId, baseValue, localValue, remoteValue));
+                continue;
+            }
+
+            if (string.Equals(localValue, remoteValue, StringComparison.Ordinal))
+            {
+                sameBoth.Add(new SpreadsheetMergeChange(SpreadsheetMergeChangeKind.SameBoth, target.Cell, fieldName, rowId, baseValue, localValue, remoteValue));
+                continue;
+            }
+
+            conflicts.Add(new SpreadsheetMergeChange(SpreadsheetMergeChangeKind.Conflict, target.Cell, fieldName, rowId, baseValue, localValue, remoteValue));
+        }
+
+        return new SpreadsheetMergePlan(autoRemote, localOnly, sameBoth, conflicts);
+    }
+
+    public static string CreateBackup(string localFilePath)
+    {
+        var directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "SVNManager",
+            "merge-backups",
+            DateTime.Now.ToString("yyyyMMdd"));
+        Directory.CreateDirectory(directory);
+        var fileName = Path.GetFileNameWithoutExtension(localFilePath);
+        var extension = Path.GetExtension(localFilePath);
+        var backupPath = Path.Combine(directory, $"{fileName}_{DateTime.Now:HHmmss_fff}{extension}");
+        File.Copy(localFilePath, backupPath, overwrite: false);
+        return backupPath;
+    }
+
+    public static void ApplyWrites(string localFilePath, IReadOnlyList<SpreadsheetMergeWrite> writes)
+    {
+        if (writes.Count == 0)
+        {
+            return;
+        }
+
+        if (ExcelDiffService.IsXmlSpreadsheetFile(localFilePath))
+        {
+            ApplyXmlWrites(localFilePath, writes);
+            return;
+        }
+
+        ApplyWorkbookWrites(localFilePath, writes);
+    }
+
+    public static string CreatePhysicalKey(ExcelCellKey cell)
+    {
+        return $"P|{cell.Sheet}|{cell.Row}|{cell.Column}";
+    }
+
+    private static IReadOnlyList<SpreadsheetMergeRawCell> ReadRawCells(string filePath)
+    {
+        var cells = ExcelDiffService.ReadCellValues(filePath);
+        var layouts = InferSheetLayouts(cells);
+        return cells
+            .Select(pair =>
+            {
+                var cell = pair.Key;
+                var layout = layouts.TryGetValue(cell.Sheet, out var inferredLayout)
+                    ? inferredLayout
+                    : new SpreadsheetMergeSheetLayout(cell.Sheet, 1, [], []);
+                var fieldName = layout.FieldName(cell.Column);
+                var rowId = layout.RowKey(cells, cell.Row);
+                var hasSemanticKey = layout.HasKey &&
+                    cell.Row > layout.FieldHeaderRow &&
+                    !string.IsNullOrWhiteSpace(rowId) &&
+                    !string.IsNullOrWhiteSpace(fieldName);
+                var semanticKey = hasSemanticKey
+                    ? $"S|{cell.Sheet}|{rowId.Trim()}|{NormalizeHeader(fieldName)}"
+                    : "";
+                return new SpreadsheetMergeRawCell(cell, pair.Value, fieldName, rowId, semanticKey, hasSemanticKey);
+            })
+            .ToList();
+    }
+
+    private static Dictionary<string, SpreadsheetMergeSheetLayout> InferSheetLayouts(Dictionary<ExcelCellKey, string> cells)
+    {
+        return cells.Keys
+            .Select(key => key.Sheet)
+            .Distinct(StringComparer.Ordinal)
+            .ToDictionary(
+                sheet => sheet,
+                sheet => InferSheetLayout(sheet, cells),
+                StringComparer.Ordinal);
+    }
+
+    private static SpreadsheetMergeSheetLayout InferSheetLayout(string sheet, Dictionary<ExcelCellKey, string> cells)
+    {
+        var sheetCells = cells
+            .Where(pair => string.Equals(pair.Key.Sheet, sheet, StringComparison.Ordinal))
+            .ToList();
+        if (sheetCells.Count == 0)
+        {
+            return new SpreadsheetMergeSheetLayout(sheet, 1, [], []);
+        }
+
+        var maxRow = sheetCells.Max(pair => pair.Key.Row);
+        var maxColumn = sheetCells.Max(pair => pair.Key.Column);
+        var fieldHeaderRow = InferFieldHeaderRow(sheet, cells, maxRow);
+        var headers = Enumerable.Range(0, maxColumn + 1)
+            .ToDictionary(column => column, column =>
+            {
+                var value = GetCellValue(cells, sheet, fieldHeaderRow, column).Trim();
+                return string.IsNullOrWhiteSpace(value) ? $"col_{column + 1}" : value;
+            });
+        var keyColumns = InferKeyColumns(sheet, cells, headers, fieldHeaderRow, maxRow);
+        return new SpreadsheetMergeSheetLayout(sheet, fieldHeaderRow, headers, keyColumns);
+    }
+
+    private static int InferFieldHeaderRow(string sheet, Dictionary<ExcelCellKey, string> cells, int maxRow)
+    {
+        var bestRow = 0;
+        var bestScore = -1.0;
+        var limit = Math.Min(maxRow, 11);
+        for (var row = 0; row <= limit; row++)
+        {
+            var values = RowValues(cells, sheet, row)
+                .Select(value => value.Trim())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .ToList();
+            if (values.Count == 0)
+            {
+                continue;
+            }
+
+            var tokenCount = values.Count(value => FieldTokenRegex.IsMatch(value));
+            var score = (double)tokenCount / values.Count;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestRow = row;
+            }
+        }
+
+        return bestRow;
+    }
+
+    private static IReadOnlyList<int> InferKeyColumns(
+        string sheet,
+        Dictionary<ExcelCellKey, string> cells,
+        Dictionary<int, string> headers,
+        int fieldHeaderRow,
+        int maxRow)
+    {
+        var dataRows = Enumerable.Range(fieldHeaderRow + 1, Math.Max(0, maxRow - fieldHeaderRow))
+            .Where(row => RowNonEmptyCount(cells, sheet, row) >= 2)
+            .ToList();
+        if (dataRows.Count == 0)
+        {
+            return [];
+        }
+
+        foreach (var exactIdColumn in headers
+            .Where(pair => string.Equals(NormalizeHeader(pair.Value), "id", StringComparison.Ordinal))
+            .Select(pair => pair.Key))
+        {
+            var keys = dataRows
+                .Select(row => GetCellValue(cells, sheet, row, exactIdColumn).Trim())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .ToList();
+            if (keys.Count > 0 && keys.Distinct(StringComparer.Ordinal).Count() == keys.Count)
+            {
+                return [exactIdColumn];
+            }
+        }
+
+        var candidates = headers
+            .Where(pair => KeyFieldRegex.IsMatch(NormalizeHeader(pair.Value)))
+            .Select(pair => pair.Key)
+            .Take(6)
+            .ToList();
+        if (candidates.Count == 0)
+        {
+            return [];
+        }
+
+        IReadOnlyList<int> bestColumns = [];
+        var bestScore = -1.0;
+        for (var width = 1; width <= Math.Min(3, candidates.Count); width++)
+        {
+            foreach (var columns in Combinations(candidates, width))
+            {
+                var keys = dataRows
+                    .Select(row => columns.Select(column => GetCellValue(cells, sheet, row, column).Trim()).ToArray())
+                    .Where(values => values.All(value => !string.IsNullOrWhiteSpace(value)))
+                    .Select(values => string.Join("\u001f", values))
+                    .ToList();
+                if (keys.Count == 0 || keys.Distinct(StringComparer.Ordinal).Count() != keys.Count)
+                {
+                    continue;
+                }
+
+                var coverage = (double)keys.Count / dataRows.Count;
+                var idBonus = columns.Count(column => NormalizeHeader(headers[column]).Contains("id", StringComparison.Ordinal)) * 0.15;
+                var score = coverage + idBonus;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestColumns = columns.ToList();
+                }
+            }
+        }
+
+        return bestScore >= 0.8 ? bestColumns : [];
+    }
+
+    private static IEnumerable<IReadOnlyList<int>> Combinations(IReadOnlyList<int> values, int width)
+    {
+        var selected = new int[width];
+        return Build(0, 0);
+
+        IEnumerable<IReadOnlyList<int>> Build(int start, int depth)
+        {
+            if (depth == width)
+            {
+                yield return selected.ToArray();
+                yield break;
+            }
+
+            for (var index = start; index <= values.Count - (width - depth); index++)
+            {
+                selected[depth] = values[index];
+                foreach (var item in Build(index + 1, depth + 1))
+                {
+                    yield return item;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> RowValues(Dictionary<ExcelCellKey, string> cells, string sheet, int row)
+    {
+        return cells
+            .Where(pair => string.Equals(pair.Key.Sheet, sheet, StringComparison.Ordinal) && pair.Key.Row == row)
+            .OrderBy(pair => pair.Key.Column)
+            .Select(pair => pair.Value);
+    }
+
+    private static int RowNonEmptyCount(Dictionary<ExcelCellKey, string> cells, string sheet, int row)
+    {
+        return RowValues(cells, sheet, row).Count(value => !string.IsNullOrWhiteSpace(value));
+    }
+
+    private static string NormalizeHeader(string value)
+    {
+        var text = (value ?? "").Trim().ToLowerInvariant();
+        text = HeaderNonWordRegex.Replace(text, "_");
+        text = HeaderUnderscoreRegex.Replace(text, "_").Trim('_');
+        return string.IsNullOrWhiteSpace(text) ? "unknown" : text;
+    }
+
+    private static HashSet<string> FindUnsafeSemanticKeys(params IReadOnlyList<SpreadsheetMergeRawCell>[] versions)
+    {
+        var unsafeKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var version in versions)
+        {
+            foreach (var group in version.Where(cell => cell.HasSemanticKey).GroupBy(cell => cell.SemanticKey))
+            {
+                if (group.Count() > 1)
+                {
+                    unsafeKeys.Add(group.Key);
+                }
+            }
+        }
+
+        return unsafeKeys;
+    }
+
+    private static Dictionary<string, SpreadsheetMergeCell> MaterializeCells(
+        IReadOnlyList<SpreadsheetMergeRawCell> rawCells,
+        HashSet<string> unsafeSemanticKeys)
+    {
+        return rawCells
+            .Select(raw =>
+            {
+                var key = raw.HasSemanticKey && !unsafeSemanticKeys.Contains(raw.SemanticKey)
+                    ? raw.SemanticKey
+                    : raw.PhysicalKey;
+                return new SpreadsheetMergeCell(key, raw.Cell, raw.Value, raw.FieldName, raw.RowId);
+            })
+            .GroupBy(cell => cell.MergeKey, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
+    }
+
+    private static SpreadsheetMergeCell? PickCell(
+        string key,
+        Dictionary<string, SpreadsheetMergeCell> localCells,
+        Dictionary<string, SpreadsheetMergeCell> baseCells,
+        Dictionary<string, SpreadsheetMergeCell> remoteCells)
+    {
+        if (localCells.TryGetValue(key, out var localCell))
+        {
+            return localCell;
+        }
+
+        if (baseCells.TryGetValue(key, out var baseCell))
+        {
+            return baseCell;
+        }
+
+        return remoteCells.TryGetValue(key, out var remoteCell) ? remoteCell : null;
+    }
+
+    private static string GetCellValue(Dictionary<ExcelCellKey, string> cells, string sheet, int row, int column)
+    {
+        return cells.TryGetValue(new ExcelCellKey(sheet, row, column), out var value) ? value : "";
+    }
+
+    private static string FirstNonEmpty(params string?[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
+    }
+
+    private static void ApplyWorkbookWrites(string localFilePath, IReadOnlyList<SpreadsheetMergeWrite> writes)
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        IWorkbook workbook;
+        using (var input = File.OpenRead(localFilePath))
+        {
+            workbook = WorkbookFactory.Create(input);
+        }
+
+        foreach (var write in writes)
+        {
+            var sheet = workbook.GetSheet(write.Cell.Sheet) ?? workbook.CreateSheet(write.Cell.Sheet);
+            var row = sheet.GetRow(write.Cell.Row) ?? sheet.CreateRow(write.Cell.Row);
+            var cell = row.GetCell(write.Cell.Column) ?? row.CreateCell(write.Cell.Column);
+            if (string.IsNullOrEmpty(write.Value))
+            {
+                cell.SetCellType(CellType.Blank);
+            }
+            else
+            {
+                cell.SetCellValue(write.Value);
+            }
+        }
+
+        using var output = File.Create(localFilePath);
+        workbook.Write(output);
+        workbook.Close();
+    }
+
+    private static void ApplyXmlWrites(string localFilePath, IReadOnlyList<SpreadsheetMergeWrite> writes)
+    {
+        var document = XDocument.Load(localFilePath, LoadOptions.PreserveWhitespace);
+        XNamespace spreadsheet = "urn:schemas-microsoft-com:office:spreadsheet";
+        var root = document.Root ?? throw new InvalidOperationException("XML 表格缺少 Workbook 根节点。");
+
+        foreach (var write in writes)
+        {
+            var worksheet = GetOrCreateWorksheet(root, spreadsheet, write.Cell.Sheet);
+            var table = worksheet.Element(spreadsheet + "Table");
+            if (table == null)
+            {
+                table = new XElement(spreadsheet + "Table");
+                worksheet.Add(table);
+            }
+
+            var row = GetOrCreateXmlRow(table, spreadsheet, write.Cell.Row);
+            var cell = GetOrCreateXmlCell(row, spreadsheet, write.Cell.Column);
+            RemoveXmlFormulaAttributes(cell, spreadsheet);
+            var data = cell.Elements().FirstOrDefault(element => element.Name.LocalName == "Data");
+            if (data == null)
+            {
+                data = new XElement(spreadsheet + "Data", new XAttribute(spreadsheet + "Type", "String"));
+                cell.Add(data);
+            }
+
+            data.Value = NormalizeXmlCellText(write.Value);
+            if (string.IsNullOrWhiteSpace(data.Attribute(spreadsheet + "Type")?.Value))
+            {
+                data.SetAttributeValue(spreadsheet + "Type", GuessXmlCellType(write.Value));
+            }
+        }
+
+        foreach (var table in root.Descendants(spreadsheet + "Table"))
+        {
+            UpdateXmlTableExtents(table, spreadsheet);
+        }
+
+        document.Save(localFilePath);
+    }
+
+    private static void RemoveXmlFormulaAttributes(XElement cell, XNamespace spreadsheet)
+    {
+        cell.Attribute(spreadsheet + "Formula")?.Remove();
+        cell.Attribute(spreadsheet + "ArrayRange")?.Remove();
+    }
+
+    private static void UpdateXmlTableExtents(XElement table, XNamespace spreadsheet)
+    {
+        var maxRow = 0;
+        var maxColumn = 0;
+        var rowIndex = 0;
+        foreach (var row in table.Elements(spreadsheet + "Row"))
+        {
+            var explicitRowIndex = ReadSpreadsheetIndex(row, spreadsheet);
+            if (explicitRowIndex.HasValue)
+            {
+                rowIndex = explicitRowIndex.Value - 1;
+            }
+
+            maxRow = Math.Max(maxRow, rowIndex + 1);
+            var columnIndex = 0;
+            foreach (var cell in row.Elements(spreadsheet + "Cell"))
+            {
+                var explicitColumnIndex = ReadSpreadsheetIndex(cell, spreadsheet);
+                if (explicitColumnIndex.HasValue)
+                {
+                    columnIndex = explicitColumnIndex.Value - 1;
+                }
+
+                maxColumn = Math.Max(maxColumn, columnIndex + 1);
+                columnIndex++;
+            }
+
+            rowIndex++;
+        }
+
+        if (maxRow > 0)
+        {
+            table.SetAttributeValue(spreadsheet + "ExpandedRowCount", maxRow.ToString());
+        }
+
+        if (maxColumn > 0)
+        {
+            table.SetAttributeValue(spreadsheet + "ExpandedColumnCount", maxColumn.ToString());
+        }
+    }
+
+    private static XElement GetOrCreateWorksheet(XElement root, XNamespace spreadsheet, string sheetName)
+    {
+        var worksheet = root
+            .Elements(spreadsheet + "Worksheet")
+            .FirstOrDefault(element => string.Equals(element.Attribute(spreadsheet + "Name")?.Value, sheetName, StringComparison.Ordinal));
+        if (worksheet != null)
+        {
+            return worksheet;
+        }
+
+        worksheet = new XElement(spreadsheet + "Worksheet", new XAttribute(spreadsheet + "Name", sheetName));
+        root.Add(worksheet);
+        return worksheet;
+    }
+
+    private static XElement GetOrCreateXmlRow(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    {
+        var rowIndex = 0;
+        foreach (var row in table.Elements(spreadsheet + "Row"))
+        {
+            var explicitIndex = ReadSpreadsheetIndex(row, spreadsheet);
+            if (explicitIndex.HasValue)
+            {
+                rowIndex = explicitIndex.Value - 1;
+            }
+
+            if (rowIndex == zeroBasedRow)
+            {
+                return row;
+            }
+
+            if (rowIndex > zeroBasedRow)
+            {
+                var created = new XElement(spreadsheet + "Row", new XAttribute(spreadsheet + "Index", zeroBasedRow + 1));
+                row.AddBeforeSelf(created);
+                return created;
+            }
+
+            rowIndex++;
+        }
+
+        var appended = new XElement(spreadsheet + "Row", new XAttribute(spreadsheet + "Index", zeroBasedRow + 1));
+        table.Add(appended);
+        return appended;
+    }
+
+    private static XElement GetOrCreateXmlCell(XElement row, XNamespace spreadsheet, int zeroBasedColumn)
+    {
+        var columnIndex = 0;
+        foreach (var cell in row.Elements(spreadsheet + "Cell"))
+        {
+            var explicitIndex = ReadSpreadsheetIndex(cell, spreadsheet);
+            if (explicitIndex.HasValue)
+            {
+                columnIndex = explicitIndex.Value - 1;
+            }
+
+            if (columnIndex == zeroBasedColumn)
+            {
+                return cell;
+            }
+
+            if (columnIndex > zeroBasedColumn)
+            {
+                var created = new XElement(spreadsheet + "Cell", new XAttribute(spreadsheet + "Index", zeroBasedColumn + 1));
+                cell.AddBeforeSelf(created);
+                return created;
+            }
+
+            columnIndex++;
+        }
+
+        var appended = new XElement(spreadsheet + "Cell", new XAttribute(spreadsheet + "Index", zeroBasedColumn + 1));
+        row.Add(appended);
+        return appended;
+    }
+
+    private static int? ReadSpreadsheetIndex(XElement element, XNamespace spreadsheet)
+    {
+        var value = element.Attribute(spreadsheet + "Index")?.Value;
+        return int.TryParse(value, out var index) ? index : null;
+    }
+
+    private static string NormalizeXmlCellText(string value)
+    {
+        return (value ?? "").Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+    }
+
+    private static string GuessXmlCellType(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "String";
+        }
+
+        return double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _)
+            ? "Number"
+            : "String";
+    }
+}
+
+internal sealed class CrossRepositorySpreadsheetMergeForm : Form
+{
+    private readonly TextBox _baseFileText = new();
+    private readonly TextBox _changedFileText = new();
+    private readonly TextBox _targetFileText = new();
+
+    public CrossRepositorySpreadsheetMergeForm(string defaultTargetFile)
+    {
+        Text = "跨库表格三方合并";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(780, 300);
+        Size = new Size(900, 340);
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 6,
+            Padding = new Padding(14),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        Controls.Add(root);
+
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(45, 55, 72),
+            Text = "以 A 为基线，计算 A -> B 的改动，再合并到目标 C。C 中相对 A 独立修改过的单元格会保留；双方改同一格且结果不同会进入冲突选择表。",
+        }, 0, 0);
+
+        root.Controls.Add(CreatePathRow("A 改动前", _baseFileText, "选择 A"), 0, 1);
+        root.Controls.Add(CreatePathRow("B 改动后", _changedFileText, "选择 B"), 0, 2);
+        root.Controls.Add(CreatePathRow("C 目标文件", _targetFileText, "选择 C"), 0, 3);
+        _targetFileText.Text = defaultTargetFile;
+
+        var hint = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.TopLeft,
+            ForeColor = Color.FromArgb(100, 116, 139),
+            Text = "支持 .xls / .xlsx / .xlsm / SpreadsheetML XML。开始后会先显示合并项目清单，确认写入前会自动备份 C。",
+        };
+        root.Controls.Add(hint, 0, 4);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+        };
+        var startButton = new Button { Text = "开始合并", Width = 96, DialogResult = DialogResult.OK };
+        var cancelButton = new Button { Text = "取消", Width = 86, DialogResult = DialogResult.Cancel };
+        startButton.Click += (_, args) =>
+        {
+            if (!ValidateInputPaths(out var message))
+            {
+                MessageBox.Show(this, message, "无法开始合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                DialogResult = DialogResult.None;
+            }
+        };
+        buttons.Controls.Add(startButton);
+        buttons.Controls.Add(cancelButton);
+        root.Controls.Add(buttons, 0, 5);
+        AcceptButton = startButton;
+        CancelButton = cancelButton;
+    }
+
+    public string BaseFilePath => _baseFileText.Text.Trim();
+
+    public string ChangedFilePath => _changedFileText.Text.Trim();
+
+    public string TargetFilePath => _targetFileText.Text.Trim();
+
+    private static Control CreatePathRow(string labelText, TextBox textBox, string buttonText)
+    {
+        var row = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
+            Margin = new Padding(0, 0, 0, 6),
+        };
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+        row.Controls.Add(new Label
+        {
+            Text = labelText,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
+
+        textBox.Dock = DockStyle.Fill;
+        textBox.Margin = new Padding(0, 4, 8, 4);
+        row.Controls.Add(textBox, 1, 0);
+
+        var browseButton = new Button { Text = buttonText, Dock = DockStyle.Fill, Margin = new Padding(0, 3, 0, 3) };
+        browseButton.Click += (_, _) => BrowseSpreadsheetFile(textBox);
+        row.Controls.Add(browseButton, 2, 0);
+        return row;
+    }
+
+    private static void BrowseSpreadsheetFile(TextBox textBox)
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Filter = "表格文件 (*.xml;*.xls;*.xlsx;*.xlsm)|*.xml;*.xls;*.xlsx;*.xlsm|所有文件 (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false,
+        };
+        var current = textBox.Text.Trim();
+        if (!string.IsNullOrWhiteSpace(current) && File.Exists(current))
+        {
+            dialog.InitialDirectory = Path.GetDirectoryName(current);
+            dialog.FileName = Path.GetFileName(current);
+        }
+
+        if (dialog.ShowDialog() == DialogResult.OK)
+        {
+            textBox.Text = dialog.FileName;
+        }
+    }
+
+    private bool ValidateInputPaths(out string message)
+    {
+        var paths = new[]
+        {
+            ("A 改动前", BaseFilePath),
+            ("B 改动后", ChangedFilePath),
+            ("C 目标文件", TargetFilePath),
+        };
+
+        foreach (var (name, path) in paths)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                message = $"请选择 {name}。";
+                return false;
+            }
+
+            if (!File.Exists(path))
+            {
+                message = $"{name} 不存在：{path}";
+                return false;
+            }
+
+            if (!SpreadsheetThreeWayMergeService.IsSupportedPath(path))
+            {
+                message = $"{name} 不是支持的表格文件：{path}";
+                return false;
+            }
+        }
+
+        message = "";
+        return true;
+    }
+}
+
+internal sealed class SpreadsheetMergeConflictForm : Form
+{
+    private readonly SpreadsheetMergePlan _plan;
+    private readonly List<SpreadsheetMergeConflictGridRow> _rows;
+    private readonly BindingSource _source = new();
+    private readonly DataGridView _grid = new();
+    private readonly Label _summaryLabel = new();
+    private readonly Label _detailTitleLabel = new();
+    private readonly RichTextBox _baseDetailBox = new();
+    private readonly RichTextBox _targetDetailBox = new();
+    private readonly RichTextBox _sourceDetailBox = new();
+    private readonly string _targetLabel;
+    private readonly string _sourceLabel;
+    private readonly string _localResolutionText;
+    private readonly string _remoteResolutionText;
+
+    public SpreadsheetMergeConflictForm(
+        string relativePath,
+        SpreadsheetMergePlan plan,
+        string titlePrefix = "内置表格三方合并",
+        string targetLabel = "本地",
+        string sourceLabel = "远端 HEAD",
+        string applyButtonText = "写入工作副本")
+    {
+        _plan = plan;
+        _targetLabel = targetLabel;
+        _sourceLabel = sourceLabel;
+        _localResolutionText = string.Equals(targetLabel, "本地", StringComparison.Ordinal)
+            ? "保留本地"
+            : $"保留{targetLabel}";
+        _remoteResolutionText = string.Equals(sourceLabel, "远端 HEAD", StringComparison.Ordinal)
+            ? "使用远端"
+            : $"使用{sourceLabel}";
+        _rows = plan.AllChanges.Select(change => new SpreadsheetMergeConflictGridRow(change, _localResolutionText, _remoteResolutionText)).ToList();
+        Text = $"{titlePrefix} - {relativePath}";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(1180, 700);
+        Size = new Size(1400, 840);
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 188));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        Controls.Add(root);
+
+        _summaryLabel.Dock = DockStyle.Fill;
+        _summaryLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _summaryLabel.ForeColor = Color.FromArgb(45, 55, 72);
+        root.Controls.Add(_summaryLabel, 0, 0);
+
+        ConfigureGrid();
+        root.Controls.Add(_grid, 0, 1);
+        root.Controls.Add(CreateDetailPanel(), 0, 2);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+        };
+        var applyButton = new Button { Text = applyButtonText, Width = 118 };
+        var cancelButton = new Button { Text = "取消", Width = 86, DialogResult = DialogResult.Cancel };
+        var allRemoteButton = new Button { Text = $"全部选{sourceLabel}", Width = 120 };
+        var allLocalButton = new Button { Text = $"全部选{targetLabel}", Width = 120 };
+        applyButton.Click += (_, _) =>
+        {
+            if (ApplyRowsToPlan())
+            {
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+        };
+        allRemoteButton.Click += (_, _) => SetAll(_remoteResolutionText);
+        allLocalButton.Click += (_, _) => SetAll(_localResolutionText);
+        buttons.Controls.Add(applyButton);
+        buttons.Controls.Add(cancelButton);
+        buttons.Controls.Add(allRemoteButton);
+        buttons.Controls.Add(allLocalButton);
+        root.Controls.Add(buttons, 0, 3);
+        AcceptButton = applyButton;
+        CancelButton = cancelButton;
+        UpdateSummary();
+        UpdateMergeDetail();
+    }
+
+    private void ConfigureGrid()
+    {
+        _grid.Dock = DockStyle.Fill;
+        _grid.AllowUserToAddRows = false;
+        _grid.AllowUserToDeleteRows = false;
+        _grid.AutoGenerateColumns = false;
+        _grid.RowHeadersVisible = false;
+        _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _grid.BackgroundColor = Color.White;
+        _grid.BorderStyle = System.Windows.Forms.BorderStyle.None;
+        _grid.GridColor = Color.FromArgb(226, 232, 240);
+        _grid.EnableHeadersVisualStyles = false;
+        _grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
+        _grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(45, 55, 72);
+        _grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        _grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
+        _grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(15, 23, 42);
+        _grid.RowTemplate.Height = 86;
+        _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None;
+        _grid.DataBindingComplete += (_, _) => ApplyRowStyles();
+        _grid.SelectionChanged += (_, _) => UpdateMergeDetail();
+        _grid.CellPainting += PaintMergeComparisonCell;
+        _grid.CellDoubleClick += (_, args) =>
+        {
+            if (args.RowIndex >= 0 && _grid.Rows[args.RowIndex].DataBoundItem is SpreadsheetMergeConflictGridRow row)
+            {
+                ShowMergeCellDetail(row);
+            }
+        };
+        _grid.CellValueChanged += (_, args) =>
+        {
+            if (args.RowIndex >= 0)
+            {
+                UpdateSummary();
+                ApplyRowStyles();
+                UpdateMergeDetail();
+            }
+        };
+        _grid.DataError += (_, args) => args.ThrowException = false;
+        _grid.CurrentCellDirtyStateChanged += (_, _) =>
+        {
+            if (_grid.IsCurrentCellDirty)
+            {
+                _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            }
+        };
+        _grid.CellToolTipTextNeeded += (_, args) =>
+        {
+            if (args.RowIndex < 0 || args.RowIndex >= _rows.Count)
+            {
+                return;
+            }
+
+            var row = _rows[args.RowIndex];
+            args.ToolTipText =
+                $"BASE：{row.BaseValue}{Environment.NewLine}" +
+                $"{_targetLabel}：{row.LocalValue}{Environment.NewLine}" +
+                $"{_sourceLabel}：{row.RemoteValue}";
+        };
+
+        _grid.Columns.Add(new DataGridViewComboBoxColumn
+        {
+            HeaderText = "选择",
+            DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.Resolution),
+            DataSource = new[] { _localResolutionText, _remoteResolutionText },
+            Width = 108,
+        });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "类型", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.KindText), Width = 108, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "默认位置", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.DefaultLocation), Width = 150, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "写入工作表", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.WriteSheet), Width = 120 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "写入单元格", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.WriteAddress), Width = 88 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ID", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.RowId), Width = 126, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "字段", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.FieldName), Width = 144, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "合并对比（双击看完整内容）",
+            Name = "MergeComparison",
+            DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.ComparisonText),
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            MinimumWidth = 420,
+            ReadOnly = true,
+        });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "BASE", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.BaseValue), Visible = false, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = _targetLabel, DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.LocalValue), Visible = false, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = _sourceLabel, DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.RemoteValue), Visible = false, ReadOnly = true });
+
+        _source.DataSource = _rows;
+        _grid.DataSource = _source;
+    }
+
+    private Control CreateDetailPanel()
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = new Padding(0, 8, 0, 0),
+            BackColor = Color.White,
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        _detailTitleLabel.Dock = DockStyle.Fill;
+        _detailTitleLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _detailTitleLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        _detailTitleLabel.ForeColor = Color.FromArgb(30, 41, 59);
+        panel.Controls.Add(_detailTitleLabel, 0, 0);
+
+        var boxes = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
+            BackColor = Color.White,
+        };
+        boxes.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        boxes.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
+        boxes.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        boxes.Controls.Add(CreateMergeDetailBox("BASE", _baseDetailBox, Color.FromArgb(71, 85, 105)), 0, 0);
+        boxes.Controls.Add(CreateMergeDetailBox(_targetLabel, _targetDetailBox, Color.FromArgb(153, 27, 27)), 1, 0);
+        boxes.Controls.Add(CreateMergeDetailBox(_sourceLabel, _sourceDetailBox, Color.FromArgb(22, 101, 52)), 2, 0);
+        panel.Controls.Add(boxes, 0, 1);
+        return panel;
+    }
+
+    private static Control CreateMergeDetailBox(string title, RichTextBox box, Color titleColor)
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = new Padding(0, 0, 8, 0),
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        panel.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = title,
+            ForeColor = titleColor,
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
+        box.Dock = DockStyle.Fill;
+        box.ReadOnly = true;
+        box.WordWrap = true;
+        box.ScrollBars = RichTextBoxScrollBars.Both;
+        box.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
+        box.BackColor = Color.White;
+        box.Font = new Font("Consolas", 9F);
+        box.DetectUrls = false;
+        panel.Controls.Add(box, 0, 1);
+        return panel;
+    }
+
+    private void UpdateMergeDetail()
+    {
+        var row = _grid.CurrentRow?.DataBoundItem as SpreadsheetMergeConflictGridRow ??
+            _rows.FirstOrDefault();
+        if (row == null)
+        {
+            _detailTitleLabel.Text = "未选择合并项目";
+            SetMergeDetailText(_baseDetailBox, "", Color.FromArgb(71, 85, 105), Color.White, []);
+            SetMergeDetailText(_targetDetailBox, "", Color.FromArgb(153, 27, 27), Color.White, []);
+            SetMergeDetailText(_sourceDetailBox, "", Color.FromArgb(22, 101, 52), Color.White, []);
+            return;
+        }
+
+        var highlights = DiffHighlightSpans.Calculate(row.LocalValue, row.RemoteValue);
+        _detailTitleLabel.Text = $"{row.KindText}    {row.Sheet}!{row.Address}    写入 {row.WriteSheet}!{row.WriteAddress}    ID: {row.RowId}    字段: {row.FieldName}";
+        SetMergeDetailText(_baseDetailBox, row.BaseValue, Color.FromArgb(71, 85, 105), Color.FromArgb(226, 232, 240), []);
+        SetMergeDetailText(_targetDetailBox, row.LocalValue, Color.FromArgb(153, 27, 27), Color.FromArgb(254, 202, 202), highlights.OldSpans);
+        SetMergeDetailText(_sourceDetailBox, row.RemoteValue, Color.FromArgb(22, 101, 52), Color.FromArgb(187, 247, 208), highlights.NewSpans);
+    }
+
+    private static void SetMergeDetailText(RichTextBox box, string value, Color textColor, Color highlightColor, IReadOnlyList<TextHighlightSpan> highlights)
+    {
+        box.SuspendLayout();
+        box.Text = value ?? "";
+        box.SelectAll();
+        box.SelectionColor = textColor;
+        box.SelectionBackColor = Color.White;
+        box.SelectionFont = new Font(box.Font, FontStyle.Regular);
+        foreach (var span in highlights)
+        {
+            if (span.Start < 0 || span.Length <= 0 || span.Start >= box.TextLength)
+            {
+                continue;
+            }
+
+            var length = Math.Min(span.Length, box.TextLength - span.Start);
+            box.Select(span.Start, length);
+            box.SelectionBackColor = highlightColor;
+            box.SelectionFont = new Font(box.Font, FontStyle.Bold);
+        }
+
+        box.Select(0, 0);
+        box.ResumeLayout();
+    }
+
+    private void PaintMergeComparisonCell(object? sender, DataGridViewCellPaintingEventArgs args)
+    {
+        if (sender is not DataGridView grid ||
+            args.RowIndex < 0 ||
+            args.ColumnIndex < 0 ||
+            args.Graphics == null ||
+            grid.Columns[args.ColumnIndex].Name != "MergeComparison" ||
+            grid.Rows[args.RowIndex].DataBoundItem is not SpreadsheetMergeConflictGridRow row)
+        {
+            return;
+        }
+
+        args.Handled = true;
+        var cellStyle = args.CellStyle ?? grid.DefaultCellStyle;
+        var selected = grid.Rows[args.RowIndex].Selected;
+        var backColor = selected
+            ? cellStyle.SelectionBackColor
+            : grid.Rows[args.RowIndex].DefaultCellStyle.BackColor;
+        using var backBrush = new SolidBrush(backColor);
+        args.Graphics.FillRectangle(backBrush, args.CellBounds);
+
+        var bounds = Rectangle.Inflate(args.CellBounds, -8, -5);
+        var lineHeight = Math.Max(21, bounds.Height / 3);
+        var baseBounds = new Rectangle(bounds.Left, bounds.Top, bounds.Width, lineHeight);
+        var targetBounds = new Rectangle(bounds.Left, bounds.Top + lineHeight, bounds.Width, lineHeight);
+        var sourceBounds = new Rectangle(bounds.Left, bounds.Top + lineHeight * 2, bounds.Width, bounds.Height - lineHeight * 2);
+        var highlights = DiffHighlightSpans.Calculate(row.LocalValue, row.RemoteValue);
+        var basePreview = BuildFocusedPreview(row.BaseValue, [], 160);
+        var targetPreview = BuildFocusedPreview(row.LocalValue, highlights.OldSpans, 170);
+        var sourcePreview = BuildFocusedPreview(row.RemoteValue, highlights.NewSpans, 170);
+
+        DrawMergeValueLine(args.Graphics, baseBounds, "BASE", basePreview.Text, basePreview.Spans, grid.Font, Color.FromArgb(71, 85, 105), Color.FromArgb(226, 232, 240));
+        DrawMergeValueLine(args.Graphics, targetBounds, _targetLabel, targetPreview.Text, targetPreview.Spans, grid.Font, Color.FromArgb(153, 27, 27), Color.FromArgb(254, 202, 202));
+        DrawMergeValueLine(args.Graphics, sourceBounds, _sourceLabel, sourcePreview.Text, sourcePreview.Spans, grid.Font, Color.FromArgb(22, 101, 52), Color.FromArgb(187, 247, 208));
+
+        using var borderPen = new Pen(Color.FromArgb(203, 213, 225));
+        args.Graphics.DrawLine(borderPen, args.CellBounds.Left, args.CellBounds.Bottom - 1, args.CellBounds.Right, args.CellBounds.Bottom - 1);
+    }
+
+    private static (string Text, IReadOnlyList<TextHighlightSpan> Spans) BuildFocusedPreview(string value, IReadOnlyList<TextHighlightSpan> spans, int maxLength)
+    {
+        value ??= "";
+        if (value.Length <= maxLength || spans.Count == 0)
+        {
+            return (value, spans);
+        }
+
+        var firstStart = spans.Min(span => Math.Max(0, span.Start));
+        var lastEnd = spans.Max(span => Math.Min(value.Length, span.Start + span.Length));
+        var context = Math.Max(24, (maxLength - Math.Max(8, lastEnd - firstStart)) / 2);
+        var start = Math.Max(0, firstStart - context);
+        var end = Math.Min(value.Length, lastEnd + context);
+        if (end - start > maxLength)
+        {
+            end = Math.Min(value.Length, start + maxLength);
+        }
+
+        var prefix = start > 0 ? "... " : "";
+        var suffix = end < value.Length ? " ..." : "";
+        var text = prefix + value[start..end] + suffix;
+        var adjusted = spans
+            .Select(span =>
+            {
+                var spanStart = Math.Max(start, span.Start);
+                var spanEnd = Math.Min(end, span.Start + span.Length);
+                return spanEnd > spanStart
+                    ? new TextHighlightSpan(prefix.Length + spanStart - start, spanEnd - spanStart)
+                    : new TextHighlightSpan(-1, 0);
+            })
+            .Where(span => span.Start >= 0 && span.Length > 0)
+            .ToList();
+        return (text, adjusted);
+    }
+
+    private static void DrawMergeValueLine(
+        Graphics graphics,
+        Rectangle bounds,
+        string label,
+        string value,
+        IReadOnlyList<TextHighlightSpan> highlights,
+        Font font,
+        Color textColor,
+        Color highlightColor)
+    {
+        var labelBounds = new Rectangle(bounds.Left, bounds.Top + 2, 58, Math.Max(18, bounds.Height - 4));
+        using var labelBrush = new SolidBrush(Color.FromArgb(28, textColor));
+        using var labelPen = new Pen(Color.FromArgb(80, textColor));
+        graphics.FillRoundedRectangle(labelBrush, labelBounds, 4);
+        graphics.DrawRoundedRectangle(labelPen, labelBounds, 4);
+        TextRenderer.DrawText(
+            graphics,
+            label,
+            font,
+            labelBounds,
+            textColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+
+        var textBounds = new Rectangle(labelBounds.Right + 8, bounds.Top, Math.Max(1, bounds.Right - labelBounds.Right - 8), bounds.Height);
+        DrawHighlightedMergeText(graphics, textBounds, value, highlights, font, textColor, highlightColor);
+    }
+
+    private static void DrawHighlightedMergeText(
+        Graphics graphics,
+        Rectangle bounds,
+        string value,
+        IReadOnlyList<TextHighlightSpan> highlights,
+        Font font,
+        Color textColor,
+        Color highlightColor)
+    {
+        value ??= "";
+        if (string.IsNullOrEmpty(value))
+        {
+            TextRenderer.DrawText(graphics, "(空)", font, bounds, Color.FromArgb(148, 163, 184), TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            return;
+        }
+
+        var x = bounds.Left;
+        var cursor = 0;
+        foreach (var span in highlights.OrderBy(span => span.Start))
+        {
+            if (span.Start > cursor)
+            {
+                DrawMergeTextPart(graphics, ref x, bounds, value[cursor..span.Start], font, textColor, null);
+            }
+
+            var safeLength = Math.Min(span.Length, value.Length - span.Start);
+            if (safeLength > 0)
+            {
+                DrawMergeTextPart(graphics, ref x, bounds, value.Substring(span.Start, safeLength), font, textColor, highlightColor);
+            }
+
+            cursor = Math.Max(cursor, span.Start + Math.Max(0, safeLength));
+            if (x >= bounds.Right)
+            {
+                return;
+            }
+        }
+
+        if (cursor < value.Length)
+        {
+            DrawMergeTextPart(graphics, ref x, bounds, value[cursor..], font, textColor, null);
+        }
+    }
+
+    private static void DrawMergeTextPart(Graphics graphics, ref int x, Rectangle bounds, string text, Font font, Color textColor, Color? backColor)
+    {
+        if (string.IsNullOrEmpty(text) || x >= bounds.Right)
+        {
+            return;
+        }
+
+        var textSize = TextRenderer.MeasureText(graphics, text, font, Size.Empty, TextFormatFlags.NoPadding);
+        var width = Math.Min(textSize.Width, bounds.Right - x);
+        var partBounds = new Rectangle(x, bounds.Top + 1, width, Math.Max(1, bounds.Height - 2));
+        if (backColor != null)
+        {
+            using var brush = new SolidBrush(backColor.Value);
+            graphics.FillRoundedRectangle(brush, partBounds, 3);
+        }
+
+        TextRenderer.DrawText(graphics, text, font, partBounds, textColor, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        x += width;
+    }
+
+    private void ShowMergeCellDetail(SpreadsheetMergeConflictGridRow row)
+    {
+        var highlights = DiffHighlightSpans.Calculate(row.LocalValue, row.RemoteValue);
+        using var form = new Form
+        {
+            Text = $"合并项目详情 - {row.Sheet}!{row.Address}",
+            StartPosition = FormStartPosition.CenterParent,
+            MinimumSize = new Size(920, 560),
+            Size = new Size(1100, 680),
+            Font = Font,
+        };
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 5,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 33));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 33));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        form.Controls.Add(root);
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+            Text = $"{row.KindText}    默认 {row.Sheet}!{row.Address}    写入 {row.WriteSheet}!{row.WriteAddress}    ID: {row.RowId}    字段: {row.FieldName}",
+        }, 0, 0);
+        root.Controls.Add(CreatePopupMergeValueBox("BASE", row.BaseValue, Color.FromArgb(71, 85, 105), Color.FromArgb(226, 232, 240), []), 0, 1);
+        root.Controls.Add(CreatePopupMergeValueBox(_targetLabel + "（红底为与来源不同的位置）", row.LocalValue, Color.FromArgb(153, 27, 27), Color.FromArgb(254, 202, 202), highlights.OldSpans), 0, 2);
+        root.Controls.Add(CreatePopupMergeValueBox(_sourceLabel + "（绿底为与目标不同的位置）", row.RemoteValue, Color.FromArgb(22, 101, 52), Color.FromArgb(187, 247, 208), highlights.NewSpans), 0, 3);
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
+        buttons.Controls.Add(new Button { Text = "关闭", Width = 86, DialogResult = DialogResult.OK });
+        root.Controls.Add(buttons, 0, 4);
+        form.AcceptButton = buttons.Controls.OfType<Button>().First();
+        form.ShowDialog(this);
+    }
+
+    private static Control CreatePopupMergeValueBox(string title, string value, Color textColor, Color highlightColor, IReadOnlyList<TextHighlightSpan> highlights)
+    {
+        var box = new RichTextBox();
+        var panel = (TableLayoutPanel)CreateMergeDetailBox(title, box, textColor);
+        panel.Margin = new Padding(0, 0, 0, 8);
+        SetMergeDetailText(box, value, textColor, highlightColor, highlights);
+        return panel;
+    }
+
+    private void ApplyRowStyles()
+    {
+        foreach (DataGridViewRow gridRow in _grid.Rows)
+        {
+            if (gridRow.DataBoundItem is not SpreadsheetMergeConflictGridRow row)
+            {
+                continue;
+            }
+
+            gridRow.DefaultCellStyle.BackColor = row.Kind switch
+            {
+                SpreadsheetMergeChangeKind.AutoRemote => Color.FromArgb(235, 255, 239),
+                SpreadsheetMergeChangeKind.LocalOnly => Color.FromArgb(239, 246, 255),
+                SpreadsheetMergeChangeKind.SameBoth => Color.FromArgb(248, 250, 252),
+                SpreadsheetMergeChangeKind.Conflict => Color.FromArgb(255, 247, 237),
+                _ => Color.White,
+            };
+            gridRow.DefaultCellStyle.ForeColor = row.Kind == SpreadsheetMergeChangeKind.Conflict
+                ? Color.FromArgb(124, 45, 18)
+                : Color.FromArgb(30, 41, 59);
+        }
+    }
+
+    private void SetAll(string resolution)
+    {
+        foreach (var row in _rows)
+        {
+            row.Resolution = resolution;
+        }
+
+        _source.ResetBindings(false);
+        UpdateSummary();
+        ApplyRowStyles();
+        UpdateMergeDetail();
+    }
+
+    private bool ApplyRowsToPlan()
+    {
+        _grid.EndEdit();
+        foreach (var row in _rows)
+        {
+            if (!row.TryApplyToChange(out var error))
+            {
+                MessageBox.Show(this, error, "写入位置无效", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+        }
+
+        var duplicateTarget = _plan.AllChanges
+            .Where(change => change.Resolution == SpreadsheetMergeResolution.UseRemote)
+            .Where(change => !string.Equals(change.LocalValue, change.RemoteValue, StringComparison.Ordinal))
+            .GroupBy(change => change.WriteCell)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicateTarget != null)
+        {
+            var target = duplicateTarget.Key;
+            var address = $"{target.Sheet}!{ExcelDiffService.ToColumnName(target.Column)}{target.Row + 1}";
+            MessageBox.Show(
+                this,
+                $"有多个合并项目会写入同一个目标单元格：{address}{Environment.NewLine}{Environment.NewLine}请先手动调整其中一项的写入位置，避免覆盖顺序不明确。",
+                "写入位置重复",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return false;
+        }
+
+        return true;
+    }
+
+    private void UpdateSummary()
+    {
+        var remoteCount = _rows.Count(row => row.Resolution == _remoteResolutionText);
+        var plannedWrites = _rows.Count(row =>
+            row.Resolution == _remoteResolutionText &&
+            !string.Equals(row.LocalValue, row.RemoteValue, StringComparison.Ordinal));
+        _summaryLabel.Text =
+            $"可应用{_sourceLabel} {_plan.AutoRemoteChanges.Count} 项；{_targetLabel}独有 {_plan.LocalOnlyChanges.Count} 项；两边相同 {_plan.SameBothChanges.Count} 项；冲突 {_plan.Conflicts.Count} 项。{Environment.NewLine}" +
+            $"当前选择{_sourceLabel} {remoteCount} 项、{_targetLabel} {_rows.Count - remoteCount} 项；预计写入 {plannedWrites} 个单元格。";
+    }
+}
+
+internal sealed class SpreadsheetMergeConflictGridRow
+{
+    private readonly SpreadsheetMergeChange _change;
+    private readonly string _remoteResolutionText;
+
+    public SpreadsheetMergeConflictGridRow(SpreadsheetMergeChange change, string localResolutionText, string remoteResolutionText)
+    {
+        _change = change;
+        _remoteResolutionText = remoteResolutionText;
+        Resolution = change.Resolution == SpreadsheetMergeResolution.UseRemote
+            ? remoteResolutionText
+            : localResolutionText;
+        WriteSheet = change.WriteCell.Sheet;
+        WriteAddress = $"{ExcelDiffService.ToColumnName(change.WriteCell.Column)}{change.WriteCell.Row + 1}";
+    }
+
+    public string Resolution { get; set; }
+    public string WriteSheet { get; set; }
+    public string WriteAddress { get; set; }
+    public SpreadsheetMergeChangeKind Kind => _change.Kind;
+    public string KindText => _change.Kind switch
+    {
+        SpreadsheetMergeChangeKind.AutoRemote => "可合并改动",
+        SpreadsheetMergeChangeKind.LocalOnly => "目标独有",
+        SpreadsheetMergeChangeKind.SameBoth => "双方相同",
+        SpreadsheetMergeChangeKind.Conflict => "冲突",
+        _ => "未知",
+    };
+    public string Sheet => _change.Sheet;
+    public string Address => _change.Address;
+    public string RowId => _change.RowId;
+    public string FieldName => _change.FieldName;
+    public string BaseValue => _change.BaseValue;
+    public string LocalValue => _change.LocalValue;
+    public string RemoteValue => _change.RemoteValue;
+    public string DefaultLocation => $"{Sheet}!{Address}";
+    public string ComparisonText => $"BASE {BaseValue}{Environment.NewLine}{LocalValue}{Environment.NewLine}{RemoteValue}";
+
+    public bool TryApplyToChange(out string error)
+    {
+        error = "";
+        if (!TryParseCellAddress(WriteAddress, out var row, out var column))
+        {
+            error = $"写入单元格格式无效：{WriteAddress}{Environment.NewLine}{Environment.NewLine}请使用 A1、B23 这种格式。";
+            return false;
+        }
+
+        var sheet = WriteSheet.Trim();
+        if (string.IsNullOrWhiteSpace(sheet))
+        {
+            error = "写入工作表不能为空。";
+            return false;
+        }
+
+        _change.Resolution = Resolution == _remoteResolutionText
+            ? SpreadsheetMergeResolution.UseRemote
+            : SpreadsheetMergeResolution.UseLocal;
+        _change.WriteCell = new ExcelCellKey(sheet, row, column);
+        return true;
+    }
+
+    private static bool TryParseCellAddress(string address, out int row, out int column)
+    {
+        row = -1;
+        column = -1;
+        var text = (address ?? "").Trim();
+        var match = Regex.Match(text, @"^([A-Za-z]+)([1-9]\d*)$");
+        if (!match.Success)
+        {
+            return false;
+        }
+
+        var columnText = match.Groups[1].Value.ToUpperInvariant();
+        var value = 0;
+        foreach (var character in columnText)
+        {
+            value = value * 26 + character - 'A' + 1;
+        }
+
+        if (!int.TryParse(match.Groups[2].Value, out var oneBasedRow))
+        {
+            return false;
+        }
+
+        row = oneBasedRow - 1;
+        column = value - 1;
+        return row >= 0 && column >= 0;
+    }
+}
+
 internal sealed class ExcelDiffForm : Form
 {
+    public ExcelDiffForm(string relativePath, DiffPreviewData data)
+        : this(relativePath, data.ExcelDifferences ?? [])
+    {
+    }
+
     public ExcelDiffForm(string relativePath, IReadOnlyList<ExcelCellDifference> differences)
     {
         Text = $"Excel 差异 - {relativePath}";
@@ -7313,12 +10917,12 @@ internal sealed class ExcelDiffForm : Form
             TextAlign = ContentAlignment.MiddleLeft,
         }, 0, 0);
 
-        root.Controls.Add(CreateExcelDiffView(differences), 0, 1);
+        root.Controls.Add(DiffPreviewData.FromExcel(differences).CreateView(), 0, 1);
     }
 
     public static Control CreateExcelDiffView(IReadOnlyList<ExcelCellDifference> differences)
     {
-        var rows = differences.ToList();
+        var rows = differences.Select(ExcelUnifiedDiffRow.FromDifference).ToList();
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -7331,30 +10935,34 @@ internal sealed class ExcelDiffForm : Form
         var toolbar = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 5,
+            ColumnCount = 6,
             RowCount = 1,
             BackColor = Color.FromArgb(248, 249, 250),
         };
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
-        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
-        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
-        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 140));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 140));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
 
         var searchBox = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "搜索 ID / 字段 / 新旧值 / 单元格", Margin = new Padding(0, 4, 8, 4) };
         var idBox = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "只看 ID", Margin = new Padding(0, 4, 8, 4) };
         var fieldBox = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "只看字段", Margin = new Padding(0, 4, 8, 4) };
         var clearButton = new Button { Text = "清空", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 8, 3) };
+        var copyButton = new Button { Text = "复制摘要", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 8, 3) };
         var countLabel = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
         toolbar.Controls.Add(searchBox, 0, 0);
         toolbar.Controls.Add(idBox, 1, 0);
         toolbar.Controls.Add(fieldBox, 2, 0);
         toolbar.Controls.Add(clearButton, 3, 0);
-        toolbar.Controls.Add(countLabel, 4, 0);
+        toolbar.Controls.Add(copyButton, 4, 0);
+        toolbar.Controls.Add(countLabel, 5, 0);
         root.Controls.Add(toolbar, 0, 0);
 
         var grid = CreateExcelDiffGrid();
         root.Controls.Add(grid, 0, 1);
+        var visibleRows = rows;
 
         void ApplyFilter()
         {
@@ -7372,6 +10980,7 @@ internal sealed class ExcelDiffForm : Form
                     (string.IsNullOrWhiteSpace(id) || row.RowId.Contains(id, StringComparison.OrdinalIgnoreCase)) &&
                     (string.IsNullOrWhiteSpace(field) || row.FieldName.Contains(field, StringComparison.OrdinalIgnoreCase)))
                 .ToList();
+            visibleRows = filtered;
             grid.DataSource = filtered;
             countLabel.Text = $"{filtered.Count} / {rows.Count} 项";
         }
@@ -7385,6 +10994,7 @@ internal sealed class ExcelDiffForm : Form
             idBox.Clear();
             fieldBox.Clear();
         };
+        copyButton.Click += (_, _) => CopyExcelDiffSummary(root.FindForm(), visibleRows);
         ApplyFilter();
         return root;
     }
@@ -7400,17 +11010,575 @@ internal sealed class ExcelDiffForm : Form
             ReadOnly = true,
             RowHeadersVisible = false,
             SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None,
+            BackgroundColor = Color.White,
+            BorderStyle = System.Windows.Forms.BorderStyle.None,
+            CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+            GridColor = Color.FromArgb(226, 232, 240),
         };
 
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "工作表", DataPropertyName = nameof(ExcelCellDifference.Sheet), Width = 160 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "单元格", DataPropertyName = nameof(ExcelCellDifference.Address), Width = 90 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "字段", DataPropertyName = nameof(ExcelCellDifference.FieldName), Width = 170 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ID", DataPropertyName = nameof(ExcelCellDifference.RowId), Width = 130 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "旧值", DataPropertyName = nameof(ExcelCellDifference.OldValue), Width = 320 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "新值", DataPropertyName = nameof(ExcelCellDifference.NewValue), Width = 320 });
+        grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(45, 55, 72);
+        grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        grid.EnableHeadersVisualStyles = false;
+        grid.RowTemplate.Height = 58;
+        grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
+        grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(15, 23, 42);
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "工作表", DataPropertyName = nameof(ExcelUnifiedDiffRow.Sheet), Width = 130 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ID", DataPropertyName = nameof(ExcelUnifiedDiffRow.RowId), Width = 120 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "字段", DataPropertyName = nameof(ExcelUnifiedDiffRow.FieldName), Width = 150 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "差异内容",
+            Name = "Difference",
+            DataPropertyName = nameof(ExcelUnifiedDiffRow.DifferenceText),
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            MinimumWidth = 360,
+        });
+        grid.CellPainting += PaintExcelDiffCell;
+        grid.DataBindingComplete += (_, _) => ApplyExcelRowStyles(grid);
+        grid.CellToolTipTextNeeded += (_, args) =>
+        {
+            if (args.RowIndex < 0 || grid.Rows[args.RowIndex].DataBoundItem is not ExcelUnifiedDiffRow row)
+            {
+                return;
+            }
+
+            args.ToolTipText =
+                $"工作表：{row.Sheet}{Environment.NewLine}" +
+                $"单元格：{row.Address}{Environment.NewLine}" +
+                $"字段：{row.FieldName}{Environment.NewLine}" +
+                $"ID：{row.RowId}{Environment.NewLine}" +
+                $"旧值：{row.OldValue}{Environment.NewLine}" +
+                $"新值：{row.NewValue}";
+        };
+        grid.CellDoubleClick += (_, args) =>
+        {
+            if (args.RowIndex >= 0 && grid.Rows[args.RowIndex].DataBoundItem is ExcelUnifiedDiffRow row)
+            {
+                ShowExcelDiffDetail(grid.FindForm(), row);
+            }
+        };
         return grid;
     }
+
+    private static void ApplyExcelRowStyles(DataGridView grid)
+    {
+        foreach (DataGridViewRow gridRow in grid.Rows)
+        {
+            if (gridRow.DataBoundItem is not ExcelUnifiedDiffRow row)
+            {
+                continue;
+            }
+
+            gridRow.Height = 58;
+            gridRow.DefaultCellStyle.BackColor = row.ChangeKind switch
+            {
+                "Added" => Color.FromArgb(235, 255, 239),
+                "Deleted" => Color.FromArgb(255, 239, 241),
+                _ => Color.White,
+            };
+            gridRow.DefaultCellStyle.ForeColor = Color.FromArgb(30, 41, 59);
+        }
+    }
+
+    private static void PaintExcelDiffCell(object? sender, DataGridViewCellPaintingEventArgs args)
+    {
+        if (sender is not DataGridView grid ||
+            args.RowIndex < 0 ||
+            args.Graphics == null ||
+            grid.Columns[args.ColumnIndex].Name != "Difference" ||
+            grid.Rows[args.RowIndex].DataBoundItem is not ExcelUnifiedDiffRow row)
+        {
+            return;
+        }
+
+        args.Handled = true;
+        args.Paint(args.CellBounds, args.PaintParts & ~DataGridViewPaintParts.ContentForeground);
+        var bounds = Rectangle.Inflate(args.CellBounds, -8, -5);
+        var cellStyle = args.CellStyle ?? grid.DefaultCellStyle;
+        var font = cellStyle.Font ?? grid.Font;
+        var isSelected = grid.Rows[args.RowIndex].Selected;
+        var backColor = isSelected ? cellStyle.SelectionBackColor : grid.Rows[args.RowIndex].DefaultCellStyle.BackColor;
+        using var backBrush = new SolidBrush(backColor);
+        args.Graphics.FillRectangle(backBrush, args.CellBounds);
+
+        if (row.ChangeKind == "Added")
+        {
+            DrawValueLine(args.Graphics, bounds, "+", row.NewValue, -1, 0, font, Color.FromArgb(22, 101, 52), Color.FromArgb(187, 247, 208), strikeout: false);
+        }
+        else if (row.ChangeKind == "Deleted")
+        {
+            DrawValueLine(args.Graphics, bounds, "-", row.OldValue, -1, 0, font, Color.FromArgb(153, 27, 27), Color.FromArgb(254, 202, 202), strikeout: true);
+        }
+        else
+        {
+            var spans = DiffSpan.Calculate(row.OldValue, row.NewValue);
+            var oldBounds = new Rectangle(bounds.Left, bounds.Top, bounds.Width, bounds.Height / 2);
+            var newBounds = new Rectangle(bounds.Left, bounds.Top + bounds.Height / 2, bounds.Width, bounds.Height - bounds.Height / 2);
+            DrawValueLine(args.Graphics, oldBounds, "-", row.OldValue, spans.OldStart, spans.OldLength, font, Color.FromArgb(153, 27, 27), Color.FromArgb(254, 202, 202), strikeout: true);
+            DrawValueLine(args.Graphics, newBounds, "+", row.NewValue, spans.NewStart, spans.NewLength, font, Color.FromArgb(22, 101, 52), Color.FromArgb(187, 247, 208), strikeout: false);
+        }
+
+        using var borderPen = new Pen(Color.FromArgb(226, 232, 240));
+        args.Graphics.DrawLine(borderPen, args.CellBounds.Left, args.CellBounds.Bottom - 1, args.CellBounds.Right, args.CellBounds.Bottom - 1);
+    }
+
+    private static void DrawValueLine(
+        Graphics graphics,
+        Rectangle bounds,
+        string marker,
+        string value,
+        int highlightStart,
+        int highlightLength,
+        Font font,
+        Color textColor,
+        Color highlightColor,
+        bool strikeout)
+    {
+        var lineFont = strikeout ? new Font(font, font.Style | FontStyle.Strikeout) : font;
+        try
+        {
+            var markerBounds = new Rectangle(bounds.Left, bounds.Top, 22, bounds.Height);
+            TextRenderer.DrawText(graphics, marker, font, markerBounds, textColor, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            var textBounds = new Rectangle(bounds.Left + 22, bounds.Top, bounds.Width - 22, bounds.Height);
+            DrawSegmentedText(graphics, textBounds, value, highlightStart, highlightLength, lineFont, textColor, highlightColor);
+        }
+        finally
+        {
+            if (!ReferenceEquals(lineFont, font))
+            {
+                lineFont.Dispose();
+            }
+        }
+    }
+
+    private static void DrawSegmentedText(Graphics graphics, Rectangle bounds, string value, int highlightStart, int highlightLength, Font font, Color textColor, Color highlightColor)
+    {
+        value ??= "";
+        highlightStart = Math.Clamp(highlightStart, -1, value.Length);
+        highlightLength = Math.Clamp(highlightLength, 0, Math.Max(0, value.Length - Math.Max(0, highlightStart)));
+        if (highlightStart < 0 || highlightLength == 0)
+        {
+            TextRenderer.DrawText(graphics, value, font, bounds, textColor, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            return;
+        }
+
+        var prefix = value[..highlightStart];
+        var highlight = value.Substring(highlightStart, highlightLength);
+        var suffix = value[(highlightStart + highlightLength)..];
+        var x = bounds.Left;
+        DrawTextPart(graphics, ref x, bounds, prefix, font, textColor, null);
+        DrawTextPart(graphics, ref x, bounds, highlight, font, textColor, highlightColor);
+        DrawTextPart(graphics, ref x, bounds, suffix, font, textColor, null);
+    }
+
+    private static void DrawTextPart(Graphics graphics, ref int x, Rectangle bounds, string text, Font font, Color textColor, Color? backColor)
+    {
+        if (string.IsNullOrEmpty(text) || x >= bounds.Right)
+        {
+            return;
+        }
+
+        var textSize = TextRenderer.MeasureText(graphics, text, font, Size.Empty, TextFormatFlags.NoPadding);
+        var width = Math.Min(textSize.Width, bounds.Right - x);
+        var partBounds = new Rectangle(x, bounds.Top, width, bounds.Height);
+        if (backColor != null)
+        {
+            using var brush = new SolidBrush(backColor.Value);
+            graphics.FillRectangle(brush, partBounds);
+        }
+
+        TextRenderer.DrawText(graphics, text, font, partBounds, textColor, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        x += width;
+    }
+
+    private static void ShowExcelDiffDetail(IWin32Window? owner, ExcelUnifiedDiffRow row)
+    {
+        var highlights = DiffHighlightSpans.Calculate(row.OldValue, row.NewValue);
+        using var form = new Form
+        {
+            Text = $"单元格差异 - {row.Sheet} {row.Address}",
+            StartPosition = FormStartPosition.CenterParent,
+            MinimumSize = new Size(760, 460),
+            Size = new Size(920, 560),
+            Font = new Font("Microsoft YaHei UI", 9F),
+        };
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        form.Controls.Add(root);
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+            Text = $"{row.Sheet} / {row.Address} / {row.FieldName} / ID: {row.RowId}    改动片段：旧 {highlights.OldSpans.Count} / 新 {highlights.NewSpans.Count}",
+        }, 0, 0);
+        root.Controls.Add(CreateValueBox("旧值（红底为改动位置）", row.OldValue, Color.FromArgb(153, 27, 27), Color.FromArgb(254, 202, 202), true, highlights.OldSpans), 0, 1);
+        root.Controls.Add(CreateValueBox("新值（绿底为改动位置）", row.NewValue, Color.FromArgb(22, 101, 52), Color.FromArgb(187, 247, 208), false, highlights.NewSpans), 0, 2);
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
+        buttons.Controls.Add(new Button { Text = "关闭", Width = 86, DialogResult = DialogResult.OK });
+        root.Controls.Add(buttons, 0, 3);
+        form.AcceptButton = buttons.Controls.OfType<Button>().First();
+        form.ShowDialog(owner);
+    }
+
+    private static Control CreateValueBox(string title, string value, Color color, Color highlightColor, bool strikeout, IReadOnlyList<TextHighlightSpan> highlights)
+    {
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(0, 0, 0, 8) };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        panel.Controls.Add(new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            ForeColor = color,
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
+        var box = new RichTextBox
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            ScrollBars = RichTextBoxScrollBars.Both,
+            WordWrap = true,
+            Font = new Font("Consolas", 10F, strikeout ? FontStyle.Strikeout : FontStyle.Regular),
+            ForeColor = color,
+            BackColor = Color.White,
+            BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle,
+            DetectUrls = false,
+            Text = value,
+        };
+        ApplyRichTextHighlights(box, color, highlightColor, strikeout, highlights);
+        panel.Controls.Add(box, 0, 1);
+        return panel;
+    }
+
+    private static void ApplyRichTextHighlights(RichTextBox box, Color textColor, Color highlightColor, bool strikeout, IReadOnlyList<TextHighlightSpan> highlights)
+    {
+        box.SelectAll();
+        box.SelectionColor = textColor;
+        box.SelectionBackColor = Color.White;
+        box.SelectionFont = new Font(box.Font, strikeout ? box.Font.Style | FontStyle.Strikeout : box.Font.Style);
+
+        foreach (var span in highlights)
+        {
+            if (span.Start < 0 || span.Length <= 0 || span.Start >= box.TextLength)
+            {
+                continue;
+            }
+
+            var length = Math.Min(span.Length, box.TextLength - span.Start);
+            box.Select(span.Start, length);
+            box.SelectionBackColor = highlightColor;
+            box.SelectionFont = new Font(box.Font, box.Font.Style | FontStyle.Bold | (strikeout ? FontStyle.Strikeout : FontStyle.Regular));
+        }
+
+        box.Select(0, 0);
+    }
+
+    private static void CopyExcelDiffSummary(IWin32Window? owner, IReadOnlyList<ExcelUnifiedDiffRow> rows)
+    {
+        if (rows.Count == 0)
+        {
+            MessageBox.Show(owner, "当前筛选结果为空，没有可复制的差异。", "复制摘要", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var builder = new StringBuilder();
+        builder.AppendLine($"Excel/XML 差异摘要：{rows.Count} 项");
+        builder.AppendLine("状态\t工作表\t单元格\tID\t字段\t旧值\t新值");
+        foreach (var row in rows)
+        {
+            builder.AppendLine(string.Join('\t',
+                TranslateExcelChangeKind(row.ChangeKind),
+                NormalizeClipboardCell(row.Sheet),
+                NormalizeClipboardCell(row.Address),
+                NormalizeClipboardCell(row.RowId),
+                NormalizeClipboardCell(row.FieldName),
+                NormalizeClipboardCell(row.OldValue),
+                NormalizeClipboardCell(row.NewValue)));
+        }
+
+        try
+        {
+            Clipboard.SetText(builder.ToString());
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(owner, $"复制失败：{ex.Message}", "复制摘要", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        MessageBox.Show(owner, $"已复制 {rows.Count} 项差异摘要。", "复制摘要", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private static string TranslateExcelChangeKind(string changeKind)
+    {
+        return changeKind switch
+        {
+            "Added" => "新增",
+            "Deleted" => "删除",
+            _ => "修改",
+        };
+    }
+
+    private static string NormalizeClipboardCell(string value)
+    {
+        return (value ?? "")
+            .Replace('\t', ' ')
+            .Replace("\r\n", " ", StringComparison.Ordinal)
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+    }
 }
+
+internal sealed record ExcelUnifiedDiffRow(string Sheet, string Address, string FieldName, string RowId, string OldValue, string NewValue)
+{
+    public string DifferenceText => $"{OldValue} -> {NewValue}";
+
+    public string ChangeKind => string.IsNullOrEmpty(OldValue) && !string.IsNullOrEmpty(NewValue)
+        ? "Added"
+        : !string.IsNullOrEmpty(OldValue) && string.IsNullOrEmpty(NewValue)
+            ? "Deleted"
+            : "Modified";
+
+    public static ExcelUnifiedDiffRow FromDifference(ExcelCellDifference difference)
+    {
+        return new ExcelUnifiedDiffRow(
+            difference.Sheet,
+            difference.Address,
+            string.IsNullOrWhiteSpace(difference.FieldName) ? "(未命名字段)" : difference.FieldName,
+            string.IsNullOrWhiteSpace(difference.RowId) ? "(无 ID)" : difference.RowId,
+            difference.OldValue,
+            difference.NewValue);
+    }
+}
+
+internal sealed record DiffSpan(int OldStart, int OldLength, int NewStart, int NewLength)
+{
+    public static DiffSpan Calculate(string oldValue, string newValue)
+    {
+        oldValue ??= "";
+        newValue ??= "";
+        var prefix = 0;
+        while (prefix < oldValue.Length &&
+            prefix < newValue.Length &&
+            oldValue[prefix] == newValue[prefix])
+        {
+            prefix++;
+        }
+
+        var oldEnd = oldValue.Length - 1;
+        var newEnd = newValue.Length - 1;
+        while (oldEnd >= prefix &&
+            newEnd >= prefix &&
+            oldValue[oldEnd] == newValue[newEnd])
+        {
+            oldEnd--;
+            newEnd--;
+        }
+
+        return new DiffSpan(
+            prefix,
+            Math.Max(0, oldEnd - prefix + 1),
+            prefix,
+            Math.Max(0, newEnd - prefix + 1));
+    }
+}
+
+internal sealed record TextHighlightSpan(int Start, int Length);
+
+internal sealed record DiffHighlightSpans(IReadOnlyList<TextHighlightSpan> OldSpans, IReadOnlyList<TextHighlightSpan> NewSpans)
+{
+    public static DiffHighlightSpans Calculate(string oldValue, string newValue)
+    {
+        oldValue ??= "";
+        newValue ??= "";
+        var tokenSpans = CalculateKeyValueTokenSpans(oldValue, newValue);
+        if (tokenSpans.OldSpans.Count > 0 || tokenSpans.NewSpans.Count > 0)
+        {
+            return tokenSpans;
+        }
+
+        var span = DiffSpan.Calculate(oldValue, newValue);
+        return new DiffHighlightSpans(
+            span.OldLength > 0 ? [new TextHighlightSpan(span.OldStart, span.OldLength)] : [],
+            span.NewLength > 0 ? [new TextHighlightSpan(span.NewStart, span.NewLength)] : []);
+    }
+
+    private static DiffHighlightSpans CalculateKeyValueTokenSpans(string oldValue, string newValue)
+    {
+        var oldTokens = ParseKeyValueTokens(oldValue);
+        var newTokens = ParseKeyValueTokens(newValue);
+        if (oldTokens.Count < 2 && newTokens.Count < 2)
+        {
+            return new DiffHighlightSpans([], []);
+        }
+
+        if (HasDuplicateKeys(oldTokens) || HasDuplicateKeys(newTokens))
+        {
+            return new DiffHighlightSpans([], []);
+        }
+
+        var oldByKey = oldTokens.ToDictionary(token => token.Key, StringComparer.Ordinal);
+        var newByKey = newTokens.ToDictionary(token => token.Key, StringComparer.Ordinal);
+        var oldSpans = new List<TextHighlightSpan>();
+        var newSpans = new List<TextHighlightSpan>();
+
+        foreach (var oldToken in oldTokens)
+        {
+            if (!newByKey.TryGetValue(oldToken.Key, out var newToken))
+            {
+                oldSpans.Add(new TextHighlightSpan(oldToken.TokenStart, oldToken.TokenLength));
+                continue;
+            }
+
+            if (!string.Equals(oldToken.Value, newToken.Value, StringComparison.Ordinal))
+            {
+                oldSpans.Add(new TextHighlightSpan(oldToken.ValueStart, oldToken.ValueLength));
+                newSpans.Add(new TextHighlightSpan(newToken.ValueStart, newToken.ValueLength));
+            }
+        }
+
+        foreach (var newToken in newTokens)
+        {
+            if (!oldByKey.ContainsKey(newToken.Key))
+            {
+                newSpans.Add(new TextHighlightSpan(newToken.TokenStart, newToken.TokenLength));
+            }
+        }
+
+        return new DiffHighlightSpans(CoalesceSpans(oldSpans), CoalesceSpans(newSpans));
+    }
+
+    private static IReadOnlyList<KeyValueTextToken> ParseKeyValueTokens(string value)
+    {
+        var tokens = new List<KeyValueTextToken>();
+        var start = 0;
+        while (start <= value.Length)
+        {
+            var end = start;
+            while (end < value.Length && value[end] is not ',' and not ';' and not '\r' and not '\n')
+            {
+                end++;
+            }
+
+            AddKeyValueToken(value, start, end, tokens);
+            if (end >= value.Length)
+            {
+                break;
+            }
+
+            start = end + 1;
+        }
+
+        return tokens;
+    }
+
+    private static void AddKeyValueToken(string value, int start, int end, List<KeyValueTextToken> tokens)
+    {
+        var tokenStart = start;
+        var tokenEnd = end;
+        while (tokenStart < tokenEnd && char.IsWhiteSpace(value[tokenStart]))
+        {
+            tokenStart++;
+        }
+
+        while (tokenEnd > tokenStart && char.IsWhiteSpace(value[tokenEnd - 1]))
+        {
+            tokenEnd--;
+        }
+
+        if (tokenEnd <= tokenStart)
+        {
+            return;
+        }
+
+        var equalsIndex = value.IndexOf('=', tokenStart, tokenEnd - tokenStart);
+        if (equalsIndex <= tokenStart)
+        {
+            return;
+        }
+
+        var key = value[tokenStart..equalsIndex].Trim();
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return;
+        }
+
+        var valueStart = equalsIndex + 1;
+        var valueEnd = tokenEnd;
+        while (valueStart < valueEnd && char.IsWhiteSpace(value[valueStart]))
+        {
+            valueStart++;
+        }
+
+        while (valueEnd > valueStart && char.IsWhiteSpace(value[valueEnd - 1]))
+        {
+            valueEnd--;
+        }
+
+        tokens.Add(new KeyValueTextToken(
+            key,
+            value[valueStart..valueEnd],
+            tokenStart,
+            tokenEnd - tokenStart,
+            valueStart,
+            valueEnd - valueStart));
+    }
+
+    private static bool HasDuplicateKeys(IReadOnlyList<KeyValueTextToken> tokens)
+    {
+        return tokens.Select(token => token.Key).Distinct(StringComparer.Ordinal).Count() != tokens.Count;
+    }
+
+    private static IReadOnlyList<TextHighlightSpan> CoalesceSpans(IReadOnlyList<TextHighlightSpan> spans)
+    {
+        if (spans.Count <= 1)
+        {
+            return spans;
+        }
+
+        var ordered = spans
+            .Where(span => span.Length > 0)
+            .OrderBy(span => span.Start)
+            .ToList();
+        if (ordered.Count <= 1)
+        {
+            return ordered;
+        }
+
+        var result = new List<TextHighlightSpan>();
+        var current = ordered[0];
+        foreach (var next in ordered.Skip(1))
+        {
+            var currentEnd = current.Start + current.Length;
+            if (next.Start <= currentEnd)
+            {
+                current = current with { Length = Math.Max(currentEnd, next.Start + next.Length) - current.Start };
+                continue;
+            }
+
+            result.Add(current);
+            current = next;
+        }
+
+        result.Add(current);
+        return result;
+    }
+}
+
+internal sealed record KeyValueTextToken(string Key, string Value, int TokenStart, int TokenLength, int ValueStart, int ValueLength);
 
 internal sealed record ExcelCellKey(string Sheet, int Row, int Column);
 
@@ -7453,7 +11621,8 @@ internal static class DiffFileKindDetector
         var comparablePath = SvnConflictArtifact.NormalizeToBasePath(filePath);
         var extension = Path.GetExtension(comparablePath);
         if (string.Equals(extension, ".xls", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(extension, ".xlsx", StringComparison.OrdinalIgnoreCase))
+            string.Equals(extension, ".xlsx", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".xlsm", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -7481,8 +11650,26 @@ internal static class TextDiffService
 {
     public static IReadOnlyList<TextDiffRow> Compare(string oldFilePath, string newFilePath)
     {
+        return CreatePreview(oldFilePath, newFilePath).Differences;
+    }
+
+    public static TextDiffContent CreatePreview(string oldFilePath, string newFilePath)
+    {
         var oldLines = ReadTextLines(oldFilePath);
         var newLines = ReadTextLines(newFilePath);
+        var oldText = string.Join('\n', oldLines);
+        var newText = string.Join('\n', newLines);
+        return new TextDiffContent(
+            oldText,
+            newText,
+            DetectLanguage(oldFilePath, newFilePath),
+            "旧版本",
+            "新版本",
+            CompareLines(oldLines, newLines));
+    }
+
+    private static IReadOnlyList<TextDiffRow> CompareLines(string[] oldLines, string[] newLines)
+    {
         var operations = (long)oldLines.Length * newLines.Length <= 2_000_000
             ? BuildAlignedOperations(oldLines, newLines)
             : BuildPositionalOperations(oldLines, newLines);
@@ -7631,7 +11818,60 @@ internal static class TextDiffService
             index = hunkEnd + 1;
         }
 
+        ApplyInlineHighlights(rows);
         return rows;
+    }
+
+    private static void ApplyInlineHighlights(List<TextDiffRow> rows)
+    {
+        var index = 0;
+        while (index < rows.Count)
+        {
+            if (rows[index].Kind != "Removed")
+            {
+                index++;
+                continue;
+            }
+
+            var removedStart = index;
+            while (index < rows.Count && rows[index].Kind == "Removed")
+            {
+                index++;
+            }
+
+            var addedStart = index;
+            while (index < rows.Count && rows[index].Kind == "Added")
+            {
+                index++;
+            }
+
+            var pairCount = Math.Min(addedStart - removedStart, index - addedStart);
+            for (var offset = 0; offset < pairCount; offset++)
+            {
+                var removedIndex = removedStart + offset;
+                var addedIndex = addedStart + offset;
+                var oldValue = StripDiffPrefix(rows[removedIndex].Content);
+                var newValue = StripDiffPrefix(rows[addedIndex].Content);
+                var span = DiffSpan.Calculate(oldValue, newValue);
+                rows[removedIndex] = rows[removedIndex] with
+                {
+                    HighlightStart = 2 + span.OldStart,
+                    HighlightLength = span.OldLength,
+                };
+                rows[addedIndex] = rows[addedIndex] with
+                {
+                    HighlightStart = 2 + span.NewStart,
+                    HighlightLength = span.NewLength,
+                };
+            }
+        }
+    }
+
+    private static string StripDiffPrefix(string content)
+    {
+        return content.Length >= 2 && (content[0] == '-' || content[0] == '+') && content[1] == ' '
+            ? content[2..]
+            : content;
     }
 
     public static string ReadText(string filePath)
@@ -7655,6 +11895,31 @@ internal static class TextDiffService
             .Replace('\r', '\n')
             .Split('\n');
     }
+
+    private static string DetectLanguage(string oldFilePath, string newFilePath)
+    {
+        var extension = Path.GetExtension(SvnConflictArtifact.NormalizeToBasePath(newFilePath));
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            extension = Path.GetExtension(SvnConflictArtifact.NormalizeToBasePath(oldFilePath));
+        }
+
+        return extension.ToLowerInvariant() switch
+        {
+            ".lua" => "lua",
+            ".xml" => "xml",
+            ".json" => "json",
+            ".cs" => "csharp",
+            ".js" => "javascript",
+            ".ts" => "typescript",
+            ".css" => "css",
+            ".html" or ".htm" => "html",
+            ".md" => "markdown",
+            ".sql" => "sql",
+            ".txt" => "plaintext",
+            _ => "plaintext",
+        };
+    }
 }
 
 internal sealed record TextDiffOperation(string Kind, int? OldLine, int? NewLine, string Content)
@@ -7666,8 +11931,20 @@ internal sealed record TextDiffOperation(string Kind, int? OldLine, int? NewLine
     public static TextDiffOperation Added(int newLine, string content) => new("Added", null, newLine, content);
 }
 
+internal sealed record TextDiffContent(
+    string OldText,
+    string NewText,
+    string Language,
+    string OldLabel,
+    string NewLabel,
+    IReadOnlyList<TextDiffRow> Differences);
+
 internal sealed record TextDiffRow(string Kind, string LineNumber, string Content)
 {
+    public int HighlightStart { get; init; } = -1;
+
+    public int HighlightLength { get; init; }
+
     public string KindText => Kind switch
     {
         "Added" => "新增",
@@ -7686,9 +11963,35 @@ internal sealed record TextDiffRow(string Kind, string LineNumber, string Conten
     public static TextDiffRow Added(int lineNumber, string content) => new("Added", lineNumber.ToString(), "+ " + content);
 }
 
+internal sealed record TextSideBySideRow(TextDiffRow? OldRow, TextDiffRow? NewRow)
+{
+    public string OldLine => OldRow?.Kind == "Hunk" ? "" : OldRow?.LineNumber ?? "";
+
+    public string NewLine => NewRow?.Kind == "Hunk" ? "" : NewRow?.LineNumber ?? "";
+
+    public string OldContent => OldRow?.Content ?? "";
+
+    public string NewContent => NewRow?.Content ?? "";
+
+    public bool IsHunk => OldRow?.Kind == "Hunk" || NewRow?.Kind == "Hunk";
+}
+
 internal sealed class TextDiffForm : Form
 {
+    public TextDiffForm(string title, DiffPreviewData data)
+    {
+        BuildContent(title, data.Summary, data.CreateView());
+    }
+
     public TextDiffForm(string title, IReadOnlyList<TextDiffRow> differences)
+    {
+        BuildContent(
+            title,
+            differences.Count == 0 ? "没有发现文本差异" : $"发现 {differences.Count} 行文本差异",
+            CreateTextDiffView(differences));
+    }
+
+    private void BuildContent(string title, string summary, Control content)
     {
         Text = $"文本差异 - {title}";
         StartPosition = FormStartPosition.CenterParent;
@@ -7709,12 +12012,12 @@ internal sealed class TextDiffForm : Form
 
         root.Controls.Add(new Label
         {
-            Text = differences.Count == 0 ? "没有发现文本差异" : $"发现 {differences.Count} 行文本差异",
+            Text = summary,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
         }, 0, 0);
 
-        root.Controls.Add(CreateTextDiffView(differences), 0, 1);
+        root.Controls.Add(content, 0, 1);
     }
 
     public static Control CreateTextDiffView(IReadOnlyList<TextDiffRow> differences)
@@ -7782,6 +12085,302 @@ internal sealed class TextDiffForm : Form
         return root;
     }
 
+    public static Control CreateTextDiffView(TextDiffContent content)
+    {
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 2,
+            ColumnCount = 1,
+            BackColor = Color.White,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var toolbar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 4,
+            RowCount = 1,
+            BackColor = Color.FromArgb(248, 250, 252),
+            Padding = new Padding(0, 2, 0, 2),
+        };
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
+        var unifiedButton = CreateDiffModeButton("统一视图");
+        var splitButton = CreateDiffModeButton("双栏对比");
+        var summaryLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(71, 85, 105),
+            Text = $"{content.OldLabel}  ->  {content.NewLabel}",
+        };
+        var languageLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleRight,
+            ForeColor = Color.FromArgb(100, 116, 139),
+            Text = $"语言：{content.Language}",
+        };
+        toolbar.Controls.Add(unifiedButton, 0, 0);
+        toolbar.Controls.Add(splitButton, 1, 0);
+        toolbar.Controls.Add(summaryLabel, 2, 0);
+        toolbar.Controls.Add(languageLabel, 3, 0);
+        root.Controls.Add(toolbar, 0, 0);
+
+        var host = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
+        root.Controls.Add(host, 0, 1);
+
+        void Show(Control control, Button activeButton)
+        {
+            Form1.ClearControlsDisposing(host);
+            control.Dock = DockStyle.Fill;
+            host.Controls.Add(control);
+            unifiedButton.Font = new Font(unifiedButton.Font, activeButton == unifiedButton ? FontStyle.Bold : FontStyle.Regular);
+            splitButton.Font = new Font(splitButton.Font, activeButton == splitButton ? FontStyle.Bold : FontStyle.Regular);
+            unifiedButton.BackColor = activeButton == unifiedButton ? Color.FromArgb(219, 234, 254) : Color.White;
+            splitButton.BackColor = activeButton == splitButton ? Color.FromArgb(219, 234, 254) : Color.White;
+        }
+
+        unifiedButton.Click += (_, _) => Show(CreateTextDiffView(content.Differences), unifiedButton);
+        splitButton.Click += (_, _) => Show(CreateSideBySideTextDiffView(content), splitButton);
+        Show(CreateSideBySideTextDiffView(content), splitButton);
+        return root;
+    }
+
+    private static Button CreateDiffModeButton(string text)
+    {
+        return new Button
+        {
+            Text = text,
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 2, 8, 2),
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.White,
+            ForeColor = Color.FromArgb(30, 41, 59),
+        };
+    }
+
+    private static Control CreateSideBySideTextDiffView(TextDiffContent content)
+    {
+        var rows = BuildSideBySideRows(content.Differences);
+        var grid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AutoGenerateColumns = false,
+            ReadOnly = true,
+            RowHeadersVisible = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            BackgroundColor = Color.White,
+            BorderStyle = System.Windows.Forms.BorderStyle.None,
+            CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+            GridColor = Color.FromArgb(226, 232, 240),
+            AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None,
+        };
+        grid.EnableHeadersVisualStyles = false;
+        grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(45, 55, 72);
+        grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(226, 241, 255);
+        grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(15, 23, 42);
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = content.OldLabel,
+            Name = "OldLine",
+            DataPropertyName = nameof(TextSideBySideRow.OldLine),
+            Width = 72,
+            DefaultCellStyle = new DataGridViewCellStyle { Font = new Font("Consolas", 9F), Alignment = DataGridViewContentAlignment.MiddleRight },
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "旧内容",
+            Name = "OldContent",
+            DataPropertyName = nameof(TextSideBySideRow.OldContent),
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            FillWeight = 50,
+            MinimumWidth = 260,
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = content.NewLabel,
+            Name = "NewLine",
+            DataPropertyName = nameof(TextSideBySideRow.NewLine),
+            Width = 72,
+            DefaultCellStyle = new DataGridViewCellStyle { Font = new Font("Consolas", 9F), Alignment = DataGridViewContentAlignment.MiddleRight },
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "新内容",
+            Name = "NewContent",
+            DataPropertyName = nameof(TextSideBySideRow.NewContent),
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            FillWeight = 50,
+            MinimumWidth = 260,
+        });
+        grid.DataSource = rows;
+        grid.DataBindingComplete += (_, _) => ApplySideBySideRowStyles(grid);
+        grid.CellPainting += PaintSideBySideTextDiffCell;
+        return grid;
+    }
+
+    private static List<TextSideBySideRow> BuildSideBySideRows(IReadOnlyList<TextDiffRow> rows)
+    {
+        var result = new List<TextSideBySideRow>();
+        var index = 0;
+        while (index < rows.Count)
+        {
+            var row = rows[index];
+            if (row.Kind == "Hunk")
+            {
+                result.Add(new TextSideBySideRow(row, row));
+                index++;
+                continue;
+            }
+
+            if (row.Kind == "Removed")
+            {
+                var removed = new List<TextDiffRow>();
+                while (index < rows.Count && rows[index].Kind == "Removed")
+                {
+                    removed.Add(rows[index++]);
+                }
+
+                var added = new List<TextDiffRow>();
+                while (index < rows.Count && rows[index].Kind == "Added")
+                {
+                    added.Add(rows[index++]);
+                }
+
+                var pairCount = Math.Max(removed.Count, added.Count);
+                for (var pairIndex = 0; pairIndex < pairCount; pairIndex++)
+                {
+                    result.Add(new TextSideBySideRow(
+                        pairIndex < removed.Count ? removed[pairIndex] : null,
+                        pairIndex < added.Count ? added[pairIndex] : null));
+                }
+
+                continue;
+            }
+
+            if (row.Kind == "Added")
+            {
+                result.Add(new TextSideBySideRow(null, row));
+                index++;
+                continue;
+            }
+
+            result.Add(new TextSideBySideRow(row, row));
+            index++;
+        }
+
+        return result;
+    }
+
+    private static string NormalizeSideBySideContent(TextDiffRow row)
+    {
+        return row.Content.Length >= 2 && (row.Content[0] == '-' || row.Content[0] == '+' || row.Content[0] == ' ') && row.Content[1] == ' '
+            ? row.Content[2..]
+            : row.Content;
+    }
+
+    private static void ApplySideBySideRowStyles(DataGridView grid)
+    {
+        foreach (DataGridViewRow gridRow in grid.Rows)
+        {
+            if (gridRow.DataBoundItem is not TextSideBySideRow row)
+            {
+                continue;
+            }
+
+            gridRow.DefaultCellStyle.BackColor = row.IsHunk ? Color.FromArgb(241, 245, 249) : Color.White;
+            gridRow.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
+            gridRow.DefaultCellStyle.SelectionForeColor = Color.FromArgb(15, 23, 42);
+        }
+    }
+
+    private static void PaintSideBySideTextDiffCell(object? sender, DataGridViewCellPaintingEventArgs args)
+    {
+        if (sender is not DataGridView grid ||
+            args.RowIndex < 0 ||
+            args.Graphics == null ||
+            grid.Rows[args.RowIndex].DataBoundItem is not TextSideBySideRow row)
+        {
+            return;
+        }
+
+        var columnName = grid.Columns[args.ColumnIndex].Name;
+        var diffRow = columnName.StartsWith("Old", StringComparison.Ordinal) ? row.OldRow : row.NewRow;
+        if (diffRow == null)
+        {
+            args.Handled = true;
+            args.PaintBackground(args.ClipBounds, true);
+            using var brush = new SolidBrush(Color.FromArgb(248, 250, 252));
+            args.Graphics.FillRectangle(brush, args.CellBounds);
+            return;
+        }
+
+        if (columnName is "OldLine" or "NewLine")
+        {
+            args.Handled = true;
+            args.Paint(args.CellBounds, args.PaintParts & ~DataGridViewPaintParts.ContentForeground);
+            var lineText = columnName == "OldLine" ? row.OldLine : row.NewLine;
+            using var lineFont = new Font("Consolas", 9F);
+            TextRenderer.DrawText(
+                args.Graphics,
+                lineText,
+                lineFont,
+                Rectangle.Inflate(args.CellBounds, -6, -1),
+                Color.FromArgb(100, 116, 139),
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            return;
+        }
+
+        if (columnName is not "OldContent" and not "NewContent")
+        {
+            return;
+        }
+
+        args.Handled = true;
+        var backColor = diffRow.Kind switch
+        {
+            "Added" => Color.FromArgb(235, 255, 239),
+            "Removed" => Color.FromArgb(255, 239, 241),
+            "Hunk" => Color.FromArgb(241, 245, 249),
+            _ => Color.White,
+        };
+        using var backBrush = new SolidBrush(backColor);
+        args.Graphics.FillRectangle(backBrush, args.CellBounds);
+        args.Paint(args.CellBounds, (args.PaintParts & ~DataGridViewPaintParts.Background) & ~DataGridViewPaintParts.ContentForeground);
+        var textColor = diffRow.Kind switch
+        {
+            "Added" => Color.FromArgb(22, 101, 52),
+            "Removed" => Color.FromArgb(153, 27, 27),
+            "Hunk" => Color.FromArgb(71, 85, 105),
+            _ => Color.FromArgb(30, 41, 59),
+        };
+        var highlightColor = diffRow.Kind switch
+        {
+            "Added" => Color.FromArgb(187, 247, 208),
+            "Removed" => Color.FromArgb(254, 202, 202),
+            _ => Color.FromArgb(226, 232, 240),
+        };
+        using var font = new Font("Consolas", 9F, diffRow.Kind == "Removed" ? FontStyle.Strikeout : FontStyle.Regular);
+        DrawTextDiffSegments(
+            args.Graphics,
+            Rectangle.Inflate(args.CellBounds, -8, -2),
+            NormalizeSideBySideContent(diffRow),
+            Math.Max(-1, diffRow.HighlightStart - 2),
+            diffRow.HighlightLength,
+            font,
+            textColor,
+            highlightColor);
+    }
+
     private static bool MatchesTextMode(TextDiffRow row, string mode)
     {
         return mode switch
@@ -7804,31 +12403,134 @@ internal sealed class TextDiffForm : Form
             ReadOnly = true,
             RowHeadersVisible = false,
             SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            BackgroundColor = Color.White,
+            BorderStyle = System.Windows.Forms.BorderStyle.None,
+            CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+            GridColor = Color.FromArgb(226, 232, 240),
         };
+        grid.EnableHeadersVisualStyles = false;
+        grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(45, 55, 72);
+        grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
         grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "类型", DataPropertyName = nameof(TextDiffRow.KindText), Width = 82 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "行号", DataPropertyName = nameof(TextDiffRow.LineNumber), Width = 110 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "内容", DataPropertyName = nameof(TextDiffRow.Content), Width = 980 });
-        grid.CellFormatting += (_, args) =>
+        grid.Columns.Add(new DataGridViewTextBoxColumn
         {
-            if (args.RowIndex < 0 || grid.Rows[args.RowIndex].DataBoundItem is not TextDiffRow row)
+            HeaderText = "行号",
+            DataPropertyName = nameof(TextDiffRow.LineNumber),
+            Width = 110,
+            DefaultCellStyle = new DataGridViewCellStyle { Font = new Font("Consolas", 9F), Alignment = DataGridViewContentAlignment.MiddleRight },
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "内容",
+            Name = "Content",
+            DataPropertyName = nameof(TextDiffRow.Content),
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            MinimumWidth = 520,
+        });
+        grid.DataBindingComplete += (_, _) => ApplyTextRowStyles(grid);
+        grid.CellPainting += PaintTextDiffCell;
+        return grid;
+    }
+
+    private static void ApplyTextRowStyles(DataGridView grid)
+    {
+        foreach (DataGridViewRow gridRow in grid.Rows)
+        {
+            if (gridRow.DataBoundItem is not TextDiffRow row)
             {
-                return;
+                continue;
             }
 
-            grid.Rows[args.RowIndex].DefaultCellStyle.BackColor = row.Kind switch
+            gridRow.DefaultCellStyle.BackColor = row.Kind switch
             {
-                "Added" => Color.FromArgb(220, 255, 220),
-                "Removed" => Color.FromArgb(255, 225, 225),
-                "Hunk" => Color.FromArgb(235, 235, 235),
+                "Added" => Color.FromArgb(235, 255, 239),
+                "Removed" => Color.FromArgb(255, 239, 241),
+                "Hunk" => Color.FromArgb(241, 245, 249),
                 "Context" => Color.White,
                 _ => Color.White,
             };
+            gridRow.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
+            gridRow.DefaultCellStyle.SelectionForeColor = Color.FromArgb(15, 23, 42);
             if (row.Kind == "Hunk")
             {
-                grid.Rows[args.RowIndex].DefaultCellStyle.Font = new Font(grid.Font, FontStyle.Bold);
+                gridRow.DefaultCellStyle.Font = new Font(grid.Font, FontStyle.Bold);
             }
-        };
-        return grid;
+        }
+    }
+
+    private static void PaintTextDiffCell(object? sender, DataGridViewCellPaintingEventArgs args)
+    {
+        if (sender is not DataGridView grid ||
+            args.RowIndex < 0 ||
+            args.Graphics == null ||
+            grid.Columns[args.ColumnIndex].Name != "Content" ||
+            grid.Rows[args.RowIndex].DataBoundItem is not TextDiffRow row)
+        {
+            return;
+        }
+
+        args.Handled = true;
+        args.Paint(args.CellBounds, args.PaintParts & ~DataGridViewPaintParts.ContentForeground);
+        var bounds = Rectangle.Inflate(args.CellBounds, -8, -2);
+        var font = new Font("Consolas", 9F, row.Kind == "Removed" ? FontStyle.Strikeout : FontStyle.Regular);
+        try
+        {
+            var textColor = row.Kind switch
+            {
+                "Added" => Color.FromArgb(22, 101, 52),
+                "Removed" => Color.FromArgb(153, 27, 27),
+                "Hunk" => Color.FromArgb(71, 85, 105),
+                _ => Color.FromArgb(30, 41, 59),
+            };
+            var highlightColor = row.Kind switch
+            {
+                "Added" => Color.FromArgb(187, 247, 208),
+                "Removed" => Color.FromArgb(254, 202, 202),
+                _ => Color.FromArgb(226, 232, 240),
+            };
+            DrawTextDiffSegments(args.Graphics, bounds, row.Content, row.HighlightStart, row.HighlightLength, font, textColor, highlightColor);
+        }
+        finally
+        {
+            font.Dispose();
+        }
+    }
+
+    private static void DrawTextDiffSegments(Graphics graphics, Rectangle bounds, string value, int highlightStart, int highlightLength, Font font, Color textColor, Color highlightColor)
+    {
+        value ??= "";
+        if (highlightStart < 0 || highlightLength <= 0 || highlightStart >= value.Length)
+        {
+            TextRenderer.DrawText(graphics, value, font, bounds, textColor, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            return;
+        }
+
+        highlightLength = Math.Min(highlightLength, value.Length - highlightStart);
+        var x = bounds.Left;
+        DrawTextDiffPart(graphics, ref x, bounds, value[..highlightStart], font, textColor, null);
+        DrawTextDiffPart(graphics, ref x, bounds, value.Substring(highlightStart, highlightLength), font, textColor, highlightColor);
+        DrawTextDiffPart(graphics, ref x, bounds, value[(highlightStart + highlightLength)..], font, textColor, null);
+    }
+
+    private static void DrawTextDiffPart(Graphics graphics, ref int x, Rectangle bounds, string text, Font font, Color textColor, Color? backColor)
+    {
+        if (string.IsNullOrEmpty(text) || x >= bounds.Right)
+        {
+            return;
+        }
+
+        var size = TextRenderer.MeasureText(graphics, text, font, Size.Empty, TextFormatFlags.NoPadding);
+        var width = Math.Min(size.Width, bounds.Right - x);
+        var partBounds = new Rectangle(x, bounds.Top, width, bounds.Height);
+        if (backColor != null)
+        {
+            using var brush = new SolidBrush(backColor.Value);
+            graphics.FillRectangle(brush, partBounds);
+        }
+
+        TextRenderer.DrawText(graphics, text, font, partBounds, textColor, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        x += width;
     }
 }
 
@@ -7988,18 +12690,7 @@ internal sealed class ConflictViewerForm : Form
     private static TabPage CreateDiffPage(string title, string oldFilePath, string newFilePath)
     {
         var page = new TabPage(title);
-        Control diffControl;
-        if (DiffFileKindDetector.IsSpreadsheet(oldFilePath) && DiffFileKindDetector.IsSpreadsheet(newFilePath))
-        {
-            var differences = ExcelDiffService.Compare(oldFilePath, newFilePath);
-            diffControl = ExcelDiffForm.CreateExcelDiffView(differences);
-        }
-        else
-        {
-            var differences = TextDiffService.Compare(oldFilePath, newFilePath);
-            diffControl = TextDiffForm.CreateTextDiffView(differences);
-        }
-
+        var diffControl = Form1.CreateDiffPreviewData(oldFilePath, newFilePath).CreateView();
         diffControl.Dock = DockStyle.Fill;
         page.Controls.Add(diffControl);
         return page;
@@ -8033,9 +12724,15 @@ internal sealed record WorkingCopyInfo(long Revision, long LastChangedRevision, 
 {
     public static WorkingCopyInfo Empty { get; } = new(0, 0, 0, 0, "");
 
+    public long CurrentContentRevision => MaxRevision > 0
+        ? MaxRevision
+        : Math.Max(Revision, LastChangedRevision);
+
+    public bool IsMixedRevision => MinRevision > 0 && MaxRevision > 0 && MinRevision != MaxRevision;
+
     public string DisplayRevisionText => MinRevision > 0 && MaxRevision > 0 && MinRevision != MaxRevision
         ? $"r{MinRevision}:r{MaxRevision}（混合版本）"
-        : $"r{Math.Max(MaxRevision, Revision)}";
+        : $"r{CurrentContentRevision}";
 }
 
 internal sealed record ChangedFileEntry(string Action, string RepositoryPath, string RelativePath)
@@ -8526,6 +13223,50 @@ internal sealed record ProcessResult(int ExitCode, string StandardOutput, string
         new[] { StandardOutput, StandardError }.Where(text => !string.IsNullOrWhiteSpace(text)));
 }
 
+internal sealed record CommitPreflightResult(IReadOnlyList<string> Blockers, IReadOnlyList<string> Warnings)
+{
+    public bool Blocked => Blockers.Count > 0;
+
+    public bool HasWarnings => Warnings.Count > 0;
+
+    public string BlockMessage => Blocked
+        ? string.Join(Environment.NewLine, Blockers)
+        : "";
+
+    public string FormatMessage(string title)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine(title);
+        builder.AppendLine();
+        if (Blockers.Count > 0)
+        {
+            builder.AppendLine("必须处理：");
+            foreach (var blocker in Blockers)
+            {
+                builder.AppendLine("- " + blocker);
+            }
+
+            builder.AppendLine();
+        }
+
+        if (Warnings.Count > 0)
+        {
+            builder.AppendLine("需要确认：");
+            foreach (var warning in Warnings)
+            {
+                builder.AppendLine("- " + warning);
+            }
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    public string ToLogText()
+    {
+        return $"blockers={Blockers.Count}; warnings={Warnings.Count}; {string.Join(" | ", Blockers.Concat(Warnings))}";
+    }
+}
+
 internal sealed record ConflictGridRow(string RelativePath, string Description);
 
 internal sealed record FileTreeNodeInfo(string RelativePath, bool IsFile);
@@ -8541,8 +13282,89 @@ internal sealed record FileTreeBuildResult(
     TreeNode? RootNode,
     string Message,
     int FileCount,
+    bool IsTruncated,
+    bool IsLazy,
     bool IsFiltering,
-    HashSet<string> ExpandedPaths);
+    HashSet<string> ExpandedPaths,
+    IReadOnlyDictionary<string, SvnStatusKind> StatusMap);
+
+internal sealed record FileTreeFileEntry(string RelativePath, string FullPath, SvnStatusKind Status);
+
+internal sealed class LazyFileTreePlaceholder
+{
+    public static LazyFileTreePlaceholder Instance { get; } = new();
+
+    private LazyFileTreePlaceholder()
+    {
+    }
+}
+
+internal static class WinFormsRendering
+{
+    private const int WmSetRedraw = 0x000B;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    public static void EnableDoubleBuffering(Control control)
+    {
+        typeof(Control)
+            .GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?.SetValue(control, true);
+    }
+
+    public static void SetRedraw(Control control, bool enabled)
+    {
+        if (!control.IsHandleCreated)
+        {
+            return;
+        }
+
+        SendMessage(control.Handle, WmSetRedraw, enabled ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero);
+        if (enabled)
+        {
+            control.Invalidate(true);
+        }
+    }
+
+    public static void InvalidateTreeNodeRow(TreeView tree, TreeNode node)
+    {
+        if (!tree.IsHandleCreated)
+        {
+            return;
+        }
+
+        var bounds = node.Bounds;
+        if (bounds.IsEmpty)
+        {
+            return;
+        }
+
+        tree.Invalidate(new Rectangle(0, Math.Max(0, bounds.Top - 2), tree.ClientSize.Width, Math.Max(tree.ItemHeight + 4, bounds.Height + 4)));
+    }
+
+    public static void InvalidateListViewItems(ListView list, params ListViewItem?[] items)
+    {
+        if (!list.IsHandleCreated)
+        {
+            return;
+        }
+
+        foreach (var item in items)
+        {
+            if (item == null)
+            {
+                continue;
+            }
+
+            var bounds = item.Bounds;
+            if (!bounds.IsEmpty)
+            {
+                list.Invalidate(new Rectangle(0, Math.Max(0, bounds.Top - 2), list.ClientSize.Width, bounds.Height + 4));
+            }
+        }
+    }
+}
 
 internal sealed record IgnoreGroup(string ParentPath, IReadOnlyList<string> Names);
 
@@ -8896,17 +13718,7 @@ internal sealed class RepositoryManagerForm : Form
             return;
         }
 
-        _settings.IgnoreWorkingCopy(repository.WorkingCopyPath);
-        _settings.Repositories.RemoveAll(item => item.Id == repository.Id);
-        if (string.Equals(_settings.CurrentRepositoryId, repository.Id, StringComparison.OrdinalIgnoreCase))
-        {
-            _settings.CurrentRepositoryId = _settings.Repositories.FirstOrDefault()?.Id;
-        }
-
-        if (_settings.Repositories.Count == 0)
-        {
-            _settings.CurrentRepositoryId = null;
-        }
+        _settings.RemoveRepository(repository);
 
         Changed = true;
         RefreshRows();
@@ -9260,15 +14072,216 @@ internal sealed class FileTreeNodeSorter : System.Collections.IComparer
     }
 }
 
+internal sealed class ShellTabControl : TabControl
+{
+    private const int TcmAdjustRect = 0x1328;
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == TcmAdjustRect && !DesignMode)
+        {
+            m.Result = (IntPtr)1;
+            return;
+        }
+
+        base.WndProc(ref m);
+    }
+}
+
+internal static class GraphicsExtensions
+{
+    public static void FillRoundedRectangle(this Graphics graphics, Brush brush, Rectangle bounds, int radius)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            return;
+        }
+
+        radius = Math.Max(0, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2));
+        if (radius == 0)
+        {
+            graphics.FillRectangle(brush, bounds);
+            return;
+        }
+
+        using var path = new System.Drawing.Drawing2D.GraphicsPath();
+        var diameter = radius * 2;
+        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        graphics.FillPath(brush, path);
+    }
+
+    public static void DrawRoundedRectangle(this Graphics graphics, Pen pen, Rectangle bounds, int radius)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            return;
+        }
+
+        radius = Math.Max(0, Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2));
+        if (radius == 0)
+        {
+            graphics.DrawRectangle(pen, bounds);
+            return;
+        }
+
+        using var path = new System.Drawing.Drawing2D.GraphicsPath();
+        var diameter = radius * 2;
+        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        graphics.DrawPath(pen, path);
+    }
+}
+
+internal sealed class ShellNavButton : Control
+{
+    private bool _active;
+    private bool _hovered;
+
+    public string Title { get; init; } = "";
+    public string Glyph { get; init; } = "";
+    public string TabText { get; init; } = "";
+
+    public bool Active
+    {
+        get => _active;
+        set
+        {
+            if (_active == value)
+            {
+                return;
+            }
+
+            _active = value;
+            Invalidate();
+        }
+    }
+
+    public ShellNavButton()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+        Cursor = Cursors.Hand;
+        ForeColor = Color.FromArgb(213, 220, 230);
+    }
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        _hovered = true;
+        Invalidate();
+        base.OnMouseEnter(e);
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        _hovered = false;
+        Invalidate();
+        base.OnMouseLeave(e);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        var background = Active
+            ? Color.FromArgb(39, 50, 67)
+            : _hovered ? Color.FromArgb(32, 41, 55) : Color.FromArgb(24, 31, 42);
+        using var backgroundBrush = new SolidBrush(background);
+        e.Graphics.FillRoundedRectangle(backgroundBrush, new Rectangle(0, 0, Width - 1, Height - 1), 8);
+
+        if (Active)
+        {
+            using var accentBrush = new SolidBrush(Color.FromArgb(88, 166, 255));
+            e.Graphics.FillRoundedRectangle(accentBrush, new Rectangle(0, 10, 4, Height - 20), 3);
+        }
+
+        var glyphColor = Active ? Color.White : Color.FromArgb(175, 186, 202);
+        var titleColor = Active ? Color.White : Color.FromArgb(197, 206, 220);
+        using var titleFont = new Font("Microsoft YaHei UI", 9F, Active ? FontStyle.Bold : FontStyle.Regular);
+        DrawShellIcon(e.Graphics, new Rectangle((Width - 24) / 2, 7, 24, 22), glyphColor);
+        TextRenderer.DrawText(
+            e.Graphics,
+            Title,
+            titleFont,
+            new Rectangle(8, 30, Width - 16, 22),
+            titleColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+    }
+
+    private void DrawShellIcon(Graphics graphics, Rectangle bounds, Color color)
+    {
+        using var pen = new Pen(color, 1.7F) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round };
+        using var brush = new SolidBrush(color);
+        var center = new Point(bounds.Left + bounds.Width / 2, bounds.Top + bounds.Height / 2);
+        switch (Glyph)
+        {
+            case "CFG":
+                graphics.DrawEllipse(pen, center.X - 5, center.Y - 5, 10, 10);
+                for (var index = 0; index < 8; index++)
+                {
+                    var angle = index * Math.PI / 4;
+                    var x1 = center.X + (int)(Math.Cos(angle) * 8);
+                    var y1 = center.Y + (int)(Math.Sin(angle) * 8);
+                    var x2 = center.X + (int)(Math.Cos(angle) * 10);
+                    var y2 = center.Y + (int)(Math.Sin(angle) * 10);
+                    graphics.DrawLine(pen, x1, y1, x2, y2);
+                }
+
+                break;
+            case "STS":
+                for (var index = 0; index < 3; index++)
+                {
+                    var y = bounds.Top + 4 + index * 7;
+                    graphics.FillEllipse(brush, bounds.Left + 2, y - 1, 4, 4);
+                    graphics.DrawLine(pen, bounds.Left + 10, y + 1, bounds.Right - 2, y + 1);
+                }
+
+                break;
+            case "CNF":
+                var triangle = new[]
+                {
+                    new Point(center.X, bounds.Top + 2),
+                    new Point(bounds.Right - 2, bounds.Bottom - 2),
+                    new Point(bounds.Left + 2, bounds.Bottom - 2),
+                };
+                graphics.DrawPolygon(pen, triangle);
+                graphics.DrawLine(pen, center.X, bounds.Top + 8, center.X, bounds.Bottom - 8);
+                graphics.FillEllipse(brush, center.X - 1, bounds.Bottom - 5, 3, 3);
+                break;
+            case "ALL":
+                graphics.DrawRectangle(pen, bounds.Left + 5, bounds.Top + 2, 13, 17);
+                graphics.DrawLine(pen, bounds.Left + 8, bounds.Top + 7, bounds.Right - 7, bounds.Top + 7);
+                graphics.DrawLine(pen, bounds.Left + 8, bounds.Top + 11, bounds.Right - 5, bounds.Top + 11);
+                graphics.DrawLine(pen, bounds.Left + 8, bounds.Top + 15, bounds.Right - 8, bounds.Top + 15);
+                break;
+            case "HIS":
+                graphics.DrawEllipse(pen, bounds.Left + 3, bounds.Top + 2, 18, 18);
+                graphics.DrawLine(pen, center.X, center.Y, center.X, bounds.Top + 7);
+                graphics.DrawLine(pen, center.X, center.Y, bounds.Right - 7, center.Y + 3);
+                break;
+            default:
+                graphics.FillEllipse(brush, center.X - 4, center.Y - 4, 8, 8);
+                break;
+        }
+    }
+}
+
 internal sealed class CommitPreviewForm : Form
 {
     private readonly TextBox _messageBox = new();
     private readonly TextBox _searchBox = new();
-    private readonly DataGridView _grid = new();
+    private readonly ComboBox _statusFilterBox = new();
+    private readonly TreeView _commitTree = new();
     private readonly Label _summaryLabel = new();
     private readonly Label _blockLabel = new();
+    private readonly Label _messageStatsLabel = new();
     private readonly List<CommitPreviewRow> _rows;
     private readonly string? _globalBlockReason;
+    private bool _syncingCommitTreeChecks;
 
     public string CommitMessage => _messageBox.Text.Trim();
 
@@ -9286,127 +14299,80 @@ internal sealed class CommitPreviewForm : Form
 
         Text = "准备提交";
         StartPosition = FormStartPosition.CenterParent;
-        MinimumSize = new Size(760, 480);
-        Size = new Size(920, 620);
+        MinimumSize = new Size(920, 560);
+        Size = new Size(1120, 680);
         Font = new Font("Microsoft YaHei UI", 9F);
+        BackColor = Color.FromArgb(245, 247, 250);
 
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 6,
+            RowCount = 4,
             Padding = new Padding(12),
+            BackColor = BackColor,
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, string.IsNullOrWhiteSpace(globalBlockReason) ? 0 : 34));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
         Controls.Add(root);
 
         _summaryLabel.Dock = DockStyle.Fill;
         _summaryLabel.TextAlign = ContentAlignment.MiddleLeft;
-        _summaryLabel.Font = new Font(Font, FontStyle.Bold);
+        _summaryLabel.Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold);
+        _summaryLabel.ForeColor = Color.FromArgb(15, 23, 42);
         root.Controls.Add(_summaryLabel, 0, 0);
 
         _blockLabel.Dock = DockStyle.Fill;
         _blockLabel.TextAlign = ContentAlignment.MiddleLeft;
-        _blockLabel.ForeColor = Color.DarkRed;
+        _blockLabel.ForeColor = Color.FromArgb(185, 28, 28);
         _blockLabel.Font = new Font(Font, FontStyle.Bold);
         _blockLabel.Text = globalBlockReason ?? "";
         root.Controls.Add(_blockLabel, 0, 1);
 
-        _messageBox.Dock = DockStyle.Fill;
-        _messageBox.Multiline = true;
-        _messageBox.ReadOnly = false;
-        _messageBox.ScrollBars = ScrollBars.Vertical;
-        _messageBox.Text = message;
-        _messageBox.BackColor = Color.White;
-        root.Controls.Add(_messageBox, 0, 2);
-
-        var filterPanel = new TableLayoutPanel
+        var contentLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 4,
+            ColumnCount = 2,
             RowCount = 1,
+            BackColor = BackColor,
         };
-        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
-        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
-        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
-        _searchBox.Dock = DockStyle.Fill;
-        _searchBox.PlaceholderText = "搜索文件 / 状态 / 说明";
-        _searchBox.Margin = new Padding(0, 3, 8, 3);
-        _searchBox.TextChanged += (_, _) => ApplyFilter();
-        filterPanel.Controls.Add(_searchBox, 0, 0);
-        var selectAllButton = new Button { Text = "全选", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 6, 3) };
-        selectAllButton.Click += (_, _) => SetVisibleRowsIncluded(true);
-        filterPanel.Controls.Add(selectAllButton, 1, 0);
-        var selectNoneButton = new Button { Text = "全不选", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 6, 3) };
-        selectNoneButton.Click += (_, _) => SetVisibleRowsIncluded(false);
-        filterPanel.Controls.Add(selectNoneButton, 2, 0);
-        var clearButton = new Button { Text = "清空搜索", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 0, 3) };
-        clearButton.Click += (_, _) => _searchBox.Clear();
-        filterPanel.Controls.Add(clearButton, 3, 0);
-        root.Controls.Add(filterPanel, 0, 3);
-
-        _grid.Dock = DockStyle.Fill;
-        _grid.AllowUserToAddRows = false;
-        _grid.AllowUserToDeleteRows = false;
-        _grid.AutoGenerateColumns = false;
-        _grid.ReadOnly = false;
-        _grid.RowHeadersVisible = false;
-        _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        _grid.BackColor = Color.White;
-        _grid.BackgroundColor = Color.White;
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "提交", DataPropertyName = nameof(CommitPreviewRow.Include), Width = 58 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "状态", DataPropertyName = nameof(CommitPreviewRow.Status), Width = 100, ReadOnly = true });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "文件", DataPropertyName = nameof(CommitPreviewRow.RelativePath), Width = 520, ReadOnly = true });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "说明", DataPropertyName = nameof(CommitPreviewRow.Description), Width = 160, ReadOnly = true });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "阻止原因", DataPropertyName = nameof(CommitPreviewRow.BlockReason), Width = 300, ReadOnly = true });
-        _grid.CellBeginEdit += (_, args) =>
-        {
-            if (_grid.Rows[args.RowIndex].DataBoundItem is CommitPreviewRow { CanSubmit: false } ||
-                !string.IsNullOrWhiteSpace(_globalBlockReason))
-            {
-                args.Cancel = true;
-            }
-        };
-        _grid.CurrentCellDirtyStateChanged += (_, _) =>
-        {
-            if (_grid.IsCurrentCellDirty)
-            {
-                _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
-            }
-        };
-        _grid.CellValueChanged += (_, _) => UpdateSummary();
-        _grid.CellFormatting += (_, args) =>
-        {
-            if (args.RowIndex < 0 || _grid.Rows[args.RowIndex].DataBoundItem is not CommitPreviewRow row)
-            {
-                return;
-            }
-
-            if (!row.CanSubmit || !string.IsNullOrWhiteSpace(_globalBlockReason))
-            {
-                _grid.Rows[args.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(255, 235, 235);
-                _grid.Rows[args.RowIndex].DefaultCellStyle.ForeColor = Color.DarkRed;
-            }
-        };
-        root.Controls.Add(_grid, 0, 4);
+        contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 380));
+        contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        var messagePanel = CreateCommitMessagePanel(message);
+        messagePanel.Margin = new Padding(0, 0, 8, 0);
+        var filesPanel = CreateCommitFilesPanel();
+        filesPanel.Margin = new Padding(8, 0, 0, 0);
+        contentLayout.Controls.Add(messagePanel, 0, 0);
+        contentLayout.Controls.Add(filesPanel, 1, 0);
+        root.Controls.Add(contentLayout, 0, 2);
 
         var buttons = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.RightToLeft,
             WrapContents = false,
+            Padding = new Padding(0, 8, 0, 0),
+            BackColor = BackColor,
         };
-        var okButton = new Button { Text = "确认提交", Width = 110 };
-        var cancelButton = new Button { Text = "取消", Width = 90, DialogResult = DialogResult.Cancel };
+        var okButton = new Button
+        {
+            Text = "确认提交",
+            Width = 112,
+            Height = 30,
+            FlatStyle = FlatStyle.System,
+        };
+        var cancelButton = new Button
+        {
+            Text = "取消",
+            Width = 88,
+            Height = 30,
+            DialogResult = DialogResult.Cancel,
+            FlatStyle = FlatStyle.System,
+        };
         okButton.Click += (_, _) =>
         {
-            _grid.EndEdit();
             if (string.IsNullOrWhiteSpace(CommitMessage))
             {
                 MessageBox.Show(this, "请先填写提交说明。", "缺少提交说明", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -9429,17 +14395,169 @@ internal sealed class CommitPreviewForm : Form
         };
         buttons.Controls.Add(okButton);
         buttons.Controls.Add(cancelButton);
-        root.Controls.Add(buttons, 0, 5);
+        root.Controls.Add(buttons, 0, 3);
         AcceptButton = okButton;
         CancelButton = cancelButton;
         ApplyFilter();
+        UpdateCommitMessageStats();
         _messageBox.SelectAll();
+    }
+
+    private Control CreateCommitMessagePanel(string message)
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(14),
+            BackColor = Color.White,
+            Margin = Padding.Empty,
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+
+        var title = new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "提交说明",
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(15, 23, 42),
+        };
+        panel.Controls.Add(title, 0, 0);
+
+        _messageBox.Dock = DockStyle.Fill;
+        _messageBox.Multiline = true;
+        _messageBox.ReadOnly = false;
+        _messageBox.ScrollBars = ScrollBars.Vertical;
+        _messageBox.Text = message;
+        _messageBox.BackColor = Color.White;
+        _messageBox.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
+        _messageBox.Font = new Font("Consolas", 10F);
+        _messageBox.Margin = new Padding(0, 0, 0, 8);
+        _messageBox.TextChanged += (_, _) => UpdateCommitMessageStats();
+        panel.Controls.Add(_messageBox, 0, 1);
+
+        _messageStatsLabel.Dock = DockStyle.Fill;
+        _messageStatsLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _messageStatsLabel.ForeColor = Color.FromArgb(100, 116, 139);
+        panel.Controls.Add(_messageStatsLabel, 0, 2);
+
+        var hint = new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "建议第一行写清本次改动目的；右侧可快速筛选、取消勾选不需要提交的文件。",
+            ForeColor = Color.FromArgb(71, 85, 105),
+            BackColor = Color.FromArgb(248, 250, 252),
+            Padding = new Padding(10, 8, 10, 8),
+            TextAlign = ContentAlignment.MiddleLeft,
+        };
+        panel.Controls.Add(hint, 0, 3);
+        return panel;
+    }
+
+    private Control CreateCommitFilesPanel()
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Padding = new Padding(14),
+            BackColor = Color.White,
+            Margin = Padding.Empty,
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var title = new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "待提交文件",
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(15, 23, 42),
+        };
+        panel.Controls.Add(title, 0, 0);
+
+        var filterPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 5,
+            RowCount = 1,
+            Margin = new Padding(0, 0, 0, 8),
+        };
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        _searchBox.Dock = DockStyle.Fill;
+        _searchBox.PlaceholderText = "搜索文件 / 状态 / 说明";
+        _searchBox.Margin = new Padding(0, 3, 8, 3);
+        _searchBox.TextChanged += (_, _) => ApplyFilter();
+        filterPanel.Controls.Add(_searchBox, 0, 0);
+        _statusFilterBox.Dock = DockStyle.Fill;
+        _statusFilterBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _statusFilterBox.Margin = new Padding(0, 3, 8, 3);
+        _statusFilterBox.Items.AddRange(new object[] { "全部状态", "已修改", "已新增", "已删除", "未加入", "冲突", "不可提交" });
+        _statusFilterBox.SelectedIndex = 0;
+        _statusFilterBox.SelectedIndexChanged += (_, _) => ApplyFilter();
+        filterPanel.Controls.Add(_statusFilterBox, 1, 0);
+        var selectAllButton = new Button { Text = "全选", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 6, 3), FlatStyle = FlatStyle.System };
+        selectAllButton.Click += (_, _) => SetVisibleRowsIncluded(true);
+        filterPanel.Controls.Add(selectAllButton, 2, 0);
+        var selectNoneButton = new Button { Text = "全不选", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 6, 3), FlatStyle = FlatStyle.System };
+        selectNoneButton.Click += (_, _) => SetVisibleRowsIncluded(false);
+        filterPanel.Controls.Add(selectNoneButton, 3, 0);
+        var clearButton = new Button { Text = "清空搜索", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 0, 3), FlatStyle = FlatStyle.System };
+        clearButton.Click += (_, _) =>
+        {
+            _searchBox.Clear();
+            _statusFilterBox.SelectedIndex = 0;
+        };
+        filterPanel.Controls.Add(clearButton, 4, 0);
+        panel.Controls.Add(filterPanel, 0, 1);
+
+        _commitTree.Dock = DockStyle.Fill;
+        _commitTree.BorderStyle = System.Windows.Forms.BorderStyle.None;
+        _commitTree.BackColor = Color.White;
+        _commitTree.ForeColor = Color.FromArgb(30, 41, 59);
+        _commitTree.CheckBoxes = true;
+        _commitTree.HideSelection = false;
+        _commitTree.HotTracking = false;
+        _commitTree.ShowNodeToolTips = true;
+        _commitTree.ShowLines = false;
+        _commitTree.ShowPlusMinus = false;
+        _commitTree.ShowRootLines = false;
+        _commitTree.ItemHeight = 30;
+        _commitTree.DrawMode = TreeViewDrawMode.OwnerDrawText;
+        WinFormsRendering.EnableDoubleBuffering(_commitTree);
+        _commitTree.AfterCheck += CommitTreeAfterCheck;
+        _commitTree.DrawNode += DrawCommitTreeNode;
+        _commitTree.NodeMouseDoubleClick += (_, args) => args.Node.Toggle();
+        panel.Controls.Add(_commitTree, 0, 2);
+        return panel;
+    }
+
+    private void UpdateCommitMessageStats()
+    {
+        var trimmedLength = _messageBox.Text.Trim().Length;
+        var lineCount = string.IsNullOrEmpty(_messageBox.Text) ? 0 : _messageBox.Lines.Length;
+        _messageStatsLabel.Text = $"提交说明 {trimmedLength} 字 / {lineCount} 行";
+        _messageStatsLabel.ForeColor = trimmedLength == 0
+            ? Color.FromArgb(185, 28, 28)
+            : Color.FromArgb(100, 116, 139);
     }
 
     private void ApplyFilter()
     {
-        _grid.EndEdit();
         var keyword = _searchBox.Text.Trim();
+        var statusFilter = _statusFilterBox.SelectedItem?.ToString() ?? "全部状态";
         var visibleRows = string.IsNullOrWhiteSpace(keyword)
             ? _rows
             : _rows.Where(row =>
@@ -9448,22 +14566,40 @@ internal sealed class CommitPreviewForm : Form
                 row.Description.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
                 row.BlockReason.Contains(keyword, StringComparison.OrdinalIgnoreCase))
                 .ToList();
-        _grid.DataSource = visibleRows;
+        visibleRows = visibleRows.Where(row => MatchesCommitStatusFilter(row, statusFilter)).ToList();
+        PopulateCommitTree(visibleRows);
         UpdateSummary();
+    }
+
+    private static bool MatchesCommitStatusFilter(CommitPreviewRow row, string statusFilter)
+    {
+        return statusFilter switch
+        {
+            "已修改" => row.Status == "已修改",
+            "已新增" => row.Status == "已新增",
+            "已删除" => row.Status == "已删除",
+            "未加入" => row.Status == "未加入",
+            "冲突" => row.Status == "冲突",
+            "不可提交" => !row.CanSubmit,
+            _ => true,
+        };
     }
 
     private void SetVisibleRowsIncluded(bool include)
     {
-        _grid.EndEdit();
-        foreach (DataGridViewRow gridRow in _grid.Rows)
+        _syncingCommitTreeChecks = true;
+        foreach (TreeNode node in FlattenCommitNodes(_commitTree.Nodes))
         {
-            if (gridRow.DataBoundItem is CommitPreviewRow row)
+            if (node.Tag is CommitPreviewRow row)
             {
                 row.Include = include && row.CanSubmit && string.IsNullOrWhiteSpace(_globalBlockReason);
+                node.Checked = row.Include;
             }
         }
 
-        _grid.Refresh();
+        UpdateCommitFolderChecks(_commitTree.Nodes);
+        _syncingCommitTreeChecks = false;
+        _commitTree.Invalidate();
         UpdateSummary();
     }
 
@@ -9474,6 +14610,202 @@ internal sealed class CommitPreviewForm : Form
         _summaryLabel.Text = blockedCount == 0
             ? $"准备提交 {selectedCount} / {_rows.Count} 个文件"
             : $"准备提交 {selectedCount} / {_rows.Count} 个文件，{blockedCount} 个文件不可提交";
+    }
+
+    private void PopulateCommitTree(IReadOnlyList<CommitPreviewRow> rows)
+    {
+        _syncingCommitTreeChecks = true;
+        _commitTree.BeginUpdate();
+        _commitTree.Nodes.Clear();
+
+        var folders = new Dictionary<string, TreeNode>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in rows.OrderBy(row => row.RelativePath, StringComparer.OrdinalIgnoreCase))
+        {
+            var parts = row.RelativePath.Split(['\\', '/'], StringSplitOptions.RemoveEmptyEntries);
+            var collection = _commitTree.Nodes;
+            var prefix = "";
+            for (var index = 0; index < Math.Max(0, parts.Length - 1); index++)
+            {
+                prefix = string.IsNullOrEmpty(prefix) ? parts[index] : prefix + "/" + parts[index];
+                if (!folders.TryGetValue(prefix, out var folderNode))
+                {
+                    folderNode = new TreeNode(parts[index])
+                    {
+                        Name = prefix,
+                        Tag = CommitPreviewFolderNode.Instance,
+                    };
+                    collection.Add(folderNode);
+                    folders[prefix] = folderNode;
+                }
+
+                collection = folderNode.Nodes;
+            }
+
+            var fileName = parts.Length == 0 ? row.RelativePath : parts[^1];
+            var fileNode = new TreeNode(fileName)
+            {
+                Tag = row,
+                Checked = row.Include,
+                ToolTipText = string.IsNullOrWhiteSpace(row.BlockReason)
+                    ? $"{row.Status}  {row.RelativePath}"
+                    : $"{row.Status}  {row.RelativePath}\r\n{row.BlockReason}",
+            };
+            collection.Add(fileNode);
+        }
+
+        UpdateCommitFolderChecks(_commitTree.Nodes);
+        ExpandCommitTree(_commitTree.Nodes, rows.Count <= 160);
+        _commitTree.EndUpdate();
+        _syncingCommitTreeChecks = false;
+    }
+
+    private void CommitTreeAfterCheck(object? sender, TreeViewEventArgs args)
+    {
+        if (_syncingCommitTreeChecks || args.Node == null)
+        {
+            return;
+        }
+
+        _syncingCommitTreeChecks = true;
+        SetCommitNodeChecked(args.Node, args.Node.Checked);
+        UpdateCommitFolderChecks(_commitTree.Nodes);
+        _syncingCommitTreeChecks = false;
+        _commitTree.Invalidate();
+        UpdateSummary();
+    }
+
+    private void SetCommitNodeChecked(TreeNode node, bool include)
+    {
+        if (node.Tag is CommitPreviewRow row)
+        {
+            row.Include = include && row.CanSubmit && string.IsNullOrWhiteSpace(_globalBlockReason);
+            node.Checked = row.Include;
+            return;
+        }
+
+        foreach (TreeNode child in node.Nodes)
+        {
+            SetCommitNodeChecked(child, include);
+        }
+    }
+
+    private static void UpdateCommitFolderChecks(TreeNodeCollection nodes)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            if (node.Tag is CommitPreviewFolderNode)
+            {
+                UpdateCommitFolderChecks(node.Nodes);
+                node.Checked = node.Nodes.Cast<TreeNode>().Any(child => child.Checked);
+            }
+        }
+    }
+
+    private static void ExpandCommitTree(TreeNodeCollection nodes, bool expandAll)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            if (expandAll || node.Level < 1)
+            {
+                node.Expand();
+            }
+
+            ExpandCommitTree(node.Nodes, expandAll);
+        }
+    }
+
+    private static IEnumerable<TreeNode> FlattenCommitNodes(TreeNodeCollection nodes)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            yield return node;
+            foreach (var child in FlattenCommitNodes(node.Nodes))
+            {
+                yield return child;
+            }
+        }
+    }
+
+    private static void DrawCommitTreeNode(object? sender, DrawTreeNodeEventArgs args)
+    {
+        if (sender is not TreeView tree || args.Node == null)
+        {
+            return;
+        }
+
+        args.DrawDefault = false;
+        var graphics = args.Graphics;
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        var selected = (args.State & TreeNodeStates.Selected) == TreeNodeStates.Selected;
+        var hot = (args.State & TreeNodeStates.Hot) == TreeNodeStates.Hot;
+        var fullBounds = new Rectangle(4, args.Bounds.Top + 2, Math.Max(1, tree.ClientSize.Width - 8), tree.ItemHeight - 4);
+        var backColor = selected
+            ? Color.FromArgb(226, 241, 255)
+            : hot ? Color.FromArgb(248, 250, 252) : Color.White;
+        using var backBrush = new SolidBrush(backColor);
+        graphics.FillRoundedRectangle(backBrush, fullBounds, 7);
+
+        var textBounds = args.Bounds;
+        var x = textBounds.Left;
+        if (args.Node.Nodes.Count > 0)
+        {
+            using var arrowFont = new Font("Segoe UI", 7F);
+            TextRenderer.DrawText(
+                graphics,
+                args.Node.IsExpanded ? "▼" : "▶",
+                arrowFont,
+                new Rectangle(x, args.Bounds.Top + 6, 16, 16),
+                Color.FromArgb(100, 116, 139),
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            x += 18;
+        }
+
+        if (args.Node.Tag is CommitPreviewRow row)
+        {
+            var statusColor = row.CanSubmit && string.IsNullOrWhiteSpace(row.BlockReason)
+                ? row.Status switch
+                {
+                    "已新增" => Color.FromArgb(22, 163, 74),
+                    "已删除" => Color.FromArgb(220, 38, 38),
+                    "已修改" => Color.FromArgb(202, 138, 4),
+                    "冲突" => Color.FromArgb(185, 28, 28),
+                    _ => Color.FromArgb(71, 85, 105),
+                }
+                : Color.FromArgb(185, 28, 28);
+            using var statusBrush = new SolidBrush(Color.FromArgb(24, statusColor));
+            using var statusPen = new Pen(Color.FromArgb(80, statusColor));
+            var badgeBounds = new Rectangle(x, args.Bounds.Top + 6, 44, 18);
+            graphics.FillRoundedRectangle(statusBrush, badgeBounds, 5);
+            graphics.DrawRoundedRectangle(statusPen, badgeBounds, 5);
+            TextRenderer.DrawText(
+                graphics,
+                row.Status,
+                tree.Font,
+                badgeBounds,
+                statusColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            x += 52;
+
+            var pathText = args.Node.Level == 0 ? row.RelativePath : args.Node.Text;
+            using var fileFont = new Font(tree.Font, row.CanSubmit ? FontStyle.Regular : FontStyle.Strikeout);
+            TextRenderer.DrawText(
+                graphics,
+                pathText,
+                fileFont,
+                new Rectangle(x, args.Bounds.Top + 3, Math.Max(1, tree.ClientSize.Width - x - 8), 22),
+                row.CanSubmit ? Color.FromArgb(30, 41, 59) : Color.FromArgb(153, 27, 27),
+                TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            return;
+        }
+
+        using var folderFont = new Font(tree.Font, FontStyle.Bold);
+        TextRenderer.DrawText(
+            graphics,
+            args.Node.Text,
+            folderFont,
+            new Rectangle(x, args.Bounds.Top + 3, Math.Max(1, tree.ClientSize.Width - x - 8), 22),
+            Color.FromArgb(51, 65, 85),
+            TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
     }
 }
 
@@ -9499,6 +14831,15 @@ internal sealed class CommitPreviewRow
     public SvnChange Change { get; }
 }
 
+internal sealed class CommitPreviewFolderNode
+{
+    public static CommitPreviewFolderNode Instance { get; } = new();
+
+    private CommitPreviewFolderNode()
+    {
+    }
+}
+
 internal sealed class FileHistoryForm : Form
 {
     private readonly string _workingCopy;
@@ -9514,6 +14855,7 @@ internal sealed class FileHistoryForm : Form
     private readonly Button _loadMoreButton = new();
     private readonly Button _clearSearchButton = new();
     private readonly ListView _historyList = new();
+    private readonly ImageList _historyListRowImages = new();
     private readonly TextBox _detailText = new();
     private readonly Panel _diffPanel = new();
     private readonly TreeView _changedFilesTree = new();
@@ -9527,6 +14869,7 @@ internal sealed class FileHistoryForm : Form
     private CancellationTokenSource? _diffPreviewCts;
     private int _loadedLimit = InitialHistoryLimit;
     private bool _loadingHistory;
+    private ListViewItem? _hoveredHistoryItem;
     private const int InitialHistoryLimit = 80;
     private const int HistoryLoadMoreStep = 200;
     private const int HistoryDeepSearchLimit = 1000;
@@ -9560,9 +14903,9 @@ internal sealed class FileHistoryForm : Form
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Horizontal,
-            SplitterDistance = 250,
         };
         Controls.Add(root);
+        Form1.BindSafeSplitterDistance(root, 250);
 
         var top = new TableLayoutPanel
         {
@@ -9584,12 +14927,43 @@ internal sealed class FileHistoryForm : Form
         _historyList.Dock = DockStyle.Fill;
         _historyList.View = View.Details;
         _historyList.FullRowSelect = true;
-        _historyList.GridLines = true;
+        _historyList.GridLines = false;
         _historyList.HideSelection = false;
+        _historyList.BorderStyle = System.Windows.Forms.BorderStyle.None;
+        _historyList.BackColor = Color.White;
+        _historyList.OwnerDraw = true;
+        WinFormsRendering.EnableDoubleBuffering(_historyList);
+        _historyList.HeaderStyle = ColumnHeaderStyle.None;
+        _historyListRowImages.ColorDepth = ColorDepth.Depth32Bit;
+        _historyListRowImages.ImageSize = new Size(1, 54);
+        _historyListRowImages.Images.Add("row-height", new Bitmap(1, 54));
+
+        _historyList.SmallImageList = _historyListRowImages;
         _historyList.Columns.Add("Description", 620);
         _historyList.Columns.Add("Date", 150);
         _historyList.Columns.Add("Author", 120);
         _historyList.Columns.Add("Commit", 90);
+        _historyList.DrawColumnHeader += (_, args) => args.DrawDefault = false;
+        _historyList.DrawSubItem += DrawHistoryCardSubItem;
+        _historyList.MouseMove += (_, args) =>
+        {
+            var previous = _hoveredHistoryItem;
+            var item = _historyList.GetItemAt(args.X, args.Y);
+            if (!ReferenceEquals(item, _hoveredHistoryItem))
+            {
+                _hoveredHistoryItem = item;
+                WinFormsRendering.InvalidateListViewItems(_historyList, previous, item);
+            }
+        };
+        _historyList.MouseLeave += (_, _) =>
+        {
+            if (_hoveredHistoryItem != null)
+            {
+                var previous = _hoveredHistoryItem;
+                _hoveredHistoryItem = null;
+                WinFormsRendering.InvalidateListViewItems(_historyList, previous, null);
+            }
+        };
         _historyList.SelectedIndexChanged += async (_, _) => await ShowSelectedFileRevisionAsync();
         _historyList.DoubleClick += (_, _) => FocusBestChangedFileInSelectedLog();
         top.Controls.Add(_historyList, 0, 2);
@@ -9598,9 +14972,9 @@ internal sealed class FileHistoryForm : Form
         var bottom = new SplitContainer
         {
             Dock = DockStyle.Fill,
-            SplitterDistance = 300,
             FixedPanel = FixedPanel.Panel1,
         };
+        Form1.BindSafeSplitterDistance(bottom, 300);
         _detailText.Dock = DockStyle.Fill;
         _detailText.Multiline = true;
         _detailText.ReadOnly = true;
@@ -9612,9 +14986,9 @@ internal sealed class FileHistoryForm : Form
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Horizontal,
-            SplitterDistance = 120,
             FixedPanel = FixedPanel.Panel1,
         };
+        Form1.BindSafeSplitterDistance(right, 120);
         _changedFilesTree.Dock = DockStyle.Fill;
         _changedFilesTree.HideSelection = false;
         _changedFilesTree.FullRowSelect = true;
@@ -9721,7 +15095,7 @@ internal sealed class FileHistoryForm : Form
         _historyList.Items.Clear();
         foreach (var log in rows)
         {
-            var item = new ListViewItem(log.ShortMessage) { Tag = log };
+            var item = new ListViewItem(log.ShortMessage) { Tag = log, ImageKey = "row-height" };
             item.SubItems.Add(log.LocalDateText);
             item.SubItems.Add(log.Author);
             item.SubItems.Add(log.RevisionText);
@@ -9749,6 +15123,67 @@ internal sealed class FileHistoryForm : Form
         itemToSelect.Selected = true;
         itemToSelect.Focused = true;
         itemToSelect.EnsureVisible();
+    }
+
+    private void DrawHistoryCardSubItem(object? sender, DrawListViewSubItemEventArgs args)
+    {
+        args.DrawDefault = false;
+        if (sender is not ListView list || args.Item?.Tag is not SvnLogEntry log || args.ColumnIndex != 0)
+        {
+            return;
+        }
+
+        var graphics = args.Graphics;
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        var bounds = new Rectangle(6, args.Item.Bounds.Top + 5, Math.Max(1, list.ClientSize.Width - 12), args.Item.Bounds.Height - 8);
+        var selected = args.Item.Selected;
+        var hovered = ReferenceEquals(args.Item, _hoveredHistoryItem);
+        var cardColor = selected
+            ? Color.FromArgb(226, 241, 255)
+            : hovered ? Color.FromArgb(248, 250, 252) : Color.White;
+        var borderColor = selected
+            ? Color.FromArgb(147, 197, 253)
+            : hovered ? Color.FromArgb(203, 213, 225) : Color.FromArgb(226, 232, 240);
+        using var cardBrush = new SolidBrush(cardColor);
+        using var borderPen = new Pen(borderColor);
+        using var revisionFont = new Font("Consolas", 9F, FontStyle.Bold);
+        using var authorFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        using var metaFont = new Font("Microsoft YaHei UI", 8F);
+        using var messageFont = new Font("Microsoft YaHei UI", 9F);
+        graphics.FillRoundedRectangle(cardBrush, bounds, 8);
+        graphics.DrawRoundedRectangle(borderPen, bounds, 8);
+
+        using var accentBrush = new SolidBrush(Color.FromArgb(37, 99, 235));
+        graphics.FillRoundedRectangle(accentBrush, new Rectangle(bounds.Left, bounds.Top + 9, 4, bounds.Height - 18), 3);
+
+        TextRenderer.DrawText(
+            graphics,
+            log.RevisionText,
+            revisionFont,
+            new Rectangle(bounds.Left + 16, bounds.Top + 8, 82, 18),
+            Color.FromArgb(37, 99, 235),
+            TextFormatFlags.Left | TextFormatFlags.NoPadding);
+        TextRenderer.DrawText(
+            graphics,
+            log.Author,
+            authorFont,
+            new Rectangle(bounds.Left + 104, bounds.Top + 8, 130, 18),
+            Color.FromArgb(31, 41, 55),
+            TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        TextRenderer.DrawText(
+            graphics,
+            log.LocalDateText,
+            metaFont,
+            new Rectangle(bounds.Right - 150, bounds.Top + 8, 134, 18),
+            Color.FromArgb(100, 116, 139),
+            TextFormatFlags.Right | TextFormatFlags.NoPadding);
+        TextRenderer.DrawText(
+            graphics,
+            log.ShortMessage,
+            messageFont,
+            new Rectangle(bounds.Left + 16, bounds.Top + 27, Math.Max(1, bounds.Width - 32), 20),
+            Color.FromArgb(51, 65, 85),
+            TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
     }
 
     private void UpdateSummaryLabel()
@@ -10145,7 +15580,7 @@ internal sealed class FileHistoryForm : Form
 
     private void ShowDiffLoading(string title, string message)
     {
-        _diffPanel.Controls.Clear();
+        Form1.ClearControlsDisposing(_diffPanel);
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -10198,7 +15633,7 @@ internal sealed class FileHistoryForm : Form
 
     private void ShowDiffMessage(string message)
     {
-        _diffPanel.Controls.Clear();
+        Form1.ClearControlsDisposing(_diffPanel);
         _diffPanel.Controls.Add(new TextBox
         {
             Dock = DockStyle.Fill,
@@ -10243,6 +15678,12 @@ internal sealed class FileHistoryForm : Form
         _treeImages.Images.Add("xml", CreateTreeIcon(Color.FromArgb(39, 132, 85), false));
         _treeImages.Images.Add("lua", CreateTreeIcon(Color.FromArgb(72, 99, 180), false));
         _treeImages.Images.Add("changed", CreateTreeIcon(Color.FromArgb(209, 92, 56), false));
+        _treeImages.Images.Add("action-added", CreateActionTreeIcon("A", Color.FromArgb(35, 134, 83)));
+        _treeImages.Images.Add("action-modified", CreateActionTreeIcon("M", Color.FromArgb(184, 107, 25)));
+        _treeImages.Images.Add("action-deleted", CreateActionTreeIcon("D", Color.FromArgb(184, 66, 66)));
+        _treeImages.Images.Add("action-conflicted", CreateActionTreeIcon("C", Color.FromArgb(164, 62, 176)));
+        _treeImages.Images.Add("action-replaced", CreateActionTreeIcon("R", Color.FromArgb(109, 85, 184)));
+        _treeImages.Images.Add("action-unknown", CreateActionTreeIcon("?", Color.FromArgb(100, 116, 139)));
     }
 
     private static Bitmap CreateTreeIcon(Color color, bool folder)
@@ -10269,6 +15710,21 @@ internal sealed class FileHistoryForm : Form
         return bitmap;
     }
 
+    private static Bitmap CreateActionTreeIcon(string text, Color color)
+    {
+        var bitmap = new Bitmap(16, 16);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.Clear(Color.Transparent);
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using var brush = new SolidBrush(color);
+        using var font = new Font("Segoe UI", 8F, FontStyle.Bold, GraphicsUnit.Pixel);
+        using var textBrush = new SolidBrush(Color.White);
+        graphics.FillRectangle(brush, 1, 2, 14, 12);
+        var size = graphics.MeasureString(text, font);
+        graphics.DrawString(text, font, textBrush, (16 - size.Width) / 2F, (16 - size.Height) / 2F - 0.5F);
+        return bitmap;
+    }
+
     private static void AddChangedFileNode(TreeNode root, ChangedFileEntry file)
     {
         var path = file.TreePath;
@@ -10285,8 +15741,8 @@ internal sealed class FileHistoryForm : Form
                 {
                     Tag = isFile ? file : null,
                     ToolTipText = file.DisplayText,
-                    ImageKey = isFile ? FileImageKey(file.TreePath) : "folder",
-                    SelectedImageKey = isFile ? FileImageKey(file.TreePath) : "folder",
+                    ImageKey = isFile ? ChangedFileActionImageKey(file.Action) : "folder",
+                    SelectedImageKey = isFile ? ChangedFileActionImageKey(file.Action) : "folder",
                     ForeColor = isFile ? ActionColor(file.Action) : Color.FromArgb(55, 65, 81),
                 };
                 if (!isFile)
@@ -10301,10 +15757,26 @@ internal sealed class FileHistoryForm : Form
         }
     }
 
+    private static string ChangedFileActionImageKey(string action)
+    {
+        return action switch
+        {
+            "A" => "action-added",
+            "M" => "action-modified",
+            "D" => "action-deleted",
+            "C" => "action-conflicted",
+            "R" => "action-replaced",
+            _ => "action-unknown",
+        };
+    }
+
     private static string FileImageKey(string path)
     {
         var extension = Path.GetExtension(path);
-        if (extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) || extension.Equals(".xls", StringComparison.OrdinalIgnoreCase))
+        if (extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xls", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xlsm", StringComparison.OrdinalIgnoreCase))
         {
             return "xml";
         }
@@ -10319,6 +15791,7 @@ internal sealed class FileHistoryForm : Form
             "A" => Color.FromArgb(38, 128, 72),
             "D" => Color.FromArgb(170, 67, 67),
             "M" => Color.FromArgb(166, 103, 34),
+            "C" => Color.FromArgb(144, 65, 170),
             "R" => Color.FromArgb(128, 79, 160),
             _ => SystemColors.WindowText,
         };
@@ -10369,6 +15842,7 @@ internal sealed class AppSettings
     public string? CurrentRepositoryId { get; set; }
     public List<RepositoryEntry> Repositories { get; set; } = [];
     public List<string> IgnoredWorkingCopyPaths { get; set; } = [];
+    public List<string> FavoriteFileTreePaths { get; set; } = [];
     public Dictionary<string, List<string>> ExpandedFileTreePaths { get; set; } = [];
     public UiLayoutSettings UiLayout { get; set; } = new();
 
@@ -10383,6 +15857,7 @@ internal sealed class AppSettings
 
             var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? new AppSettings();
             settings.IgnoredWorkingCopyPaths ??= [];
+            settings.FavoriteFileTreePaths ??= [];
             settings.ExpandedFileTreePaths ??= [];
             settings.UiLayout ??= new UiLayoutSettings();
             return settings;
@@ -10401,12 +15876,26 @@ internal sealed class AppSettings
 
     public void MigrateLegacySettings()
     {
+        Repositories.RemoveAll(repository => IsIgnoredWorkingCopy(repository.WorkingCopyPath));
+
         if (!string.IsNullOrWhiteSpace(WorkingCopyPath) &&
+            !IsIgnoredWorkingCopy(WorkingCopyPath) &&
             Repositories.All(repository => !PathEquals(repository.WorkingCopyPath, WorkingCopyPath)))
         {
             var entry = RepositoryEntry.Create(RepositoryUrl, WorkingCopyPath);
             Repositories.Add(entry);
             CurrentRepositoryId ??= entry.Id;
+        }
+        else if (!string.IsNullOrWhiteSpace(WorkingCopyPath) && IsIgnoredWorkingCopy(WorkingCopyPath))
+        {
+            WorkingCopyPath = "";
+            RepositoryUrl = "";
+        }
+
+        if (CurrentRepositoryId != null &&
+            Repositories.All(repository => !string.Equals(repository.Id, CurrentRepositoryId, StringComparison.OrdinalIgnoreCase)))
+        {
+            CurrentRepositoryId = Repositories.FirstOrDefault()?.Id;
         }
 
         if (CurrentRepositoryId == null && Repositories.Count > 0)
@@ -10461,6 +15950,33 @@ internal sealed class AppSettings
         }
 
         CurrentRepositoryId = existing.Id;
+    }
+
+    public void RemoveRepository(RepositoryEntry repository)
+    {
+        IgnoreWorkingCopy(repository.WorkingCopyPath);
+        Repositories.RemoveAll(item =>
+            string.Equals(item.Id, repository.Id, StringComparison.OrdinalIgnoreCase) ||
+            PathEquals(item.WorkingCopyPath, repository.WorkingCopyPath));
+
+        if (PathEquals(WorkingCopyPath, repository.WorkingCopyPath))
+        {
+            WorkingCopyPath = "";
+            RepositoryUrl = "";
+        }
+
+        ExpandedFileTreePaths.Remove(NormalizeKey(repository.WorkingCopyPath));
+
+        if (CurrentRepositoryId != null &&
+            Repositories.All(item => !string.Equals(item.Id, CurrentRepositoryId, StringComparison.OrdinalIgnoreCase)))
+        {
+            CurrentRepositoryId = Repositories.FirstOrDefault()?.Id;
+        }
+
+        if (Repositories.Count == 0)
+        {
+            CurrentRepositoryId = null;
+        }
     }
 
     public void IgnoreWorkingCopy(string workingCopyPath)
@@ -10590,6 +16106,7 @@ internal sealed class RepositoryEntry
 
 internal sealed class UiLayoutSettings
 {
+    public bool LayoutLocked { get; set; }
     public int WindowX { get; set; }
     public int WindowY { get; set; }
     public int WindowWidth { get; set; }

@@ -40,10 +40,10 @@ static class Program
         try
         {
             MessageBox.Show(
-                "梦境 SVN 管理器启动失败，错误已经写入日志。" + Environment.NewLine + Environment.NewLine +
+                "梦境 SVN 管理器遇到运行错误，错误已经写入日志。" + Environment.NewLine + Environment.NewLine +
                 StartupLogPath + Environment.NewLine + Environment.NewLine +
                 ex.Message,
-                "启动失败",
+                "运行错误",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
         }
