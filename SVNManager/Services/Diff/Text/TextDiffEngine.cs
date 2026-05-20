@@ -2,9 +2,12 @@ namespace SVNManager;
 
 internal static class TextDiffEngine
 {
-    public static IReadOnlyList<TextDiffRow> CompareLines(string[] oldLines, string[] newLines)
+    public static IReadOnlyList<TextDiffRow> CompareLines(string[] oldLines, string[] newLines, DiffOptions? options = null)
     {
-        var trim = PrefixSuffixTrimmer.TrimCommonEdges(oldLines, newLines);
+        var effectiveOptions = options ?? new DiffOptions();
+        var oldCompareLines = NormalizeLines(oldLines, effectiveOptions);
+        var newCompareLines = NormalizeLines(newLines, effectiveOptions);
+        var trim = PrefixSuffixTrimmer.TrimCommonEdges(oldCompareLines, newCompareLines);
         var operations = new List<TextDiffOperation>(Math.Min(trim.PrefixLength, 4) + trim.OldMiddle.Length + trim.NewMiddle.Length + Math.Min(trim.SuffixLength, 4));
 
         for (var index = 0; index < trim.PrefixLength; index++)
@@ -15,6 +18,8 @@ internal static class TextDiffEngine
         operations.AddRange(DiffPlexAdapter.BuildOperations(
             trim.OldMiddle,
             trim.NewMiddle,
+            Slice(oldLines, trim.PrefixLength, trim.OldMiddle.Length),
+            Slice(newLines, trim.PrefixLength, trim.NewMiddle.Length),
             trim.PrefixLength,
             trim.PrefixLength));
 
@@ -26,5 +31,39 @@ internal static class TextDiffEngine
         }
 
         return TextDiffService.BuildHunks(operations);
+    }
+
+    private static string[] NormalizeLines(string[] lines, DiffOptions options)
+    {
+        var normalized = new string[lines.Length];
+        for (var index = 0; index < lines.Length; index++)
+        {
+            var line = lines[index];
+            if (options.IgnoreWhitespace)
+            {
+                line = string.Concat(line.Where(ch => !char.IsWhiteSpace(ch)));
+            }
+
+            if (options.IgnoreCase)
+            {
+                line = line.ToUpperInvariant();
+            }
+
+            normalized[index] = line;
+        }
+
+        return normalized;
+    }
+
+    private static string[] Slice(string[] lines, int start, int count)
+    {
+        if (count <= 0)
+        {
+            return [];
+        }
+
+        var result = new string[count];
+        Array.Copy(lines, start, result, 0, count);
+        return result;
     }
 }

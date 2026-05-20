@@ -119,6 +119,7 @@ internal sealed class TextDiffForm : Form
 
     public static Control CreateTextDiffView(TextDiffContent content)
     {
+        var currentContent = content;
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -132,42 +133,72 @@ internal sealed class TextDiffForm : Form
         var toolbar = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 4,
+            ColumnCount = 6,
             RowCount = 1,
             BackColor = Color.FromArgb(248, 250, 252),
             Padding = new Padding(0, 2, 0, 2),
         };
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 330));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
         var unifiedButton = CreateDiffModeButton("统一视图");
         var splitButton = CreateDiffModeButton("双栏对比");
+        var ignoreWhitespaceBox = CreateDiffOptionCheckBox("忽略空白", currentContent.Options.IgnoreWhitespace);
+        var ignoreCaseBox = CreateDiffOptionCheckBox("忽略大小写", currentContent.Options.IgnoreCase);
+        var ignoreLineEndingsBox = CreateDiffOptionCheckBox("忽略换行", currentContent.Options.IgnoreLineEndings);
+        var optionsPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            BackColor = Color.Transparent,
+            Margin = new Padding(2, 0, 8, 0),
+        };
+        optionsPanel.Controls.Add(ignoreWhitespaceBox);
+        optionsPanel.Controls.Add(ignoreCaseBox);
+        optionsPanel.Controls.Add(ignoreLineEndingsBox);
+        var applyButton = new Button
+        {
+            Text = "应用",
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 2, 8, 2),
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.White,
+            ForeColor = Color.FromArgb(30, 41, 59),
+        };
+        applyButton.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
         var summaryLabel = new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.FromArgb(71, 85, 105),
-            Text = $"{content.OldLabel}  ->  {content.NewLabel}",
+            Text = $"{currentContent.OldLabel}  ->  {currentContent.NewLabel}",
         };
         var languageLabel = new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleRight,
             ForeColor = Color.FromArgb(100, 116, 139),
-            Text = $"语言：{content.Language}",
+            Text = $"语言：{currentContent.Language}",
         };
         toolbar.Controls.Add(unifiedButton, 0, 0);
         toolbar.Controls.Add(splitButton, 1, 0);
-        toolbar.Controls.Add(summaryLabel, 2, 0);
-        toolbar.Controls.Add(languageLabel, 3, 0);
+        toolbar.Controls.Add(optionsPanel, 2, 0);
+        toolbar.Controls.Add(applyButton, 3, 0);
+        toolbar.Controls.Add(summaryLabel, 4, 0);
+        toolbar.Controls.Add(languageLabel, 5, 0);
         root.Controls.Add(toolbar, 0, 0);
 
         var host = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
         root.Controls.Add(host, 0, 1);
+        var activeMode = splitButton;
 
         void Show(Control control, Button activeButton)
         {
+            activeMode = activeButton;
             Form1.ClearControlsDisposing(host);
             control.Dock = DockStyle.Fill;
             host.Controls.Add(control);
@@ -177,10 +208,59 @@ internal sealed class TextDiffForm : Form
             splitButton.BackColor = activeButton == splitButton ? Color.FromArgb(219, 234, 254) : Color.White;
         }
 
-        unifiedButton.Click += (_, _) => Show(CreateTextDiffView(content.Differences), unifiedButton);
-        splitButton.Click += (_, _) => Show(CreateSideBySideTextDiffView(content), splitButton);
-        Show(CreateSideBySideTextDiffView(content), splitButton);
+        DiffOptions BuildOptions()
+        {
+            return new DiffOptions
+            {
+                IgnoreWhitespace = ignoreWhitespaceBox.Checked,
+                IgnoreCase = ignoreCaseBox.Checked,
+                IgnoreLineEndings = ignoreLineEndingsBox.Checked,
+                ShowInlineHighlight = currentContent.Options.ShowInlineHighlight,
+                ContextLines = currentContent.Options.ContextLines,
+            };
+        }
+
+        void ShowCurrent(Button modeButton)
+        {
+            if (modeButton == unifiedButton)
+            {
+                Show(CreateTextDiffView(currentContent.Differences), unifiedButton);
+                return;
+            }
+
+            Show(CreateSideBySideTextDiffView(currentContent), splitButton);
+        }
+
+        unifiedButton.Click += (_, _) => ShowCurrent(unifiedButton);
+        splitButton.Click += (_, _) => ShowCurrent(splitButton);
+        applyButton.Click += (_, _) =>
+        {
+            var options = BuildOptions();
+            currentContent = TextDiffService.CreatePreviewFromText(
+                currentContent.OldText,
+                currentContent.NewText,
+                currentContent.Language,
+                currentContent.OldLabel,
+                currentContent.NewLabel,
+                options);
+            summaryLabel.Text = $"{currentContent.OldLabel}  ->  {currentContent.NewLabel}  ·  {currentContent.Differences.Count} 行";
+            ShowCurrent(activeMode);
+        };
+
+        ShowCurrent(splitButton);
         return root;
+    }
+
+    private static CheckBox CreateDiffOptionCheckBox(string text, bool isChecked)
+    {
+        return new CheckBox
+        {
+            Text = text,
+            Checked = isChecked,
+            AutoSize = true,
+            Margin = new Padding(0, 8, 12, 0),
+            ForeColor = Color.FromArgb(51, 65, 85),
+        };
     }
 
     private static Button CreateDiffModeButton(string text)

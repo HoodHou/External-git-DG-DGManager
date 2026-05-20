@@ -10,14 +10,25 @@ internal static class DiffPlexAdapter
         int oldLineOffset,
         int newLineOffset)
     {
+        return BuildOperations(oldLines, newLines, oldLines, newLines, oldLineOffset, newLineOffset);
+    }
+
+    public static List<TextDiffOperation> BuildOperations(
+        string[] oldCompareLines,
+        string[] newCompareLines,
+        string[] oldDisplayLines,
+        string[] newDisplayLines,
+        int oldLineOffset,
+        int newLineOffset)
+    {
         var operations = new List<TextDiffOperation>();
-        if (oldLines.Length == 0 && newLines.Length == 0)
+        if (oldCompareLines.Length == 0 && newCompareLines.Length == 0)
         {
             return operations;
         }
 
-        var oldText = string.Join('\n', oldLines);
-        var newText = string.Join('\n', newLines);
+        var oldText = string.Join('\n', oldCompareLines);
+        var newText = string.Join('\n', newCompareLines);
         var result = new Differ().CreateLineDiffs(oldText, newText, false, false);
         var oldCursor = 0;
         var newCursor = 0;
@@ -26,7 +37,7 @@ internal static class DiffPlexAdapter
         {
             while (oldCursor < block.DeleteStartA && newCursor < block.InsertStartB)
             {
-                operations.Add(TextDiffOperation.Context(oldLineOffset + oldCursor + 1, newLineOffset + newCursor + 1, oldLines[oldCursor]));
+                operations.Add(TextDiffOperation.Context(oldLineOffset + oldCursor + 1, newLineOffset + newCursor + 1, oldDisplayLines[oldCursor]));
                 oldCursor++;
                 newCursor++;
             }
@@ -34,18 +45,18 @@ internal static class DiffPlexAdapter
             for (var index = 0; index < block.DeleteCountA; index++)
             {
                 var lineIndex = block.DeleteStartA + index;
-                if (lineIndex >= 0 && lineIndex < oldLines.Length)
+                if (lineIndex >= 0 && lineIndex < oldDisplayLines.Length)
                 {
-                    operations.Add(TextDiffOperation.Removed(oldLineOffset + lineIndex + 1, oldLines[lineIndex]));
+                    operations.Add(TextDiffOperation.Removed(oldLineOffset + lineIndex + 1, oldDisplayLines[lineIndex]));
                 }
             }
 
             for (var index = 0; index < block.InsertCountB; index++)
             {
                 var lineIndex = block.InsertStartB + index;
-                if (lineIndex >= 0 && lineIndex < newLines.Length)
+                if (lineIndex >= 0 && lineIndex < newDisplayLines.Length)
                 {
-                    operations.Add(TextDiffOperation.Added(newLineOffset + lineIndex + 1, newLines[lineIndex]));
+                    operations.Add(TextDiffOperation.Added(newLineOffset + lineIndex + 1, newDisplayLines[lineIndex]));
                 }
             }
 
@@ -53,22 +64,22 @@ internal static class DiffPlexAdapter
             newCursor = block.InsertStartB + block.InsertCountB;
         }
 
-        while (oldCursor < oldLines.Length && newCursor < newLines.Length)
+        while (oldCursor < oldDisplayLines.Length && newCursor < newDisplayLines.Length)
         {
-            operations.Add(TextDiffOperation.Context(oldLineOffset + oldCursor + 1, newLineOffset + newCursor + 1, oldLines[oldCursor]));
+            operations.Add(TextDiffOperation.Context(oldLineOffset + oldCursor + 1, newLineOffset + newCursor + 1, oldDisplayLines[oldCursor]));
             oldCursor++;
             newCursor++;
         }
 
-        while (oldCursor < oldLines.Length)
+        while (oldCursor < oldDisplayLines.Length)
         {
-            operations.Add(TextDiffOperation.Removed(oldLineOffset + oldCursor + 1, oldLines[oldCursor]));
+            operations.Add(TextDiffOperation.Removed(oldLineOffset + oldCursor + 1, oldDisplayLines[oldCursor]));
             oldCursor++;
         }
 
-        while (newCursor < newLines.Length)
+        while (newCursor < newDisplayLines.Length)
         {
-            operations.Add(TextDiffOperation.Added(newLineOffset + newCursor + 1, newLines[newCursor]));
+            operations.Add(TextDiffOperation.Added(newLineOffset + newCursor + 1, newDisplayLines[newCursor]));
             newCursor++;
         }
 

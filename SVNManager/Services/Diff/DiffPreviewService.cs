@@ -22,7 +22,7 @@ internal sealed class DiffPreviewService : IDiffPreviewService
             return DiffPreviewData.FromExcel(ExcelDiffService.Compare(oldFilePath, newFilePath));
         }
 
-        return DiffPreviewData.FromText(TextDiffService.CreatePreview(oldFilePath, newFilePath));
+        return DiffPreviewData.FromText(TextDiffService.CreatePreview(oldFilePath, newFilePath, options));
     }
 
     public Task<DiffPreviewData> ComputeAsync(

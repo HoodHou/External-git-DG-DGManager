@@ -75,7 +75,7 @@ internal static class TextDiffService
         return CreatePreview(oldFilePath, newFilePath).Differences;
     }
 
-    public static TextDiffContent CreatePreview(string oldFilePath, string newFilePath)
+    public static TextDiffContent CreatePreview(string oldFilePath, string newFilePath, DiffOptions? options = null)
     {
         var oldLines = ReadTextLines(oldFilePath);
         var newLines = ReadTextLines(newFilePath);
@@ -87,12 +87,37 @@ internal static class TextDiffService
             DetectLanguage(oldFilePath, newFilePath),
             "旧版本",
             "新版本",
-            CompareLines(oldLines, newLines));
+            CompareLines(oldLines, newLines, options))
+        {
+            Options = (options ?? new DiffOptions()).Clone(),
+        };
     }
 
-    private static IReadOnlyList<TextDiffRow> CompareLines(string[] oldLines, string[] newLines)
+    public static TextDiffContent CreatePreviewFromText(
+        string oldText,
+        string newText,
+        string language,
+        string oldLabel,
+        string newLabel,
+        DiffOptions? options = null)
     {
-        return TextDiffEngine.CompareLines(oldLines, newLines);
+        var oldLines = SplitTextLines(oldText);
+        var newLines = SplitTextLines(newText);
+        return new TextDiffContent(
+            oldText,
+            newText,
+            language,
+            oldLabel,
+            newLabel,
+            CompareLines(oldLines, newLines, options))
+        {
+            Options = (options ?? new DiffOptions()).Clone(),
+        };
+    }
+
+    private static IReadOnlyList<TextDiffRow> CompareLines(string[] oldLines, string[] newLines, DiffOptions? options = null)
+    {
+        return TextDiffEngine.CompareLines(oldLines, newLines, options);
     }
 
     private static List<TextDiffOperation> BuildAlignedOperations(string[] oldLines, string[] newLines)
@@ -481,7 +506,12 @@ internal static class TextDiffService
 
     private static string[] ReadTextLines(string filePath)
     {
-        return ReadText(filePath)
+        return SplitTextLines(ReadText(filePath));
+    }
+
+    private static string[] SplitTextLines(string text)
+    {
+        return text
             .Replace("\r\n", "\n", StringComparison.Ordinal)
             .Replace('\r', '\n')
             .Split('\n');
@@ -528,7 +558,10 @@ internal sealed record TextDiffContent(
     string Language,
     string OldLabel,
     string NewLabel,
-    IReadOnlyList<TextDiffRow> Differences);
+    IReadOnlyList<TextDiffRow> Differences)
+{
+    public DiffOptions Options { get; init; } = new();
+}
 
 internal sealed record TextDiffRow(string Kind, string LineNumber, string Content)
 {
