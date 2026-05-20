@@ -1,0 +1,1146 @@
+using System.Diagnostics;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
+using NPOI.SS.UserModel;
+
+namespace SVNManager;
+
+internal enum SpreadsheetMergeChangeKind
+{
+    AutoRemote,
+    LocalOnly,
+    SameBoth,
+    Conflict,
+}
+
+internal enum SpreadsheetMergeResolution
+{
+    UseLocal,
+    UseRemote,
+}
+
+internal enum SpreadsheetMergeOperation
+{
+    KeepTarget,
+    WriteCell,
+    AppendRow,
+    InsertRow,
+    DeleteRow,
+}
+
+internal enum SpreadsheetMergeWriteKind
+{
+    SetCell,
+    InsertRow,
+    DeleteRow,
+}
+
+internal sealed class SpreadsheetMergePlan
+{
+    public SpreadsheetMergePlan(
+        IReadOnlyList<SpreadsheetMergeChange> autoRemoteChanges,
+        IReadOnlyList<SpreadsheetMergeChange> localOnlyChanges,
+        IReadOnlyList<SpreadsheetMergeChange> sameBothChanges,
+        IReadOnlyList<SpreadsheetMergeChange> conflicts)
+    {
+        AutoRemoteChanges = autoRemoteChanges;
+        LocalOnlyChanges = localOnlyChanges;
+        SameBothChanges = sameBothChanges;
+        Conflicts = conflicts;
+    }
+
+    public IReadOnlyList<SpreadsheetMergeChange> AutoRemoteChanges { get; }
+    public IReadOnlyList<SpreadsheetMergeChange> LocalOnlyChanges { get; }
+    public IReadOnlyList<SpreadsheetMergeChange> SameBothChanges { get; }
+    public IReadOnlyList<SpreadsheetMergeChange> Conflicts { get; }
+    public IReadOnlyList<SpreadsheetMergeChange> AllChanges => AutoRemoteChanges
+        .Concat(LocalOnlyChanges)
+        .Concat(SameBothChanges)
+        .Concat(Conflicts)
+        .ToList();
+    public int ResolvedConflictCount => Conflicts.Count(change => change.Resolution == SpreadsheetMergeResolution.UseRemote);
+    public int PlannedWriteCount => AllChanges.Count(change =>
+        change.Operation != SpreadsheetMergeOperation.KeepTarget &&
+        !string.Equals(change.LocalValue, change.RemoteValue, StringComparison.Ordinal));
+    public int RelevantChangeCount => AutoRemoteChanges.Count + LocalOnlyChanges.Count + SameBothChanges.Count + Conflicts.Count;
+
+    public IReadOnlyList<SpreadsheetMergeWrite> BuildWrites()
+    {
+        var selectedChanges = AllChanges
+            .Where(change => change.Operation != SpreadsheetMergeOperation.KeepTarget)
+            .Where(change => !string.Equals(change.LocalValue, change.RemoteValue, StringComparison.Ordinal))
+            .ToList();
+        var deletes = selectedChanges
+            .Where(change => change.Operation == SpreadsheetMergeOperation.DeleteRow)
+            .GroupBy(change => new ExcelRowKey(change.WriteCell.Sheet, change.WriteCell.Row))
+            .Select(group => new SpreadsheetMergeWrite(new ExcelCellKey(group.Key.Sheet, group.Key.Row, 0), "", SpreadsheetMergeWriteKind.DeleteRow));
+        var inserts = selectedChanges
+            .Where(change => change.Operation == SpreadsheetMergeOperation.InsertRow)
+            .Select(change => new SpreadsheetMergeWrite(change.WriteCell, change.RemoteValue, SpreadsheetMergeWriteKind.InsertRow));
+        var sets = selectedChanges
+            .Where(change => change.Operation is SpreadsheetMergeOperation.WriteCell or SpreadsheetMergeOperation.AppendRow)
+            .Select(change => new SpreadsheetMergeWrite(change.WriteCell, change.RemoteValue, SpreadsheetMergeWriteKind.SetCell));
+
+        return deletes
+            .Concat(inserts)
+            .Concat(sets)
+            .GroupBy(write => $"{write.Kind}|{write.Cell.Sheet}|{write.Cell.Row}|{write.Cell.Column}", StringComparer.Ordinal)
+            .Select(group => group.Last())
+            .ToList();
+    }
+}
+
+internal sealed class SpreadsheetMergeChange
+{
+    public SpreadsheetMergeChange(
+        SpreadsheetMergeChangeKind kind,
+        ExcelCellKey targetCell,
+        string fieldName,
+        string rowId,
+        string baseValue,
+        string localValue,
+        string remoteValue,
+        bool targetCellExists = true,
+        bool targetRowExists = true,
+        bool sourceCellExists = true,
+        string rowMergeKey = "")
+    {
+        Kind = kind;
+        TargetCell = targetCell;
+        WriteCell = targetCell;
+        FieldName = string.IsNullOrWhiteSpace(fieldName) ? "(未命名字段)" : fieldName;
+        RowId = string.IsNullOrWhiteSpace(rowId) ? "(无 ID)" : rowId;
+        BaseValue = baseValue;
+        LocalValue = localValue;
+        RemoteValue = remoteValue;
+        TargetCellExists = targetCellExists;
+        TargetRowExists = targetRowExists;
+        SourceCellExists = sourceCellExists;
+        RowMergeKey = rowMergeKey;
+        Resolution = kind == SpreadsheetMergeChangeKind.AutoRemote
+            ? SpreadsheetMergeResolution.UseRemote
+            : SpreadsheetMergeResolution.UseLocal;
+        Operation = Resolution == SpreadsheetMergeResolution.UseRemote
+            ? SpreadsheetMergeOperation.WriteCell
+            : SpreadsheetMergeOperation.KeepTarget;
+        if (Operation == SpreadsheetMergeOperation.WriteCell && SourceCellExists && !TargetRowExists)
+        {
+            Operation = SpreadsheetMergeOperation.KeepTarget;
+            Resolution = SpreadsheetMergeResolution.UseLocal;
+        }
+    }
+
+    public SpreadsheetMergeChangeKind Kind { get; }
+    public ExcelCellKey TargetCell { get; }
+    public ExcelCellKey WriteCell { get; set; }
+    public string FieldName { get; }
+    public string RowId { get; }
+    public string BaseValue { get; }
+    public string LocalValue { get; }
+    public string RemoteValue { get; }
+    public SpreadsheetMergeResolution Resolution { get; set; }
+    public SpreadsheetMergeOperation Operation { get; set; }
+    public bool TargetCellExists { get; set; }
+    public bool TargetRowExists { get; set; }
+    public bool SourceCellExists { get; set; }
+    public string RowMergeKey { get; set; }
+    public string Sheet => TargetCell.Sheet;
+    public string ColumnName => ExcelDiffService.ToColumnName(TargetCell.Column);
+    public string Address => $"{ColumnName}{TargetCell.Row + 1}";
+}
+
+internal sealed record SpreadsheetMergeWrite(ExcelCellKey Cell, string Value, SpreadsheetMergeWriteKind Kind = SpreadsheetMergeWriteKind.SetCell);
+
+internal sealed record SpreadsheetMergeRawCell(
+    ExcelCellKey Cell,
+    string Value,
+    string FieldName,
+    string RowId,
+    string RowMergeKey,
+    bool HasRowMergeKey,
+    string SemanticKey,
+    bool HasSemanticKey)
+{
+    public string PhysicalKey => SpreadsheetThreeWayMergeService.CreatePhysicalKey(Cell);
+}
+
+internal sealed record SpreadsheetMergeCell(
+    string MergeKey,
+    ExcelCellKey Cell,
+    string Value,
+    string FieldName,
+    string RowId,
+    string RowMergeKey,
+    bool HasRowMergeKey);
+
+internal sealed record SpreadsheetMergeResolvedTarget(ExcelCellKey Cell, bool TargetCellExists, bool TargetRowExists, string RowMergeKey);
+
+internal sealed class SpreadsheetMergeSheetLayout
+{
+    public SpreadsheetMergeSheetLayout(string sheet, int fieldHeaderRow, Dictionary<int, string> headers, IReadOnlyList<int> keyColumns)
+    {
+        Sheet = sheet;
+        FieldHeaderRow = fieldHeaderRow;
+        Headers = headers;
+        KeyColumns = keyColumns;
+    }
+
+    public string Sheet { get; }
+    public int FieldHeaderRow { get; }
+    public Dictionary<int, string> Headers { get; }
+    public IReadOnlyList<int> KeyColumns { get; }
+    public bool HasKey => KeyColumns.Count > 0;
+
+    public string FieldName(int column)
+    {
+        return Headers.TryGetValue(column, out var header) && !string.IsNullOrWhiteSpace(header)
+            ? header
+            : $"col_{column + 1}";
+    }
+
+    public string RowKey(Dictionary<ExcelCellKey, string> cells, int row)
+    {
+        if (KeyColumns.Count == 0)
+        {
+            return "";
+        }
+
+        var values = KeyColumns
+            .Select(column => GetCellValue(cells, Sheet, row, column).Trim())
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .ToList();
+        return values.Count == KeyColumns.Count ? string.Join("/", values) : "";
+    }
+
+    private static string GetCellValue(Dictionary<ExcelCellKey, string> cells, string sheet, int row, int column)
+    {
+        return cells.TryGetValue(new ExcelCellKey(sheet, row, column), out var value) ? value : "";
+    }
+}
+
+internal static class SpreadsheetThreeWayMergeService
+{
+    private const long DefaultMaxSingleInputBytes = 120L * 1024 * 1024;
+    private const long DefaultMaxTotalInputBytes = 240L * 1024 * 1024;
+    private static readonly Regex FieldTokenRegex = new("^[a-zA-Z0-9_]+$", RegexOptions.Compiled);
+    private static readonly Regex HeaderNonWordRegex = new(@"[^\w\u4e00-\u9fff]+", RegexOptions.Compiled);
+    private static readonly Regex HeaderUnderscoreRegex = new("_+", RegexOptions.Compiled);
+    private static readonly Regex KeyFieldRegex = new(@"(?:^|_)(id|level|key|code|name|type)(?:$|_)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public static bool IsSupportedPath(string filePath)
+    {
+        return DiffFileKindDetector.IsSpreadsheet(filePath);
+    }
+
+    public static void ValidateMergeInputs(params string[] filePaths)
+    {
+        var files = filePaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => new FileInfo(path))
+            .ToList();
+        if (files.Any(file => !file.Exists))
+        {
+            var missing = files.First(file => !file.Exists).FullName;
+            throw new FileNotFoundException("表格合并输入文件不存在。", missing);
+        }
+
+        var maxSingleBytes = GetConfiguredLimitBytes("SVNMANAGER_SPREADSHEET_MERGE_MAX_SINGLE_MB", DefaultMaxSingleInputBytes);
+        var maxTotalBytes = GetConfiguredLimitBytes("SVNMANAGER_SPREADSHEET_MERGE_MAX_TOTAL_MB", DefaultMaxTotalInputBytes);
+        var tooLargeFile = files.FirstOrDefault(file => file.Length > maxSingleBytes);
+        if (tooLargeFile != null)
+        {
+            throw new InvalidOperationException(
+                $"表格文件过大，已阻止在主进程内一次性加载三份表格：{tooLargeFile.Name} ({FormatBytes(tooLargeFile.Length)})。" +
+                $"{Environment.NewLine}当前单文件上限：{FormatBytes(maxSingleBytes)}。可通过环境变量 SVNMANAGER_SPREADSHEET_MERGE_MAX_SINGLE_MB 调高，但更建议先拆分超大表。");
+        }
+
+        var totalBytes = files.Sum(file => file.Length);
+        if (totalBytes > maxTotalBytes)
+        {
+            throw new InvalidOperationException(
+                $"三方合并输入总量过大，已阻止一次性加载：{FormatBytes(totalBytes)}。" +
+                $"{Environment.NewLine}当前总上限：{FormatBytes(maxTotalBytes)}。可通过环境变量 SVNMANAGER_SPREADSHEET_MERGE_MAX_TOTAL_MB 调高。");
+        }
+    }
+
+    public static SpreadsheetMergePlan BuildPlan(string baseFilePath, string localFilePath, string remoteFilePath)
+    {
+        ValidateMergeInputs(baseFilePath, localFilePath, remoteFilePath);
+        var baseRaw = ReadRawCells(baseFilePath);
+        var localRaw = ReadRawCells(localFilePath);
+        var remoteRaw = ReadRawCells(remoteFilePath);
+        var unsafeSemanticKeys = FindUnsafeSemanticKeys(baseRaw, localRaw, remoteRaw);
+        var baseCells = MaterializeCells(baseRaw, unsafeSemanticKeys);
+        var localCells = MaterializeCells(localRaw, unsafeSemanticKeys);
+        var remoteCells = MaterializeCells(remoteRaw, unsafeSemanticKeys);
+        var localRows = BuildRowLocationMap(localRaw);
+        var nextAppendRowBySheet = BuildNextAppendRowMap(localRaw);
+        var suggestedRows = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        var keys = baseCells.Keys
+            .Union(localCells.Keys)
+            .Union(remoteCells.Keys)
+            .OrderBy(key => PickCell(key, localCells, baseCells, remoteCells)?.Cell.Sheet)
+            .ThenBy(key => PickCell(key, localCells, baseCells, remoteCells)?.Cell.Row)
+            .ThenBy(key => PickCell(key, localCells, baseCells, remoteCells)?.Cell.Column)
+            .ToList();
+
+        var autoRemote = new List<SpreadsheetMergeChange>();
+        var localOnly = new List<SpreadsheetMergeChange>();
+        var sameBoth = new List<SpreadsheetMergeChange>();
+        var conflicts = new List<SpreadsheetMergeChange>();
+
+        foreach (var key in keys)
+        {
+            baseCells.TryGetValue(key, out var baseCell);
+            localCells.TryGetValue(key, out var localCell);
+            remoteCells.TryGetValue(key, out var remoteCell);
+
+            var baseValue = baseCell?.Value ?? "";
+            var localValue = localCell?.Value ?? "";
+            var remoteValue = remoteCell?.Value ?? "";
+            var localChanged = !string.Equals(localValue, baseValue, StringComparison.Ordinal);
+            var remoteChanged = !string.Equals(remoteValue, baseValue, StringComparison.Ordinal);
+            if (!localChanged && !remoteChanged)
+            {
+                continue;
+            }
+
+            var target = ResolveTargetCell(localCell, baseCell, remoteCell, localRows, nextAppendRowBySheet, suggestedRows);
+            var fieldName = FirstNonEmpty(localCell?.FieldName, remoteCell?.FieldName, baseCell?.FieldName);
+            var rowId = FirstNonEmpty(localCell?.RowId, remoteCell?.RowId, baseCell?.RowId);
+
+            if (remoteChanged && !localChanged)
+            {
+                autoRemote.Add(CreateChange(SpreadsheetMergeChangeKind.AutoRemote, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null));
+                continue;
+            }
+
+            if (localChanged && !remoteChanged)
+            {
+                localOnly.Add(CreateChange(SpreadsheetMergeChangeKind.LocalOnly, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null));
+                continue;
+            }
+
+            if (string.Equals(localValue, remoteValue, StringComparison.Ordinal))
+            {
+                sameBoth.Add(CreateChange(SpreadsheetMergeChangeKind.SameBoth, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null));
+                continue;
+            }
+
+            conflicts.Add(CreateChange(SpreadsheetMergeChangeKind.Conflict, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null));
+        }
+
+        return new SpreadsheetMergePlan(autoRemote, localOnly, sameBoth, conflicts);
+    }
+
+    private static SpreadsheetMergeChange CreateChange(
+        SpreadsheetMergeChangeKind kind,
+        SpreadsheetMergeResolvedTarget target,
+        string fieldName,
+        string rowId,
+        string baseValue,
+        string localValue,
+        string remoteValue,
+        bool sourceCellExists)
+    {
+        return new SpreadsheetMergeChange(
+            kind,
+            target.Cell,
+            fieldName,
+            rowId,
+            baseValue,
+            localValue,
+            remoteValue,
+            target.TargetCellExists,
+            target.TargetRowExists,
+            sourceCellExists,
+            target.RowMergeKey);
+    }
+
+    public static string CreateBackup(string localFilePath)
+    {
+        var directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "SVNManager",
+            "merge-backups",
+            DateTime.Now.ToString("yyyyMMdd"));
+        Directory.CreateDirectory(directory);
+        var fileName = Path.GetFileNameWithoutExtension(localFilePath);
+        var extension = Path.GetExtension(localFilePath);
+        var backupPath = Path.Combine(directory, $"{fileName}_{DateTime.Now:HHmmss_fff}{extension}");
+        File.Copy(localFilePath, backupPath, overwrite: false);
+        return backupPath;
+    }
+
+    public static void ApplyWrites(string localFilePath, IReadOnlyList<SpreadsheetMergeWrite> writes)
+    {
+        if (writes.Count == 0)
+        {
+            return;
+        }
+
+        if (ExcelDiffService.IsXmlSpreadsheetFile(localFilePath))
+        {
+            ApplyXmlWrites(localFilePath, writes);
+            return;
+        }
+
+        ApplyWorkbookWrites(localFilePath, writes);
+    }
+
+    public static string CreatePhysicalKey(ExcelCellKey cell)
+    {
+        return $"P|{cell.Sheet}|{cell.Row}|{cell.Column}";
+    }
+
+    private static IReadOnlyList<SpreadsheetMergeRawCell> ReadRawCells(string filePath)
+    {
+        return ReadRawCells(ExcelDiffService.ReadCellValues(filePath));
+    }
+
+    internal static IReadOnlyList<SpreadsheetMergeRawCell> ReadRawCells(Dictionary<ExcelCellKey, string> cells)
+    {
+        var layouts = InferSheetLayouts(cells);
+        return cells
+            .Select(pair =>
+            {
+                var cell = pair.Key;
+                var layout = layouts.TryGetValue(cell.Sheet, out var inferredLayout)
+                    ? inferredLayout
+                    : new SpreadsheetMergeSheetLayout(cell.Sheet, 1, [], []);
+                var fieldName = layout.FieldName(cell.Column);
+                var rowId = layout.RowKey(cells, cell.Row);
+                var hasSemanticKey = layout.HasKey &&
+                    cell.Row > layout.FieldHeaderRow &&
+                    !string.IsNullOrWhiteSpace(rowId) &&
+                    !string.IsNullOrWhiteSpace(fieldName);
+                var hasRowMergeKey = layout.HasKey &&
+                    cell.Row > layout.FieldHeaderRow &&
+                    !string.IsNullOrWhiteSpace(rowId);
+                var rowMergeKey = hasRowMergeKey
+                    ? $"R|{cell.Sheet}|{rowId.Trim()}"
+                    : $"P|{cell.Sheet}|{cell.Row}";
+                var semanticKey = hasSemanticKey
+                    ? $"S|{cell.Sheet}|{rowId.Trim()}|{NormalizeHeader(fieldName)}"
+                    : "";
+                return new SpreadsheetMergeRawCell(cell, pair.Value, fieldName, rowId, rowMergeKey, hasRowMergeKey, semanticKey, hasSemanticKey);
+            })
+            .ToList();
+    }
+
+    private static Dictionary<string, SpreadsheetMergeSheetLayout> InferSheetLayouts(Dictionary<ExcelCellKey, string> cells)
+    {
+        return cells.Keys
+            .Select(key => key.Sheet)
+            .Distinct(StringComparer.Ordinal)
+            .ToDictionary(
+                sheet => sheet,
+                sheet => InferSheetLayout(sheet, cells),
+                StringComparer.Ordinal);
+    }
+
+    private static SpreadsheetMergeSheetLayout InferSheetLayout(string sheet, Dictionary<ExcelCellKey, string> cells)
+    {
+        var sheetCells = cells
+            .Where(pair => string.Equals(pair.Key.Sheet, sheet, StringComparison.Ordinal))
+            .ToList();
+        if (sheetCells.Count == 0)
+        {
+            return new SpreadsheetMergeSheetLayout(sheet, 1, [], []);
+        }
+
+        var maxRow = sheetCells.Max(pair => pair.Key.Row);
+        var maxColumn = sheetCells.Max(pair => pair.Key.Column);
+        var fieldHeaderRow = InferFieldHeaderRow(sheet, cells, maxRow);
+        var headers = Enumerable.Range(0, maxColumn + 1)
+            .ToDictionary(column => column, column =>
+            {
+                var value = GetCellValue(cells, sheet, fieldHeaderRow, column).Trim();
+                return string.IsNullOrWhiteSpace(value) ? $"col_{column + 1}" : value;
+            });
+        var keyColumns = InferKeyColumns(sheet, cells, headers, fieldHeaderRow, maxRow);
+        return new SpreadsheetMergeSheetLayout(sheet, fieldHeaderRow, headers, keyColumns);
+    }
+
+    private static int InferFieldHeaderRow(string sheet, Dictionary<ExcelCellKey, string> cells, int maxRow)
+    {
+        var bestRow = 0;
+        var bestScore = -1.0;
+        var limit = Math.Min(maxRow, 11);
+        for (var row = 0; row <= limit; row++)
+        {
+            var values = RowValues(cells, sheet, row)
+                .Select(value => value.Trim())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .ToList();
+            if (values.Count == 0)
+            {
+                continue;
+            }
+
+            var tokenCount = values.Count(value => FieldTokenRegex.IsMatch(value));
+            var score = (double)tokenCount / values.Count;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestRow = row;
+            }
+        }
+
+        return bestRow;
+    }
+
+    private static IReadOnlyList<int> InferKeyColumns(
+        string sheet,
+        Dictionary<ExcelCellKey, string> cells,
+        Dictionary<int, string> headers,
+        int fieldHeaderRow,
+        int maxRow)
+    {
+        var dataRows = Enumerable.Range(fieldHeaderRow + 1, Math.Max(0, maxRow - fieldHeaderRow))
+            .Where(row => RowNonEmptyCount(cells, sheet, row) >= 2)
+            .ToList();
+        if (dataRows.Count == 0)
+        {
+            return [];
+        }
+
+        foreach (var exactIdColumn in headers
+            .Where(pair => string.Equals(NormalizeHeader(pair.Value), "id", StringComparison.Ordinal))
+            .Select(pair => pair.Key))
+        {
+            var keys = dataRows
+                .Select(row => GetCellValue(cells, sheet, row, exactIdColumn).Trim())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .ToList();
+            if (keys.Count > 0 && keys.Distinct(StringComparer.Ordinal).Count() == keys.Count)
+            {
+                return [exactIdColumn];
+            }
+        }
+
+        var candidates = headers
+            .Where(pair => KeyFieldRegex.IsMatch(NormalizeHeader(pair.Value)))
+            .Select(pair => pair.Key)
+            .Take(6)
+            .ToList();
+        if (candidates.Count == 0)
+        {
+            return [];
+        }
+
+        IReadOnlyList<int> bestColumns = [];
+        var bestScore = -1.0;
+        for (var width = 1; width <= Math.Min(3, candidates.Count); width++)
+        {
+            foreach (var columns in Combinations(candidates, width))
+            {
+                var keys = dataRows
+                    .Select(row => columns.Select(column => GetCellValue(cells, sheet, row, column).Trim()).ToArray())
+                    .Where(values => values.All(value => !string.IsNullOrWhiteSpace(value)))
+                    .Select(values => string.Join("\u001f", values))
+                    .ToList();
+                if (keys.Count == 0 || keys.Distinct(StringComparer.Ordinal).Count() != keys.Count)
+                {
+                    continue;
+                }
+
+                var coverage = (double)keys.Count / dataRows.Count;
+                var idBonus = columns.Count(column => NormalizeHeader(headers[column]).Contains("id", StringComparison.Ordinal)) * 0.15;
+                var score = coverage + idBonus;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestColumns = columns.ToList();
+                }
+            }
+        }
+
+        return bestScore >= 0.8 ? bestColumns : [];
+    }
+
+    private static IEnumerable<IReadOnlyList<int>> Combinations(IReadOnlyList<int> values, int width)
+    {
+        var selected = new int[width];
+        return Build(0, 0);
+
+        IEnumerable<IReadOnlyList<int>> Build(int start, int depth)
+        {
+            if (depth == width)
+            {
+                yield return selected.ToArray();
+                yield break;
+            }
+
+            for (var index = start; index <= values.Count - (width - depth); index++)
+            {
+                selected[depth] = values[index];
+                foreach (var item in Build(index + 1, depth + 1))
+                {
+                    yield return item;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> RowValues(Dictionary<ExcelCellKey, string> cells, string sheet, int row)
+    {
+        return cells
+            .Where(pair => string.Equals(pair.Key.Sheet, sheet, StringComparison.Ordinal) && pair.Key.Row == row)
+            .OrderBy(pair => pair.Key.Column)
+            .Select(pair => pair.Value);
+    }
+
+    private static int RowNonEmptyCount(Dictionary<ExcelCellKey, string> cells, string sheet, int row)
+    {
+        return RowValues(cells, sheet, row).Count(value => !string.IsNullOrWhiteSpace(value));
+    }
+
+    private static string NormalizeHeader(string value)
+    {
+        var text = (value ?? "").Trim().ToLowerInvariant();
+        text = HeaderNonWordRegex.Replace(text, "_");
+        text = HeaderUnderscoreRegex.Replace(text, "_").Trim('_');
+        return string.IsNullOrWhiteSpace(text) ? "unknown" : text;
+    }
+
+    private static HashSet<string> FindUnsafeSemanticKeys(params IReadOnlyList<SpreadsheetMergeRawCell>[] versions)
+    {
+        var unsafeKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var version in versions)
+        {
+            foreach (var group in version.Where(cell => cell.HasSemanticKey).GroupBy(cell => cell.SemanticKey))
+            {
+                if (group.Count() > 1)
+                {
+                    unsafeKeys.Add(group.Key);
+                }
+            }
+        }
+
+        return unsafeKeys;
+    }
+
+    private static Dictionary<string, SpreadsheetMergeCell> MaterializeCells(
+        IReadOnlyList<SpreadsheetMergeRawCell> rawCells,
+        HashSet<string> unsafeSemanticKeys)
+    {
+        return rawCells
+            .Select(raw =>
+            {
+                var key = raw.HasSemanticKey && !unsafeSemanticKeys.Contains(raw.SemanticKey)
+                    ? raw.SemanticKey
+                    : raw.PhysicalKey;
+                return new SpreadsheetMergeCell(key, raw.Cell, raw.Value, raw.FieldName, raw.RowId, raw.RowMergeKey, raw.HasRowMergeKey);
+            })
+            .GroupBy(cell => cell.MergeKey, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
+    }
+
+    private static Dictionary<string, ExcelCellKey> BuildRowLocationMap(IReadOnlyList<SpreadsheetMergeRawCell> rawCells)
+    {
+        return rawCells
+            .Where(cell => cell.HasRowMergeKey)
+            .GroupBy(cell => cell.RowMergeKey, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderBy(cell => cell.Cell.Column).First().Cell,
+                StringComparer.Ordinal);
+    }
+
+    private static Dictionary<string, int> BuildNextAppendRowMap(IReadOnlyList<SpreadsheetMergeRawCell> rawCells)
+    {
+        return rawCells
+            .GroupBy(cell => cell.Cell.Sheet, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Max(cell => cell.Cell.Row) + 1,
+                StringComparer.Ordinal);
+    }
+
+    private static SpreadsheetMergeResolvedTarget ResolveTargetCell(
+        SpreadsheetMergeCell? localCell,
+        SpreadsheetMergeCell? baseCell,
+        SpreadsheetMergeCell? remoteCell,
+        Dictionary<string, ExcelCellKey> localRows,
+        Dictionary<string, int> nextAppendRowBySheet,
+        Dictionary<string, int> suggestedRows)
+    {
+        if (localCell != null)
+        {
+            return new SpreadsheetMergeResolvedTarget(localCell.Cell, true, true, localCell.RowMergeKey);
+        }
+
+        var template = remoteCell ?? baseCell;
+        if (template == null)
+        {
+            throw new InvalidOperationException("无法定位合并单元格。");
+        }
+
+        var rowMergeKey = FirstNonEmpty(template.RowMergeKey, baseCell?.RowMergeKey, remoteCell?.RowMergeKey);
+        if (!string.IsNullOrWhiteSpace(rowMergeKey) &&
+            localRows.TryGetValue(rowMergeKey, out var localRow))
+        {
+            return new SpreadsheetMergeResolvedTarget(
+                new ExcelCellKey(localRow.Sheet, localRow.Row, template.Cell.Column),
+                false,
+                true,
+                rowMergeKey);
+        }
+
+        var sheet = template.Cell.Sheet;
+        if (!nextAppendRowBySheet.TryGetValue(sheet, out var nextRow))
+        {
+            nextRow = 0;
+        }
+
+        var appendKey = string.IsNullOrWhiteSpace(rowMergeKey)
+            ? $"P|{template.Cell.Sheet}|{template.Cell.Row}"
+            : rowMergeKey;
+        if (!suggestedRows.TryGetValue(appendKey, out var appendRow))
+        {
+            appendRow = nextRow;
+            suggestedRows[appendKey] = appendRow;
+            nextAppendRowBySheet[sheet] = appendRow + 1;
+        }
+
+        return new SpreadsheetMergeResolvedTarget(
+            new ExcelCellKey(sheet, appendRow, template.Cell.Column),
+            false,
+            false,
+            appendKey);
+    }
+
+    private static SpreadsheetMergeCell? PickCell(
+        string key,
+        Dictionary<string, SpreadsheetMergeCell> localCells,
+        Dictionary<string, SpreadsheetMergeCell> baseCells,
+        Dictionary<string, SpreadsheetMergeCell> remoteCells)
+    {
+        if (localCells.TryGetValue(key, out var localCell))
+        {
+            return localCell;
+        }
+
+        if (baseCells.TryGetValue(key, out var baseCell))
+        {
+            return baseCell;
+        }
+
+        return remoteCells.TryGetValue(key, out var remoteCell) ? remoteCell : null;
+    }
+
+    private static string GetCellValue(Dictionary<ExcelCellKey, string> cells, string sheet, int row, int column)
+    {
+        return cells.TryGetValue(new ExcelCellKey(sheet, row, column), out var value) ? value : "";
+    }
+
+    private static string FirstNonEmpty(params string?[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
+    }
+
+    private static void ApplyWorkbookWrites(string localFilePath, IReadOnlyList<SpreadsheetMergeWrite> writes)
+    {
+        ValidateMergeInputs(localFilePath);
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        IWorkbook workbook;
+        using (var input = File.OpenRead(localFilePath))
+        {
+            workbook = WorkbookFactory.Create(input);
+        }
+
+        foreach (var delete in writes
+            .Where(write => write.Kind == SpreadsheetMergeWriteKind.DeleteRow)
+            .GroupBy(write => new ExcelRowKey(write.Cell.Sheet, write.Cell.Row))
+            .OrderByDescending(group => group.Key.Sheet)
+            .ThenByDescending(group => group.Key.Row))
+        {
+            var sheet = workbook.GetSheet(delete.Key.Sheet);
+            if (sheet != null)
+            {
+                DeleteWorkbookRow(sheet, delete.Key.Row);
+            }
+        }
+
+        foreach (var insert in writes
+            .Where(write => write.Kind == SpreadsheetMergeWriteKind.InsertRow)
+            .GroupBy(write => new ExcelRowKey(write.Cell.Sheet, write.Cell.Row))
+            .OrderByDescending(group => group.Key.Sheet)
+            .ThenByDescending(group => group.Key.Row))
+        {
+            var sheet = workbook.GetSheet(insert.Key.Sheet) ?? workbook.CreateSheet(insert.Key.Sheet);
+            InsertWorkbookRow(sheet, insert.Key.Row);
+            foreach (var write in insert)
+            {
+                SetWorkbookCell(sheet, write.Cell.Row, write.Cell.Column, write.Value);
+            }
+        }
+
+        foreach (var write in writes.Where(write => write.Kind == SpreadsheetMergeWriteKind.SetCell))
+        {
+            var sheet = workbook.GetSheet(write.Cell.Sheet) ?? workbook.CreateSheet(write.Cell.Sheet);
+            SetWorkbookCell(sheet, write.Cell.Row, write.Cell.Column, write.Value);
+        }
+
+        using var output = File.Create(localFilePath);
+        workbook.Write(output);
+        workbook.Close();
+    }
+
+    private static void SetWorkbookCell(ISheet sheet, int rowIndex, int columnIndex, string value)
+    {
+        var row = sheet.GetRow(rowIndex) ?? sheet.CreateRow(rowIndex);
+        var cell = row.GetCell(columnIndex) ?? row.CreateCell(columnIndex);
+        if (string.IsNullOrEmpty(value))
+        {
+            cell.SetCellType(CellType.Blank);
+        }
+        else
+        {
+            cell.SetCellValue(value);
+        }
+    }
+
+    private static void InsertWorkbookRow(ISheet sheet, int rowIndex)
+    {
+        if (rowIndex <= sheet.LastRowNum)
+        {
+            sheet.ShiftRows(rowIndex, sheet.LastRowNum, 1, true, false);
+        }
+
+        sheet.CreateRow(rowIndex);
+    }
+
+    private static void DeleteWorkbookRow(ISheet sheet, int rowIndex)
+    {
+        var row = sheet.GetRow(rowIndex);
+        if (row != null)
+        {
+            sheet.RemoveRow(row);
+        }
+
+        if (rowIndex < sheet.LastRowNum)
+        {
+            sheet.ShiftRows(rowIndex + 1, sheet.LastRowNum, -1, true, false);
+        }
+    }
+
+    private static long GetConfiguredLimitBytes(string variableName, long defaultBytes)
+    {
+        var value = Environment.GetEnvironmentVariable(variableName);
+        if (long.TryParse(value, out var megabytes) && megabytes > 0)
+        {
+            return megabytes * 1024 * 1024;
+        }
+
+        return defaultBytes;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1024L * 1024 * 1024)
+        {
+            return $"{bytes / 1024d / 1024d / 1024d:0.##} GB";
+        }
+
+        if (bytes >= 1024L * 1024)
+        {
+            return $"{bytes / 1024d / 1024d:0.##} MB";
+        }
+
+        return bytes >= 1024 ? $"{bytes / 1024d:0.##} KB" : $"{bytes} B";
+    }
+
+    private static void ApplyXmlWrites(string localFilePath, IReadOnlyList<SpreadsheetMergeWrite> writes)
+    {
+        var document = XDocument.Load(localFilePath, LoadOptions.PreserveWhitespace);
+        XNamespace spreadsheet = "urn:schemas-microsoft-com:office:spreadsheet";
+        var root = document.Root ?? throw new InvalidOperationException("XML 表格缺少 Workbook 根节点。");
+
+        foreach (var delete in writes
+            .Where(write => write.Kind == SpreadsheetMergeWriteKind.DeleteRow)
+            .GroupBy(write => new ExcelRowKey(write.Cell.Sheet, write.Cell.Row))
+            .OrderByDescending(group => group.Key.Sheet)
+            .ThenByDescending(group => group.Key.Row))
+        {
+            var worksheet = GetOrCreateWorksheet(root, spreadsheet, delete.Key.Sheet);
+            var table = worksheet.Element(spreadsheet + "Table");
+            if (table != null)
+            {
+                DeleteXmlRow(table, spreadsheet, delete.Key.Row);
+            }
+        }
+
+        foreach (var insert in writes
+            .Where(write => write.Kind == SpreadsheetMergeWriteKind.InsertRow)
+            .GroupBy(write => new ExcelRowKey(write.Cell.Sheet, write.Cell.Row))
+            .OrderByDescending(group => group.Key.Sheet)
+            .ThenByDescending(group => group.Key.Row))
+        {
+            var worksheet = GetOrCreateWorksheet(root, spreadsheet, insert.Key.Sheet);
+            var table = worksheet.Element(spreadsheet + "Table");
+            if (table == null)
+            {
+                table = new XElement(spreadsheet + "Table");
+                worksheet.Add(table);
+            }
+
+            InsertXmlRow(table, spreadsheet, insert.Key.Row);
+            foreach (var write in insert)
+            {
+                SetXmlCell(table, spreadsheet, write.Cell, write.Value);
+            }
+        }
+
+        foreach (var write in writes.Where(write => write.Kind == SpreadsheetMergeWriteKind.SetCell))
+        {
+            var worksheet = GetOrCreateWorksheet(root, spreadsheet, write.Cell.Sheet);
+            var table = worksheet.Element(spreadsheet + "Table");
+            if (table == null)
+            {
+                table = new XElement(spreadsheet + "Table");
+                worksheet.Add(table);
+            }
+
+            SetXmlCell(table, spreadsheet, write.Cell, write.Value);
+        }
+
+        foreach (var table in root.Descendants(spreadsheet + "Table"))
+        {
+            UpdateXmlTableExtents(table, spreadsheet);
+        }
+
+        document.Save(localFilePath);
+    }
+
+    private static void SetXmlCell(XElement table, XNamespace spreadsheet, ExcelCellKey cellKey, string value)
+    {
+        var row = GetOrCreateXmlRow(table, spreadsheet, cellKey.Row);
+        var cell = GetOrCreateXmlCell(row, spreadsheet, cellKey.Column);
+        RemoveXmlFormulaAttributes(cell, spreadsheet);
+        var data = cell.Elements().FirstOrDefault(element => element.Name.LocalName == "Data");
+        if (data == null)
+        {
+            data = new XElement(spreadsheet + "Data", new XAttribute(spreadsheet + "Type", "String"));
+            cell.Add(data);
+        }
+
+        data.Value = NormalizeXmlCellText(value);
+        if (string.IsNullOrWhiteSpace(data.Attribute(spreadsheet + "Type")?.Value))
+        {
+            data.SetAttributeValue(spreadsheet + "Type", GuessXmlCellType(value));
+        }
+    }
+
+    private static void InsertXmlRow(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    {
+        var existing = GetXmlRowAt(table, spreadsheet, zeroBasedRow);
+        var created = new XElement(spreadsheet + "Row", new XAttribute(spreadsheet + "Index", zeroBasedRow + 1));
+        if (existing != null)
+        {
+            existing.AddBeforeSelf(created);
+        }
+        else
+        {
+            table.Add(created);
+        }
+
+        NormalizeXmlRowIndexes(table, spreadsheet);
+    }
+
+    private static void DeleteXmlRow(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    {
+        GetXmlRowAt(table, spreadsheet, zeroBasedRow)?.Remove();
+        NormalizeXmlRowIndexes(table, spreadsheet);
+    }
+
+    private static XElement? GetXmlRowAt(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    {
+        var rowIndex = 0;
+        foreach (var row in table.Elements(spreadsheet + "Row"))
+        {
+            var explicitIndex = ReadSpreadsheetIndex(row, spreadsheet);
+            if (explicitIndex.HasValue)
+            {
+                rowIndex = explicitIndex.Value - 1;
+            }
+
+            if (rowIndex == zeroBasedRow)
+            {
+                return row;
+            }
+
+            if (rowIndex > zeroBasedRow)
+            {
+                return null;
+            }
+
+            rowIndex++;
+        }
+
+        return null;
+    }
+
+    private static void NormalizeXmlRowIndexes(XElement table, XNamespace spreadsheet)
+    {
+        var rowIndex = 1;
+        foreach (var row in table.Elements(spreadsheet + "Row"))
+        {
+            row.SetAttributeValue(spreadsheet + "Index", rowIndex);
+            rowIndex++;
+        }
+    }
+
+    private static void RemoveXmlFormulaAttributes(XElement cell, XNamespace spreadsheet)
+    {
+        cell.Attribute(spreadsheet + "Formula")?.Remove();
+        cell.Attribute(spreadsheet + "ArrayRange")?.Remove();
+    }
+
+    private static void UpdateXmlTableExtents(XElement table, XNamespace spreadsheet)
+    {
+        var maxRow = 0;
+        var maxColumn = 0;
+        var rowIndex = 0;
+        foreach (var row in table.Elements(spreadsheet + "Row"))
+        {
+            var explicitRowIndex = ReadSpreadsheetIndex(row, spreadsheet);
+            if (explicitRowIndex.HasValue)
+            {
+                rowIndex = explicitRowIndex.Value - 1;
+            }
+
+            maxRow = Math.Max(maxRow, rowIndex + 1);
+            var columnIndex = 0;
+            foreach (var cell in row.Elements(spreadsheet + "Cell"))
+            {
+                var explicitColumnIndex = ReadSpreadsheetIndex(cell, spreadsheet);
+                if (explicitColumnIndex.HasValue)
+                {
+                    columnIndex = explicitColumnIndex.Value - 1;
+                }
+
+                maxColumn = Math.Max(maxColumn, columnIndex + 1);
+                columnIndex++;
+            }
+
+            rowIndex++;
+        }
+
+        if (maxRow > 0)
+        {
+            table.SetAttributeValue(spreadsheet + "ExpandedRowCount", maxRow.ToString());
+        }
+
+        if (maxColumn > 0)
+        {
+            table.SetAttributeValue(spreadsheet + "ExpandedColumnCount", maxColumn.ToString());
+        }
+    }
+
+    private static XElement GetOrCreateWorksheet(XElement root, XNamespace spreadsheet, string sheetName)
+    {
+        var worksheet = root
+            .Elements(spreadsheet + "Worksheet")
+            .FirstOrDefault(element => string.Equals(element.Attribute(spreadsheet + "Name")?.Value, sheetName, StringComparison.Ordinal));
+        if (worksheet != null)
+        {
+            return worksheet;
+        }
+
+        worksheet = new XElement(spreadsheet + "Worksheet", new XAttribute(spreadsheet + "Name", sheetName));
+        root.Add(worksheet);
+        return worksheet;
+    }
+
+    private static XElement GetOrCreateXmlRow(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    {
+        var rowIndex = 0;
+        foreach (var row in table.Elements(spreadsheet + "Row"))
+        {
+            var explicitIndex = ReadSpreadsheetIndex(row, spreadsheet);
+            if (explicitIndex.HasValue)
+            {
+                rowIndex = explicitIndex.Value - 1;
+            }
+
+            if (rowIndex == zeroBasedRow)
+            {
+                return row;
+            }
+
+            if (rowIndex > zeroBasedRow)
+            {
+                var created = new XElement(spreadsheet + "Row", new XAttribute(spreadsheet + "Index", zeroBasedRow + 1));
+                row.AddBeforeSelf(created);
+                return created;
+            }
+
+            rowIndex++;
+        }
+
+        var appended = new XElement(spreadsheet + "Row", new XAttribute(spreadsheet + "Index", zeroBasedRow + 1));
+        table.Add(appended);
+        return appended;
+    }
+
+    private static XElement GetOrCreateXmlCell(XElement row, XNamespace spreadsheet, int zeroBasedColumn)
+    {
+        var columnIndex = 0;
+        foreach (var cell in row.Elements(spreadsheet + "Cell"))
+        {
+            var explicitIndex = ReadSpreadsheetIndex(cell, spreadsheet);
+            if (explicitIndex.HasValue)
+            {
+                columnIndex = explicitIndex.Value - 1;
+            }
+
+            if (columnIndex == zeroBasedColumn)
+            {
+                return cell;
+            }
+
+            if (columnIndex > zeroBasedColumn)
+            {
+                var created = new XElement(spreadsheet + "Cell", new XAttribute(spreadsheet + "Index", zeroBasedColumn + 1));
+                cell.AddBeforeSelf(created);
+                return created;
+            }
+
+            columnIndex++;
+        }
+
+        var appended = new XElement(spreadsheet + "Cell", new XAttribute(spreadsheet + "Index", zeroBasedColumn + 1));
+        row.Add(appended);
+        return appended;
+    }
+
+    private static int? ReadSpreadsheetIndex(XElement element, XNamespace spreadsheet)
+    {
+        var value = element.Attribute(spreadsheet + "Index")?.Value;
+        return int.TryParse(value, out var index) ? index : null;
+    }
+
+    private static string NormalizeXmlCellText(string value)
+    {
+        return (value ?? "").Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+    }
+
+    private static string GuessXmlCellType(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "String";
+        }
+
+        return double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _)
+            ? "Number"
+            : "String";
+    }
+}
+

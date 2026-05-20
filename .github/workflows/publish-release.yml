@@ -1,0 +1,74 @@
+name: Publish SVNManager Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.2.0"
+        required: true
+        default: "v0.2.0"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ inputs.tag }}"
+          } else {
+            "${{ github.ref_name }}"
+          }
+          if ([string]::IsNullOrWhiteSpace($tag) -or -not $tag.StartsWith("v")) {
+            throw "Release tag must look like v0.2.0. Actual: '$tag'"
+          }
+          $version = $tag.TrimStart("v")
+          $notesPath = ".\.github\release-notes\$tag.md"
+          if (-not (Test-Path -LiteralPath $notesPath)) {
+            throw "Missing release notes: $notesPath"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "notes=$notesPath" >> $env:GITHUB_OUTPUT
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build release zip
+        shell: pwsh
+        run: |
+          .\Publish-Release.ps1 -Configuration Release -Runtime win-x64
+
+      - name: Publish GitHub Release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          NOTES: ${{ steps.meta.outputs.notes }}
+          RELEASE_TITLE: SVNManager ${{ steps.meta.outputs.tag }}
+        run: |
+          $zip = Resolve-Path ".\artifacts\DreamSVNManager-win-x64-v$env:VERSION.zip"
+          gh release view $env:TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG $zip --repo $env:GITHUB_REPOSITORY --title $env:RELEASE_TITLE --notes-file $env:NOTES
+          } else {
+            gh release edit $env:TAG --repo $env:GITHUB_REPOSITORY --title $env:RELEASE_TITLE --notes-file $env:NOTES
+            gh release upload $env:TAG $zip --repo $env:GITHUB_REPOSITORY --clobber
+          }

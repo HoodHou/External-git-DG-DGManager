@@ -41,6 +41,14 @@ internal sealed class HistorySummaryPanel : UserControl
             Padding = new Padding(24, 20, 24, 20), // Wider padding for modern look
             BackColor = Color.FromArgb(250, 250, 250), 
         };
+        root.ControlAdded += (_, args) =>
+        {
+            if (args.Control != null)
+            {
+                ApplyResponsiveWidth(root, args.Control);
+            }
+        };
+        root.SizeChanged += (_, _) => ApplyResponsiveWidths(root);
         Controls.Add(root);
 
         root.Controls.Add(CreateTitle(data));
@@ -95,6 +103,7 @@ internal sealed class HistorySummaryPanel : UserControl
             Margin = new Padding(0, 0, 0, 16),
             Width = 720
         };
+        panel.Tag = "HistorySummaryWide";
         
         var titleLabel = new Label
         {
@@ -194,9 +203,10 @@ internal sealed class HistorySummaryPanel : UserControl
         {
             Width = 720,
             AutoSize = true,
-            Padding = new Padding(16, 12, 12, 12),
+            Padding = new Padding(20, 16, 20, 16),
             Margin = new Padding(0, 0, 0, 24),
             BackColor = Color.FromArgb(248, 250, 252), // subtle background
+            Tag = "HistorySummaryWide",
         };
         panel.Paint += (s, e) => {
             using var brush = new SolidBrush(Color.FromArgb(203, 213, 225)); // Slate 300 accent border
@@ -206,12 +216,13 @@ internal sealed class HistorySummaryPanel : UserControl
         var label = new Label
         {
             AutoSize = true,
-            MaximumSize = new Size(690, 0),
+            MaximumSize = new Size(660, 0),
             Text = message,
             Font = new Font("Consolas", 10F),
             ForeColor = Color.FromArgb(30, 41, 59),
             BackColor = Color.Transparent,
             Margin = Padding.Empty,
+            Location = new Point(20, 16),
         };
         panel.Controls.Add(label);
         return panel;
@@ -278,6 +289,7 @@ internal sealed class HistorySummaryPanel : UserControl
             ColumnCount = 2,
             Margin = new Padding(0, 0, 0, 4),
             BackColor = Color.FromArgb(250, 250, 250),
+            Tag = "HistorySummaryWide",
         };
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 36));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -302,7 +314,7 @@ internal sealed class HistorySummaryPanel : UserControl
             MaximumSize = new Size(660, 0),
             Text = string.IsNullOrWhiteSpace(file.RepositoryPath)
                 ? file.TreePath
-                : $"{file.TreePath}{Environment.NewLine}{file.RepositoryPath}",
+                : $"{file.TreePath}{Environment.NewLine}{CompactMiddle(file.RepositoryPath, 96)}",
             Font = new Font("Consolas", 9.5F),
             ForeColor = Color.FromArgb(51, 65, 85),
             Margin = new Padding(0, 3, 0, 3),
@@ -344,6 +356,7 @@ internal sealed class HistorySummaryPanel : UserControl
             Margin = new Padding(0, 0, 0, 6),
             Font = new Font("Microsoft YaHei UI", 9.5F),
             ForeColor = Color.FromArgb(39, 50, 64),
+            Tag = "HistorySummaryWide",
         };
     }
 
@@ -359,7 +372,48 @@ internal sealed class HistorySummaryPanel : UserControl
             BackColor = Color.FromArgb(241, 245, 249),
             ForeColor = Color.FromArgb(71, 85, 105),
             Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+            Tag = "HistorySummaryWide",
         };
+    }
+
+    private static void ApplyResponsiveWidths(FlowLayoutPanel root)
+    {
+        foreach (Control control in root.Controls)
+        {
+            ApplyResponsiveWidth(root, control);
+        }
+    }
+
+    private static void ApplyResponsiveWidth(FlowLayoutPanel root, Control control)
+    {
+        if (!string.Equals(control.Tag as string, "HistorySummaryWide", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var width = Math.Max(360, root.ClientSize.Width - root.Padding.Horizontal - SystemInformation.VerticalScrollBarWidth - 8);
+        control.Width = width;
+        if (control is Label directLabel)
+        {
+            directLabel.MaximumSize = new Size(width, 0);
+        }
+
+        foreach (var label in control.Controls.OfType<Label>())
+        {
+            label.MaximumSize = new Size(Math.Max(220, width - 52), 0);
+        }
+    }
+
+    private static string CompactMiddle(string value, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        var left = Math.Max(12, maxLength / 2 - 2);
+        var right = Math.Max(12, maxLength - left - 5);
+        return value[..left] + "..." + value[^right..];
     }
 
     private static Color ActionColor(string action)

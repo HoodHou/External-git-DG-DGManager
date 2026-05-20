@@ -6,8 +6,13 @@ static class Program
     ///  The main entry point for the application.
     /// </summary>
     [STAThread]
-    static void Main()
+    static int Main(string[] args)
     {
+        if (SpreadsheetMergeWorker.TryRunFromCommandLine(args, out var workerExitCode))
+        {
+            return workerExitCode;
+        }
+
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, args) => HandleFatalException(args.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
@@ -23,14 +28,18 @@ static class Program
 
         try
         {
+            DiffTempFileTracker.Initialize();
             LogStartup("Starting SVNManager");
             ApplicationConfiguration.Initialize();
             Application.Run(new Form1());
+            DiffTempFileTracker.CleanupRegistered();
             LogStartup("SVNManager exited normally");
+            return 0;
         }
         catch (Exception ex)
         {
             HandleFatalException(ex);
+            return 1;
         }
     }
 
