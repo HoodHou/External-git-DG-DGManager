@@ -10,6 +10,32 @@ namespace SVNManager;
 
 internal sealed class ExcelDiffForm : Form
 {
+    // 静态化常用 Font / Brush,避免每次创建窗体/格子时重复 GDI 资源申请
+    private static readonly Font BaseFont = new("Microsoft YaHei UI", 9F);
+    private static readonly Font TitleFont = new("Microsoft YaHei UI", 9F, FontStyle.Bold);
+    private static readonly Font ChipFontRegular = new("Microsoft YaHei UI", 8.5F, FontStyle.Regular);
+    private static readonly Font ChipFontBold = new("Microsoft YaHei UI", 8.5F, FontStyle.Bold);
+    private static readonly Font GridHeaderFont = new("Microsoft YaHei UI", 9F, FontStyle.Bold);
+    private static readonly Font FieldGridHeaderFont = new("Microsoft YaHei UI", 8.5F, FontStyle.Bold);
+    private static readonly Font MonospaceFont = new("Consolas", 9F);
+
+    private static readonly Dictionary<int, SolidBrush> IndicatorBrushCache = new();
+    private static readonly object IndicatorBrushLock = new();
+
+    private static SolidBrush GetIndicatorBrush(Color color)
+    {
+        lock (IndicatorBrushLock)
+        {
+            if (!IndicatorBrushCache.TryGetValue(color.ToArgb(), out var brush))
+            {
+                brush = new SolidBrush(color);
+                IndicatorBrushCache[color.ToArgb()] = brush;
+            }
+
+            return brush;
+        }
+    }
+
     public ExcelDiffForm(string relativePath, DiffPreviewData data)
         : this(relativePath, data.SpreadsheetReport ?? SpreadsheetDiffReport.FromLegacy(data.ExcelDifferences ?? []))
     {
@@ -21,7 +47,7 @@ internal sealed class ExcelDiffForm : Form
         StartPosition = FormStartPosition.CenterParent;
         MinimumSize = new Size(1080, 640);
         Size = new Size(1280, 760);
-        Font = new Font("Microsoft YaHei UI", 9F);
+        Font = BaseFont;
 
         var root = new TableLayoutPanel
         {
@@ -39,7 +65,7 @@ internal sealed class ExcelDiffForm : Form
             Text = report.Summary,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
-            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+            Font = TitleFont,
         }, 0, 0);
 
         root.Controls.Add(CreateExcelDiffView(report), 0, 1);
@@ -60,37 +86,39 @@ internal sealed class ExcelDiffForm : Form
             ColumnCount = 1,
         };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 58));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 42));
 
         var toolbar = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 5,
+            ColumnCount = 6,
             RowCount = 1,
             BackColor = Color.FromArgb(248, 249, 250),
         };
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
-        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 250));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
         var searchBox = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "搜索 工作表 / ID / 字段 / 新旧值", Margin = new Padding(0, 4, 8, 4) };
-        var typeCombo = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 4, 8, 4) };
-        typeCombo.Items.AddRange(["全部类型", "只看修改", "只看新增行", "只看删除行", "只看弱对齐"]);
-        typeCombo.SelectedIndex = 0;
+        var previousButton = new Button { Text = "上一处", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 8, 3) };
+        var nextButton = new Button { Text = "下一处", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 8, 3) };
         var clearButton = new Button { Text = "清空", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 8, 3) };
         var copyButton = new Button { Text = "复制摘要", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 8, 3) };
         var countLabel = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.FromArgb(71, 85, 105) };
         toolbar.Controls.Add(searchBox, 0, 0);
-        toolbar.Controls.Add(typeCombo, 1, 0);
-        toolbar.Controls.Add(clearButton, 2, 0);
-        toolbar.Controls.Add(copyButton, 3, 0);
-        toolbar.Controls.Add(countLabel, 4, 0);
+        toolbar.Controls.Add(previousButton, 1, 0);
+        toolbar.Controls.Add(nextButton, 2, 0);
+        toolbar.Controls.Add(clearButton, 3, 0);
+        toolbar.Controls.Add(copyButton, 4, 0);
+        toolbar.Controls.Add(countLabel, 5, 0);
         root.Controls.Add(toolbar, 0, 0);
 
         var selectedSheet = "";
+        var selectedTypeIndex = 0;
         var sheetTabs = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -109,7 +137,21 @@ internal sealed class ExcelDiffForm : Form
         var fieldsPage = new TabPage("字段横向核对");
         var structuredPage = new TabPage("子表 / 长字段");
         var fieldGrid = CreateSpreadsheetFieldGrid();
-        fieldsPage.Controls.Add(fieldGrid);
+        var fieldsRoot = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
+        fieldsRoot.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        fieldsRoot.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var onlyChangedBox = new CheckBox
+        {
+            Text = "只看变化字段",
+            Checked = true,
+            AutoSize = true,
+            Dock = DockStyle.Left,
+            Margin = new Padding(6, 7, 0, 0),
+            ForeColor = Color.FromArgb(51, 65, 85),
+        };
+        fieldsRoot.Controls.Add(onlyChangedBox, 0, 0);
+        fieldsRoot.Controls.Add(fieldGrid, 0, 1);
+        fieldsPage.Controls.Add(fieldsRoot);
         structuredPage.Controls.Add(CreateStructuredDetailPanel(out var structuredSelector, out var structuredOldBox, out var structuredNewBox, out var structuredSegmentsGrid));
         detailTabs.TabPages.Add(fieldsPage);
         detailTabs.TabPages.Add(structuredPage);
@@ -121,7 +163,7 @@ internal sealed class ExcelDiffForm : Form
         void UpdateDetails(SpreadsheetDiffRow? row)
         {
             selectedRow = row;
-            UpdateSpreadsheetFieldGrid(fieldGrid, row);
+            UpdateSpreadsheetFieldGrid(fieldGrid, row, onlyChangedBox.Checked);
             UpdateStructuredSelector(structuredSelector, structuredOldBox, structuredNewBox, structuredSegmentsGrid, row);
         }
 
@@ -129,12 +171,21 @@ internal sealed class ExcelDiffForm : Form
         {
             foreach (var button in sheetTabs.Controls.OfType<Button>())
             {
+                if (button.Tag is int chipType)
+                {
+                    var selectedChip = chipType == selectedTypeIndex;
+                    button.BackColor = selectedChip ? Color.FromArgb(239, 246, 255) : Color.White;
+                    button.FlatAppearance.BorderColor = selectedChip ? Color.FromArgb(96, 165, 250) : Color.FromArgb(226, 232, 240);
+                    button.Font = selectedChip ? ChipFontBold : ChipFontRegular;
+                    continue;
+                }
+
                 var sheet = button.Tag as string ?? "";
                 var selected = string.Equals(sheet, selectedSheet, StringComparison.OrdinalIgnoreCase);
                 button.BackColor = selected ? Color.FromArgb(219, 234, 254) : Color.White;
                 button.ForeColor = selected ? Color.FromArgb(29, 78, 216) : Color.FromArgb(71, 85, 105);
                 button.FlatAppearance.BorderColor = selected ? Color.FromArgb(96, 165, 250) : Color.FromArgb(226, 232, 240);
-                button.Font = new Font("Microsoft YaHei UI", 8.5F, selected ? FontStyle.Bold : FontStyle.Regular);
+                button.Font = selected ? ChipFontBold : ChipFontRegular;
             }
         }
 
@@ -161,24 +212,58 @@ internal sealed class ExcelDiffForm : Form
             sheetTabs.Controls.Add(button);
         }
 
-        AddSheetTab("", rows.Count);
-        foreach (var group in rows.GroupBy(row => row.Sheet).OrderBy(group => group.Key, StringComparer.CurrentCultureIgnoreCase))
+        Button AddFilterChip(string text, int typeIndex, Color accentColor)
         {
-            AddSheetTab(group.Key, group.Count());
+            var button = new Button
+            {
+                Text = text,
+                Tag = typeIndex,
+                AutoSize = true,
+                Height = 28,
+                FlatStyle = FlatStyle.Flat,
+                Margin = new Padding(0, 0, 6, 0),
+                Padding = new Padding(10, 0, 10, 0),
+                UseVisualStyleBackColor = false,
+            };
+            button.FlatAppearance.BorderSize = 1;
+            button.FlatAppearance.BorderColor = Color.FromArgb(226, 232, 240);
+            button.BackColor = Color.White;
+            button.ForeColor = accentColor;
+            button.Click += (_, _) =>
+            {
+                selectedTypeIndex = selectedTypeIndex == typeIndex ? 0 : typeIndex;
+                ApplyFilter();
+            };
+            sheetTabs.Controls.Add(button);
+            return button;
+        }
+
+        AddFilterChip($"全部 {rows.Count}", 0, Color.FromArgb(30, 41, 59));
+        AddFilterChip($"修改 {report.ModifiedRowCount}", 1, Color.FromArgb(180, 83, 9));
+        AddFilterChip($"新增 {report.AddedRowCount}", 2, Color.FromArgb(22, 101, 52));
+        AddFilterChip($"删除 {report.DeletedRowCount}", 3, Color.FromArgb(153, 27, 27));
+        AddFilterChip($"弱对齐 {report.WeakAlignedRowCount}", 4, Color.FromArgb(37, 99, 235));
+        var sheetGroups = rows.GroupBy(row => row.Sheet).OrderBy(group => group.Key, StringComparer.CurrentCultureIgnoreCase).ToList();
+        if (sheetGroups.Count > 1)
+        {
+            AddSheetTab("", rows.Count);
+            foreach (var group in sheetGroups)
+            {
+                AddSheetTab(group.Key, group.Count());
+            }
         }
 
         void ApplyFilter()
         {
             var keyword = searchBox.Text.Trim();
-            var typeIndex = typeCombo.SelectedIndex;
             var filtered = rows.Where(row =>
                     (string.IsNullOrWhiteSpace(selectedSheet) || string.Equals(row.Sheet, selectedSheet, StringComparison.OrdinalIgnoreCase)) &&
-                    MatchesSpreadsheetRowType(row, typeIndex) &&
+                    MatchesSpreadsheetRowType(row, selectedTypeIndex) &&
                     (string.IsNullOrWhiteSpace(keyword) || MatchesSpreadsheetRowKeyword(row, keyword)))
                 .ToList();
             visibleRows = filtered;
             BindSpreadsheetDiffGrid(grid, filtered);
-            countLabel.Text = $"{filtered.Count} / {rows.Count} 行    修改 {report.ModifiedRowCount} | 新增 {report.AddedRowCount} | 删除 {report.DeletedRowCount} | 弱对齐 {report.WeakAlignedRowCount}";
+            countLabel.Text = $"{filtered.Count} / {rows.Count} 行";
             if (filtered.Count > 0 && grid.Rows.Count > 0)
             {
                 grid.ClearSelection();
@@ -202,16 +287,6 @@ internal sealed class ExcelDiffForm : Form
                 UpdateDetails(row);
             }
         };
-        grid.CellContentClick += (_, args) =>
-        {
-            if (args.RowIndex >= 0 &&
-                args.ColumnIndex >= 0 &&
-                grid.Columns[args.ColumnIndex].Name == "Detail" &&
-                GetSpreadsheetDiffGridRow(grid, args.RowIndex) is { } row)
-            {
-                ShowSpreadsheetRowDetail(grid.FindForm(), row);
-            }
-        };
         grid.CellDoubleClick += (_, args) =>
         {
             if (args.RowIndex >= 0 && GetSpreadsheetDiffGridRow(grid, args.RowIndex) is { } row)
@@ -219,12 +294,77 @@ internal sealed class ExcelDiffForm : Form
                 ShowSpreadsheetRowDetail(grid.FindForm(), row);
             }
         };
+
+        var rowContextMenu = new ContextMenuStrip();
+        rowContextMenu.Items.Add("复制 行 ID", null, (_, _) =>
+        {
+            if (selectedRow is { } row)
+            {
+                Clipboard.SetText(string.IsNullOrWhiteSpace(row.DisplayKey) ? row.RowMergeKey : row.DisplayKey);
+            }
+        });
+        rowContextMenu.Items.Add("复制旧整行", null, (_, _) =>
+        {
+            if (selectedRow is { } row && !string.IsNullOrEmpty(row.OldRowText))
+            {
+                Clipboard.SetText(row.OldRowText);
+            }
+        });
+        rowContextMenu.Items.Add("复制新整行", null, (_, _) =>
+        {
+            if (selectedRow is { } row && !string.IsNullOrEmpty(row.NewRowText))
+            {
+                Clipboard.SetText(row.NewRowText);
+            }
+        });
+        rowContextMenu.Items.Add("复制摘要", null, (_, _) =>
+        {
+            if (selectedRow is { } row)
+            {
+                Clipboard.SetText(row.CardSummary);
+            }
+        });
+        rowContextMenu.Items.Add(new ToolStripSeparator());
+        rowContextMenu.Items.Add("跳到字段表", null, (_, _) =>
+        {
+            detailTabs.SelectedIndex = 0;
+            fieldGrid.Focus();
+        });
+        rowContextMenu.Items.Add("打开详情窗口", null, (_, _) =>
+        {
+            if (selectedRow is { } row)
+            {
+                ShowSpreadsheetRowDetail(grid.FindForm(), row);
+            }
+        });
+        rowContextMenu.Opening += (_, opening) => opening.Cancel = selectedRow == null;
+        grid.ContextMenuStrip = rowContextMenu;
+        grid.CellMouseDown += (_, args) =>
+        {
+            if (args.Button == MouseButtons.Right && args.RowIndex >= 0)
+            {
+                grid.ClearSelection();
+                grid.Rows[args.RowIndex].Selected = true;
+                grid.CurrentCell = grid.Rows[args.RowIndex].Cells[Math.Min(1, grid.ColumnCount - 1)];
+            }
+        };
+
         searchBox.TextChanged += (_, _) => ApplyFilter();
-        typeCombo.SelectedIndexChanged += (_, _) => ApplyFilter();
+        onlyChangedBox.CheckedChanged += (_, _) => UpdateDetails(selectedRow);
+        previousButton.Click += (_, _) => MoveSpreadsheetGridSelection(grid, -1);
+        nextButton.Click += (_, _) => MoveSpreadsheetGridSelection(grid, 1);
         clearButton.Click += (_, _) =>
         {
             searchBox.Clear();
-            typeCombo.SelectedIndex = 0;
+            selectedTypeIndex = 0;
+            selectedSheet = "";
+            // 与窗体首次打开的默认状态保持一致：只看变化字段
+            if (!onlyChangedBox.Checked)
+            {
+                onlyChangedBox.Checked = true; // 触发 CheckedChanged → 刷新字段表
+            }
+
+            ApplyFilter();
         };
         copyButton.Click += (_, _) => CopySpreadsheetDiffSummary(root.FindForm(), visibleRows);
         structuredSelector.SelectedIndexChanged += (_, _) => UpdateStructuredDetail(structuredSelector, structuredOldBox, structuredNewBox, structuredSegmentsGrid);
@@ -277,42 +417,45 @@ internal sealed class ExcelDiffForm : Form
         };
         grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
         grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(45, 55, 72);
-        grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        grid.ColumnHeadersDefaultCellStyle.Font = GridHeaderFont;
         grid.EnableHeadersVisualStyles = false;
         grid.VirtualMode = true;
-        grid.RowTemplate.Height = 42;
+        grid.RowTemplate.Height = 58;
         grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
         grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(15, 23, 42);
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "工作表", DataPropertyName = nameof(SpreadsheetDiffRow.Sheet), Width = 120 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ID / 行标识", DataPropertyName = nameof(SpreadsheetDiffRow.DisplayKey), Width = 130 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "位置", DataPropertyName = nameof(SpreadsheetDiffRow.AddressText), Width = 116 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "改动类型", Name = "ChangeKind", Width = 82 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "对齐", Name = "AlignmentKind", Width = 82 });
+        grid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
-            HeaderText = "改动字段摘要",
-            DataPropertyName = nameof(SpreadsheetDiffRow.ChangedFieldsSummary),
-            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-            FillWeight = 38,
-            MinimumWidth = 220,
+            HeaderText = "",
+            Name = "Indicator",
+            Width = 12,
+            SortMode = DataGridViewColumnSortMode.NotSortable,
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
-            HeaderText = "旧整行",
+            HeaderText = "变更行",
+            Name = "CardSummary",
+            DataPropertyName = nameof(SpreadsheetDiffRow.CardSummary),
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            FillWeight = 45,
+            MinimumWidth = 300,
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "旧整行预览",
             DataPropertyName = nameof(SpreadsheetDiffRow.OldRowText),
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-            FillWeight = 31,
+            FillWeight = 27,
             MinimumWidth = 220,
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
-            HeaderText = "新整行",
+            HeaderText = "新整行预览",
             DataPropertyName = nameof(SpreadsheetDiffRow.NewRowText),
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-            FillWeight = 31,
+            FillWeight = 27,
             MinimumWidth = 220,
         });
-        grid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "", Name = "Detail", Text = "详情", UseColumnTextForButtonValue = true, Width = 66 });
         grid.CellValueNeeded += ProvideSpreadsheetDiffGridValue;
         grid.CellFormatting += (_, args) =>
         {
@@ -321,14 +464,9 @@ internal sealed class ExcelDiffForm : Form
                 return;
             }
 
-            if (grid.Columns[args.ColumnIndex].Name == "ChangeKind")
+            if (grid.Columns[args.ColumnIndex].Name == "Indicator")
             {
-                args.Value = SpreadsheetDiffChangeKindLabels.Text(row.ChangeKind);
-                args.FormattingApplied = true;
-            }
-            else if (grid.Columns[args.ColumnIndex].Name == "AlignmentKind")
-            {
-                args.Value = SpreadsheetDiffAlignmentKindLabels.Text(row.AlignmentKind);
+                args.Value = "";
                 args.FormattingApplied = true;
             }
 
@@ -340,6 +478,7 @@ internal sealed class ExcelDiffForm : Form
             };
             args.CellStyle.ForeColor = Color.FromArgb(30, 41, 59);
         };
+        grid.CellPainting += PaintSpreadsheetDiffGridCell;
         return grid;
     }
 
@@ -367,20 +506,33 @@ internal sealed class ExcelDiffForm : Form
 
         args.Value = grid.Columns[args.ColumnIndex].Name switch
         {
-            "ChangeKind" => SpreadsheetDiffChangeKindLabels.Text(row.ChangeKind),
-            "AlignmentKind" => SpreadsheetDiffAlignmentKindLabels.Text(row.AlignmentKind),
-            "Detail" => "详情",
+            "Indicator" => "",
+            "CardSummary" => row.CardSummary,
             _ => grid.Columns[args.ColumnIndex].DataPropertyName switch
             {
-                nameof(SpreadsheetDiffRow.Sheet) => row.Sheet,
-                nameof(SpreadsheetDiffRow.DisplayKey) => row.DisplayKey,
-                nameof(SpreadsheetDiffRow.AddressText) => row.AddressText,
-                nameof(SpreadsheetDiffRow.ChangedFieldsSummary) => row.ChangedFieldsSummary,
                 nameof(SpreadsheetDiffRow.OldRowText) => row.OldRowText,
                 nameof(SpreadsheetDiffRow.NewRowText) => row.NewRowText,
                 _ => "",
             },
         };
+    }
+
+    private static void PaintSpreadsheetDiffGridCell(object? sender, DataGridViewCellPaintingEventArgs args)
+    {
+        if (sender is not DataGridView grid ||
+            args.RowIndex < 0 ||
+            args.ColumnIndex < 0 ||
+            args.Graphics == null ||
+            GetSpreadsheetDiffGridRow(grid, args.RowIndex) is not { } row ||
+            grid.Columns[args.ColumnIndex].Name != "Indicator")
+        {
+            return;
+        }
+
+        args.Handled = true;
+        args.PaintBackground(args.CellBounds, grid.Rows[args.RowIndex].Selected);
+        var brush = GetIndicatorBrush(GetSpreadsheetChangeColor(row));
+        args.Graphics.FillRectangle(brush, new Rectangle(args.CellBounds.Left + 3, args.CellBounds.Top + 6, 4, Math.Max(8, args.CellBounds.Height - 12)));
     }
 
     private static DataGridView CreateSpreadsheetFieldGrid()
@@ -390,12 +542,12 @@ internal sealed class ExcelDiffForm : Form
             Dock = DockStyle.Fill,
             AllowUserToAddRows = false,
             AllowUserToDeleteRows = false,
-            AllowUserToResizeRows = false,
+            AllowUserToResizeRows = true,
             AutoGenerateColumns = false,
             ReadOnly = true,
             RowHeadersVisible = false,
             SelectionMode = DataGridViewSelectionMode.CellSelect,
-            AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None,
+            AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.DisplayedCellsExceptHeaders,
             BackgroundColor = Color.White,
             BorderStyle = System.Windows.Forms.BorderStyle.None,
             CellBorderStyle = DataGridViewCellBorderStyle.Single,
@@ -403,18 +555,35 @@ internal sealed class ExcelDiffForm : Form
         };
         grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
         grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(45, 55, 72);
-        grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Bold);
+        grid.ColumnHeadersDefaultCellStyle.Font = FieldGridHeaderFont;
         grid.EnableHeadersVisualStyles = false;
-        grid.RowTemplate.Height = 42;
-        grid.DefaultCellStyle.Font = new Font("Consolas", 9F);
-        grid.DefaultCellStyle.WrapMode = DataGridViewTriState.False;
+        grid.RowTemplate.Height = 58;
+        grid.RowTemplate.MinimumHeight = 34;
+        grid.DefaultCellStyle.Font = MonospaceFont;
+        grid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
         grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
         grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(15, 23, 42);
         grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "字段", DataPropertyName = nameof(SpreadsheetDiffCell.FieldName), Width = 150, Frozen = true });
         grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "列", DataPropertyName = nameof(SpreadsheetDiffCell.ColumnName), Width = 54 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "类型", Name = "CellKind", Width = 70 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "旧值", DataPropertyName = nameof(SpreadsheetDiffCell.OldValue), AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, FillWeight = 50, MinimumWidth = 220 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "新值", DataPropertyName = nameof(SpreadsheetDiffCell.NewValue), AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, FillWeight = 50, MinimumWidth = 220 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "旧值",
+            DataPropertyName = nameof(SpreadsheetDiffCell.OldValue),
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            FillWeight = 50,
+            MinimumWidth = 220,
+            DefaultCellStyle = new DataGridViewCellStyle { WrapMode = DataGridViewTriState.True },
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "新值",
+            DataPropertyName = nameof(SpreadsheetDiffCell.NewValue),
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            FillWeight = 50,
+            MinimumWidth = 220,
+            DefaultCellStyle = new DataGridViewCellStyle { WrapMode = DataGridViewTriState.True },
+        });
         grid.CellFormatting += (_, args) =>
         {
             if (args.RowIndex < 0 || grid.Rows[args.RowIndex].DataBoundItem is not SpreadsheetDiffCell cell)
@@ -433,14 +602,50 @@ internal sealed class ExcelDiffForm : Form
                 };
                 args.FormattingApplied = true;
             }
+            else if (grid.Columns[args.ColumnIndex].DataPropertyName == nameof(SpreadsheetDiffCell.NewValue) &&
+                TryGetNumericDelta(cell.OldValue, cell.NewValue, out var deltaText))
+            {
+                args.Value = $"{cell.NewValue} ({deltaText})";
+                args.FormattingApplied = true;
+            }
+        };
+        grid.CellToolTipTextNeeded += (_, args) =>
+        {
+            if (args.RowIndex < 0 || grid.Rows[args.RowIndex].DataBoundItem is not SpreadsheetDiffCell cell)
+            {
+                return;
+            }
+
+            args.ToolTipText =
+                $"字段：{cell.FieldName}{Environment.NewLine}" +
+                $"列：{cell.ColumnName}{Environment.NewLine}" +
+                $"类型：{SpreadsheetDiffCellKindText(cell.Kind)}{Environment.NewLine}" +
+                $"旧值：{cell.OldValue}{Environment.NewLine}" +
+                $"新值：{cell.NewValue}{Environment.NewLine}{Environment.NewLine}" +
+                "双击打开完整文本对比。";
+        };
+        grid.CellDoubleClick += (_, args) =>
+        {
+            if (args.RowIndex >= 0 && grid.Rows[args.RowIndex].DataBoundItem is SpreadsheetDiffCell cell)
+            {
+                ShowSpreadsheetFieldDetail(grid.FindForm(), cell);
+            }
         };
         grid.DataBindingComplete += (_, _) => ApplySpreadsheetFieldStyles(grid);
+        AttachSpreadsheetFieldContextMenu(grid);
         return grid;
     }
 
-    private static void UpdateSpreadsheetFieldGrid(DataGridView grid, SpreadsheetDiffRow? row)
+    private static void UpdateSpreadsheetFieldGrid(DataGridView grid, SpreadsheetDiffRow? row, bool onlyChanged = false)
     {
-        grid.DataSource = row?.Cells.ToList() ?? [];
+        if (row == null)
+        {
+            grid.DataSource = Array.Empty<SpreadsheetDiffCell>();
+            return;
+        }
+
+        var cells = onlyChanged ? row.ChangedCells : row.Cells;
+        grid.DataSource = cells.ToList();
     }
 
     private static void ApplySpreadsheetFieldStyles(DataGridView grid)
@@ -467,6 +672,167 @@ internal sealed class ExcelDiffForm : Form
                 gridRow.Cells[4].Style.ForeColor = Color.FromArgb(22, 101, 52);
             }
         }
+    }
+
+    private static void MoveSpreadsheetGridSelection(DataGridView grid, int delta)
+    {
+        if (grid.RowCount <= 0)
+        {
+            return;
+        }
+
+        var current = grid.CurrentCell?.RowIndex ?? 0;
+        var next = Math.Clamp(current + delta, 0, grid.RowCount - 1);
+        grid.ClearSelection();
+        grid.Rows[next].Selected = true;
+        grid.CurrentCell = grid.Rows[next].Cells[Math.Min(1, grid.Columns.Count - 1)];
+        grid.FirstDisplayedScrollingRowIndex = Math.Max(0, next - 2);
+    }
+
+    private static Color GetSpreadsheetChangeColor(SpreadsheetDiffRow row)
+    {
+        return row.ChangeKind switch
+        {
+            SpreadsheetDiffChangeKind.Added => Color.FromArgb(22, 163, 74),
+            SpreadsheetDiffChangeKind.Deleted => Color.FromArgb(220, 38, 38),
+            _ => row.AlignmentKind == SpreadsheetDiffAlignmentKind.Weak ? Color.FromArgb(37, 99, 235) : Color.FromArgb(217, 119, 6),
+        };
+    }
+
+    private static void AttachSpreadsheetFieldContextMenu(DataGridView grid)
+    {
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("复制旧值", null, (_, _) => CopySelectedSpreadsheetFieldValue(grid, oldSide: true));
+        menu.Items.Add("复制新值", null, (_, _) => CopySelectedSpreadsheetFieldValue(grid, oldSide: false));
+        menu.Items.Add("复制 字段=新值", null, (_, _) => CopySelectedSpreadsheetFieldAssignment(grid));
+        menu.Items.Add("复制字段名", null, (_, _) => CopySelectedSpreadsheetFieldName(grid));
+        grid.ContextMenuStrip = menu;
+        grid.CellMouseDown += (_, args) =>
+        {
+            if (args.Button == MouseButtons.Right && args.RowIndex >= 0 && args.ColumnIndex >= 0)
+            {
+                grid.ClearSelection();
+                grid.Rows[args.RowIndex].Selected = true;
+                grid.CurrentCell = grid.Rows[args.RowIndex].Cells[args.ColumnIndex];
+            }
+        };
+    }
+
+    private static SpreadsheetDiffCell? GetSelectedSpreadsheetFieldCell(DataGridView grid)
+    {
+        return grid.CurrentRow?.DataBoundItem as SpreadsheetDiffCell;
+    }
+
+    private static void CopySelectedSpreadsheetFieldValue(DataGridView grid, bool oldSide)
+    {
+        if (GetSelectedSpreadsheetFieldCell(grid) is not { } cell)
+        {
+            return;
+        }
+
+        Clipboard.SetText(oldSide ? cell.OldValue : cell.NewValue);
+    }
+
+    private static void CopySelectedSpreadsheetFieldAssignment(DataGridView grid)
+    {
+        if (GetSelectedSpreadsheetFieldCell(grid) is not { } cell)
+        {
+            return;
+        }
+
+        Clipboard.SetText($"{cell.FieldName}={cell.NewValue}");
+    }
+
+    private static void CopySelectedSpreadsheetFieldName(DataGridView grid)
+    {
+        if (GetSelectedSpreadsheetFieldCell(grid) is not { } cell)
+        {
+            return;
+        }
+
+        Clipboard.SetText(cell.FieldName);
+    }
+
+    private static string SpreadsheetDiffCellKindText(SpreadsheetDiffCellKind kind)
+    {
+        return kind switch
+        {
+            SpreadsheetDiffCellKind.Added => "新增",
+            SpreadsheetDiffCellKind.Deleted => "删除",
+            SpreadsheetDiffCellKind.Modified => "修改",
+            _ => "相同",
+        };
+    }
+
+    private static void ShowSpreadsheetFieldDetail(IWin32Window? owner, SpreadsheetDiffCell cell)
+    {
+        var oldDetail = FormatDiffDetailValue(cell.OldValue);
+        var newDetail = FormatDiffDetailValue(cell.NewValue);
+        var highlights = DiffHighlightSpans.Calculate(oldDetail, newDetail);
+        using var form = new Form
+        {
+            Text = $"字段差异 - {cell.FieldName}",
+            StartPosition = FormStartPosition.CenterParent,
+            MinimumSize = new Size(900, 520),
+            Size = new Size(1120, 680),
+            Font = new Font("Microsoft YaHei UI", 9F),
+        };
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        form.Controls.Add(root);
+
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+            Text = $"{cell.FieldName} / {cell.ColumnName}    {SpreadsheetDiffCellKindText(cell.Kind)}    改动片段：旧 {highlights.OldSpans.Count} / 新 {highlights.NewSpans.Count}",
+        }, 0, 0);
+
+        var split = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+        };
+        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        split.Controls.Add(CreateValueBox("旧值（红底为改动位置）", oldDetail, Color.FromArgb(153, 27, 27), Color.FromArgb(254, 202, 202), cell.Kind == SpreadsheetDiffCellKind.Deleted, highlights.OldSpans), 0, 0);
+        split.Controls.Add(CreateValueBox("新值（绿底为改动位置）", newDetail, Color.FromArgb(22, 101, 52), Color.FromArgb(187, 247, 208), false, highlights.NewSpans), 1, 0);
+        root.Controls.Add(split, 0, 1);
+
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
+        buttons.Controls.Add(new Button { Text = "关闭", Width = 86, DialogResult = DialogResult.OK });
+        root.Controls.Add(buttons, 0, 2);
+        form.AcceptButton = buttons.Controls.OfType<Button>().First();
+        form.ShowDialog(owner);
+    }
+
+    private static bool TryGetNumericDelta(string oldValue, string newValue, out string deltaText)
+    {
+        deltaText = "";
+        if (!decimal.TryParse(oldValue, out var oldNumber) || !decimal.TryParse(newValue, out var newNumber))
+        {
+            return false;
+        }
+
+        var delta = newNumber - oldNumber;
+        if (delta == 0)
+        {
+            return false;
+        }
+
+        deltaText = delta > 0 ? $"+{delta:0.####}" : $"{delta:0.####}";
+        return true;
     }
 
     private static Control CreateStructuredDetailPanel(

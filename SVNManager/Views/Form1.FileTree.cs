@@ -47,7 +47,10 @@ public partial class Form1
     private async Task LoadAllFilesAsync()
     {
         _fileTreeLoadDebounceTimer.Stop();
-        var root = _configView.WorkingCopyPath.Trim();
+        var context = TryGetWorkingCopyContext();
+        var root = context?.SelectedPath ?? _configView.WorkingCopyPath.Trim();
+        var svnRoot = context?.RootPath ?? root;
+        var scopeRelativePath = context?.ScopeRelativePath ?? "";
         var search = _allFilesView.SearchTextBox.Text.Trim();
         var changedOnly = _allFilesView.ChangedOnlyCheck.Checked;
         var isFiltering = changedOnly || !string.IsNullOrWhiteSpace(search);
@@ -61,7 +64,7 @@ public partial class Form1
         var loadCts = new CancellationTokenSource();
         _fileTreeLoadCts = loadCts;
         var token = loadCts.Token;
-        var request = new FileTreeLoadRequest(root, search, changedOnly, isFiltering, expandedPaths);
+        var request = new FileTreeLoadRequest(root, svnRoot, scopeRelativePath, search, changedOnly, isFiltering, expandedPaths);
         ShowFileTreeMessage(string.IsNullOrWhiteSpace(root) ? "请选择本地目录。" : "正在加载文件树...");
         _allFilesView.SetLoadingControls(loading: true);
         _statusLabel.Text = "正在加载全部文件...";
@@ -180,15 +183,16 @@ public partial class Form1
     }
 
     private static IEnumerable<FileTreeFileEntry> EnumerateFilteredWorkingCopyFiles(
-        string rootPath,
+        string searchRootPath,
+        string svnRootPath,
         string search,
         IReadOnlyDictionary<string, SvnStatusKind> statusMap,
         CancellationToken token)
     {
-        foreach (var filePath in EnumerateWorkingCopyFiles(rootPath, token))
+        foreach (var filePath in EnumerateWorkingCopyFiles(searchRootPath, token))
         {
             token.ThrowIfCancellationRequested();
-            var relativePath = Path.GetRelativePath(rootPath, filePath);
+            var relativePath = Path.GetRelativePath(svnRootPath, filePath);
             if (SvnConflictArtifact.IsAuxiliaryPath(relativePath))
             {
                 continue;
@@ -206,7 +210,8 @@ public partial class Form1
     }
 
     private static IEnumerable<FileTreeFileEntry> EnumerateChangedStatusFiles(
-        string rootPath,
+        string svnRootPath,
+        string scopeRelativePath,
         string search,
         IReadOnlyDictionary<string, SvnStatusKind> statusMap,
         CancellationToken token)
@@ -224,6 +229,11 @@ public partial class Form1
                 continue;
             }
 
+            if (!IsPathInsideScope(item.Key, scopeRelativePath))
+            {
+                continue;
+            }
+
             if (!string.IsNullOrWhiteSpace(search) &&
                 !item.Key.Contains(search, StringComparison.OrdinalIgnoreCase) &&
                 !Path.GetFileName(item.Key).Contains(search, StringComparison.OrdinalIgnoreCase))
@@ -231,13 +241,13 @@ public partial class Form1
                 continue;
             }
 
-            yield return new FileTreeFileEntry(item.Key, Path.Combine(rootPath, item.Key), item.Value);
+            yield return new FileTreeFileEntry(item.Key, Path.Combine(svnRootPath, item.Key), item.Value);
         }
     }
 
     private static int PopulateLazyDirectoryNode(
         TreeNode directoryNode,
-        string rootPath,
+        string svnRootPath,
         string relativeDirectory,
         IReadOnlyDictionary<string, SvnStatusKind> statusMap,
         CancellationToken token)
@@ -245,8 +255,8 @@ public partial class Form1
         token.ThrowIfCancellationRequested();
         directoryNode.Nodes.Clear();
         var fullDirectory = string.IsNullOrWhiteSpace(relativeDirectory)
-            ? rootPath
-            : Path.Combine(rootPath, relativeDirectory);
+            ? svnRootPath
+            : Path.Combine(svnRootPath, relativeDirectory);
         if (!Directory.Exists(fullDirectory))
         {
             return 0;
@@ -261,7 +271,7 @@ public partial class Form1
                 continue;
             }
 
-            var relativePath = Path.GetRelativePath(rootPath, directory);
+            var relativePath = Path.GetRelativePath(svnRootPath, directory);
             if (IsReservedDevicePath(relativePath))
             {
                 continue;
@@ -281,7 +291,7 @@ public partial class Form1
         foreach (var file in SafeEnumerateFiles(fullDirectory).OrderBy(Path.GetFileName, StringComparer.CurrentCultureIgnoreCase))
         {
             token.ThrowIfCancellationRequested();
-            var relativePath = Path.GetRelativePath(rootPath, file);
+            var relativePath = Path.GetRelativePath(svnRootPath, file);
             if (SvnConflictArtifact.IsAuxiliaryPath(relativePath) || IsReservedDevicePath(relativePath))
             {
                 continue;
@@ -304,7 +314,8 @@ public partial class Form1
             return;
         }
 
-        var root = _configView.WorkingCopyPath.Trim();
+        var context = TryGetWorkingCopyContext();
+        var root = context?.RootPath ?? _configView.WorkingCopyPath.Trim();
         if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
         {
             return;
@@ -390,14 +401,14 @@ public partial class Form1
         var rootInfo = new DirectoryInfo(request.RootPath);
         var rootNode = new TreeNode(rootInfo.Name)
         {
-            Tag = new FileTreeNodeInfo("", false),
+            Tag = new FileTreeNodeInfo(request.ScopeRelativePath, false),
             ToolTipText = request.RootPath,
             ImageKey = "folder",
             SelectedImageKey = "folder",
         };
 
-        var statusMap = GetStatusMapForTree(request.RootPath);
-        var rootStatus = ResolveFileTreeStatus("", statusMap);
+        var statusMap = GetStatusMapForTree(request.SvnRootPath);
+        var rootStatus = ResolveFileTreeStatus(request.ScopeRelativePath, statusMap);
         if (ShouldDisplayFileTreeStatus(rootStatus))
         {
             StyleFileTreeNodeForStatus(rootNode, rootStatus, rootInfo.Name, isFile: false);
@@ -406,15 +417,15 @@ public partial class Form1
         token.ThrowIfCancellationRequested();
         if (!request.IsFiltering)
         {
-            var topLevelCount = PopulateLazyDirectoryNode(rootNode, request.RootPath, "", statusMap, token);
+            var topLevelCount = PopulateLazyDirectoryNode(rootNode, request.SvnRootPath, request.ScopeRelativePath, statusMap, token);
             return new FileTreeBuildResult(rootNode, "", topLevelCount, false, true, request.IsFiltering, request.ExpandedPaths, statusMap);
         }
 
         var files = new List<FileTreeFileEntry>();
         var isTruncated = false;
         var filteredFiles = request.ChangedOnly
-            ? EnumerateChangedStatusFiles(request.RootPath, request.Search, statusMap, token)
-            : EnumerateFilteredWorkingCopyFiles(request.RootPath, request.Search, statusMap, token);
+            ? EnumerateChangedStatusFiles(request.SvnRootPath, request.ScopeRelativePath, request.Search, statusMap, token)
+            : EnumerateFilteredWorkingCopyFiles(request.RootPath, request.SvnRootPath, request.Search, statusMap, token);
         foreach (var file in filteredFiles)
         {
             token.ThrowIfCancellationRequested();
@@ -1238,7 +1249,7 @@ public partial class Form1
             return;
         }
 
-        var path = Path.Combine(_configView.WorkingCopyPath.Trim(), change.RelativePath);
+        var path = Path.Combine(GetWorkingCopyRootPath(), change.RelativePath);
         if (File.Exists(path))
         {
             Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
@@ -1257,7 +1268,7 @@ public partial class Form1
             return;
         }
 
-        var path = Path.Combine(_configView.WorkingCopyPath.Trim(), change.RelativePath);
+        var path = Path.Combine(GetWorkingCopyRootPath(), change.RelativePath);
         var argument = File.Exists(path)
             ? $"/select,\"{path}\""
             : Path.GetDirectoryName(path);
@@ -1322,13 +1333,24 @@ public partial class Form1
         }
 
         var current = _allFilesView.FileTree.Nodes[0];
-        if (string.IsNullOrWhiteSpace(relativePath))
+        var pathToFind = NormalizeRelativePath(relativePath == "." ? "" : relativePath);
+        if (current.Tag is FileTreeNodeInfo { IsFile: false } rootInfo &&
+            !string.IsNullOrWhiteSpace(rootInfo.RelativePath) &&
+            IsPathInsideScope(pathToFind, rootInfo.RelativePath))
+        {
+            var scope = NormalizeRelativePath(rootInfo.RelativePath).Trim(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            pathToFind = string.Equals(pathToFind, scope, StringComparison.OrdinalIgnoreCase)
+                ? ""
+                : pathToFind[(scope.Length + 1)..];
+        }
+
+        if (string.IsNullOrWhiteSpace(pathToFind))
         {
             current.Expand();
             return current;
         }
 
-        foreach (var part in relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        foreach (var part in pathToFind.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
         {
             EnsureLazyFileTreeChildren(current);
             current.Expand();
@@ -1461,7 +1483,7 @@ public partial class Form1
             return;
         }
 
-        var filePath = Path.Combine(_configView.WorkingCopyPath.Trim(), fileNode.RelativePath);
+        var filePath = Path.Combine(GetWorkingCopyRootPath(), fileNode.RelativePath);
         if (File.Exists(filePath))
         {
             Process.Start(new ProcessStartInfo(filePath) { UseShellExecute = true });
@@ -1478,7 +1500,7 @@ public partial class Form1
         _fileTreeMenu.Items.Add("和另一个表快速比对...", null, async (_, _) => await CompareSelectedTableWithAnotherAsync());
         _fileTreeMenu.Items.Add("当前本地 vs 远端 HEAD", null, async (_, _) => await CompareSelectedFileWithRemoteHeadAsync());
         _fileTreeMenu.Items.Add("查看冲突", null, async (_, _) => await RunConflictViewerAsync());
-        _fileTreeMenu.Items.Add("内置表格三方合并", null, async (_, _) => await RunInternalSpreadsheetMergeAsync());
+        _fileTreeMenu.Items.Add("内置三方合并", null, async (_, _) => await RunInternalSpreadsheetMergeAsync());
         _fileTreeMenu.Items.Add("跨库表格三方合并", null, async (_, _) => await RunCrossRepositorySpreadsheetMergeAsync());
         _fileTreeMenu.Items.Add("用分久必合对比/合并", null, async (_, _) => await RunExternalCompareOrMergeAsync());
         _fileTreeMenu.Items.Add("冲突处理流程", null, async (_, _) => await RunConflictWorkflowAsync());
@@ -1507,7 +1529,7 @@ public partial class Form1
                     item.Text is "打开文件" && hasFile ||
                     item.Text is "查看差异" && hasFile ||
                     item.Text is "和另一个表快速比对..." && hasFile ||
-                    item.Text is "内置表格三方合并" && hasFile ||
+                    item.Text is "内置三方合并" && hasFile ||
                     item.Text is "跨库表格三方合并" ||
                     item.Text is "查看冲突" && hasFile ||
                     item.Text is "用分久必合对比/合并" && hasFile ||
@@ -1539,7 +1561,7 @@ public partial class Form1
             return;
         }
 
-        var path = Path.Combine(_configView.WorkingCopyPath.Trim(), nodeInfo.RelativePath);
+        var path = Path.Combine(GetWorkingCopyRootPath(), nodeInfo.RelativePath);
         var folder = nodeInfo.IsFile ? Path.GetDirectoryName(path) : path;
         if (!string.IsNullOrWhiteSpace(folder) && Directory.Exists(folder))
         {

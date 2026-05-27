@@ -2,7 +2,12 @@ namespace SVNManager;
 
 internal sealed record SvnStatusXmlEntry(string Path, string Item);
 
-internal sealed record SvnInfoXmlEntry(long Revision, long LastChangedRevision, string Url);
+internal sealed record SvnInfoXmlEntry(
+    long Revision,
+    long LastChangedRevision,
+    string Url,
+    string RepositoryRootUrl,
+    string WorkingCopyRootPath);
 
 internal sealed record SvnLogXmlPath(string Action, string RepositoryPath);
 

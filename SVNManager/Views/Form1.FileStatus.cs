@@ -59,7 +59,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetRequiredWorkingCopyContext().SelectedPath;
         using var form = new CleanupOptionsForm(workingCopy);
         if (form.ShowDialog(this) != DialogResult.OK)
         {
@@ -99,7 +99,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         SetBusy(true, "正在读取忽略清单...");
         try
         {
@@ -136,7 +136,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var selectedPaths = GetSelectedIgnoreCandidatePaths();
         if (selectedPaths.Count == 0)
         {
@@ -200,7 +200,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var message =
             $"准备从 svn:ignore 里移除 {selectedPaths.Count} 个名称。{Environment.NewLine}{Environment.NewLine}" +
             string.Join(Environment.NewLine, selectedPaths.Take(12)) +
@@ -408,11 +408,11 @@ public partial class Form1
 
         if (!ConfirmRevertToLatest(changes))
         {
-            OperationLogger.Log("RevertToLatestCancelled", _configView.WorkingCopyPath.Trim(), $"files={changes.Count}");
+            OperationLogger.Log("RevertToLatestCancelled", GetWorkingCopyRootPath(), $"files={changes.Count}");
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         SetBusy(true, "正在还原到 SVN 最新版本...");
         try
         {
@@ -473,7 +473,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         OperationLogger.Log("LockFileStart", workingCopy, relativePath);
         var result = await RunSvnOperationAsync("正在锁定文件...", async () => await _svn.LockAsync(workingCopy, relativePath));
         OperationLogger.Log(result?.ExitCode == 0 ? "LockFileSuccess" : "LockFileFailed", workingCopy, relativePath);
@@ -490,7 +490,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         OperationLogger.Log("UnlockFileStart", workingCopy, relativePath);
         var result = await RunSvnOperationAsync("正在解锁文件...", async () => await _svn.UnlockAsync(workingCopy, relativePath));
         OperationLogger.Log(result?.ExitCode == 0 ? "UnlockFileSuccess" : "UnlockFileFailed", workingCopy, relativePath);
@@ -510,7 +510,7 @@ public partial class Form1
         SetBusy(true, "正在读取锁信息...");
         try
         {
-            var result = await _svn.InfoAsync(_configView.WorkingCopyPath.Trim(), relativePath);
+            var result = await _svn.InfoAsync(GetWorkingCopyRootPath(), relativePath);
             WriteOutput(result.CombinedOutput);
             MessageBox.Show(
                 BuildLockInfoMessage(relativePath, result),
@@ -541,7 +541,7 @@ public partial class Form1
         try
         {
             SaveSettings();
-            var changes = (await _svn.GetStatusAsync(_configView.WorkingCopyPath.Trim())).ToList();
+            var changes = FilterChangesForCurrentScope(await _svn.GetStatusAsync(GetWorkingCopyRootPath())).ToList();
             var orderedChanges = changes.OrderBy(change => change.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
             _fileStatusView.SetChanges(orderedChanges);
             _state.SetStatusChanges(orderedChanges);
@@ -723,8 +723,8 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
-        var latestChanges = (await _svn.GetStatusAsync(workingCopy)).ToList();
+        var workingCopy = GetWorkingCopyRootPath();
+        var latestChanges = FilterChangesForCurrentScope(await _svn.GetStatusAsync(workingCopy)).ToList();
         var conflicts = latestChanges.Where(change => change.Status == SvnStatusKind.Conflicted).ToList();
         string? globalBlockReason = null;
         if (conflicts.Count > 0)

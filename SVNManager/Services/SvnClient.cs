@@ -291,7 +291,7 @@ internal sealed class SvnClient
             // svnversion is optional; root svn info is still usable as a fallback.
         }
 
-        return new WorkingCopyInfo(revision, lastChangedRevision, minRevision, maxRevision, url);
+        return new WorkingCopyInfo(revision, lastChangedRevision, minRevision, maxRevision, url, info.RepositoryRootUrl, info.WorkingCopyRootPath);
     }
 
     private static IReadOnlyList<SvnChange> ParseStatusXml(string xml, bool includeNormal)
@@ -311,7 +311,7 @@ internal sealed class SvnClient
 
     private static SvnInfoXmlEntry ParseWorkingCopyInfoXml(string xml)
     {
-        return ReadInfoXmlEntry(xml) ?? new SvnInfoXmlEntry(0, 0, "");
+        return ReadInfoXmlEntry(xml) ?? new SvnInfoXmlEntry(0, 0, "", "", "");
     }
 
     private static IReadOnlyList<SvnStatusXmlEntry> ReadStatusXmlEntries(string xml)
@@ -344,7 +344,9 @@ internal sealed class SvnClient
         return new SvnInfoXmlEntry(
             revision,
             lastChangedRevision,
-            entry.Element("url")?.Value?.Trim() ?? "");
+            entry.Element("url")?.Value?.Trim() ?? "",
+            entry.Element("repository")?.Element("root")?.Value?.Trim() ?? "",
+            entry.Element("wc-info")?.Element("wcroot-abspath")?.Value?.Trim() ?? "");
     }
 
     private static (long MinRevision, long MaxRevision) ParseSvnVersion(string text)

@@ -8,7 +8,16 @@ param(
 
     [switch]$SkipRestore,
 
-    [switch]$NoZip
+    [switch]$NoZip,
+
+    [ValidateSet("stable", "beta")]
+    [string]$Channel = "stable",
+
+    [string]$ReleaseNotes = "",
+
+    [string]$ReleaseBaseUrl = "https://github.com/HoodHou/External-git-DG-DGManager/releases/download",
+
+    [switch]$NoManifest
 )
 
 $ErrorActionPreference = "Stop"
@@ -82,6 +91,37 @@ if (-not $NoZip) {
 
     Compress-Archive -Path (Join-Path $OutputDirectory "*") -DestinationPath $ZipPath -Force
     Write-Host "Release zip: $ZipPath"
+
+    if (-not $NoManifest) {
+        $ZipName = Split-Path -Leaf $ZipPath
+        $Sha256 = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $DownloadUrl = "$ReleaseBaseUrl/v$Version/$ZipName"
+        $ReleasePageBaseUrl = $ReleaseBaseUrl -replace "/releases/download$", "/releases/tag"
+        $ReleaseUrl = "$ReleasePageBaseUrl/v$Version"
+        $ManifestPath = Join-Path $Root "update.json"
+        $Manifest = [ordered]@{}
+        if (Test-Path -LiteralPath $ManifestPath) {
+            $Existing = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+            foreach ($Property in $Existing.PSObject.Properties) {
+                $Manifest[$Property.Name] = $Property.Value
+            }
+        }
+
+        $Manifest[$Channel] = [ordered]@{
+            version = $Version
+            tag = "v$Version"
+            assetName = $ZipName
+            url = $DownloadUrl
+            sha256 = $Sha256
+            required = $false
+            notes = $ReleaseNotes
+            releaseUrl = $ReleaseUrl
+            publishedAt = (Get-Date).ToString("yyyy-MM-dd")
+        }
+        $Manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+        Write-Host "SHA256: $Sha256"
+        Write-Host "Update manifest: $ManifestPath ($Channel)"
+    }
 }
 
 Write-Host "Publish output: $OutputDirectory"

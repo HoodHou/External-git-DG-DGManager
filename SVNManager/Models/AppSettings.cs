@@ -14,6 +14,7 @@ internal sealed class AppSettings
     public string WorkingCopyPath { get; set; } = "";
     public string LastCommitMessage { get; set; } = "【策划配置】";
     public string ExternalMergeToolPath { get; set; } = "";
+    public string UpdateChannel { get; set; } = "stable";
     public string? CurrentRepositoryId { get; set; }
     public List<RepositoryEntry> Repositories { get; set; } = [];
     public List<string> IgnoredWorkingCopyPaths { get; set; } = [];

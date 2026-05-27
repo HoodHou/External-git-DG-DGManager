@@ -9,7 +9,20 @@ on:
       tag:
         description: "Release tag, for example v0.2.0"
         required: true
-        default: "v0.2.0"
+        default: "v0.3.2"
+      channel:
+        description: "Update channel written into update.json"
+        required: true
+        type: choice
+        options:
+          - stable
+          - beta
+        default: stable
+      prerelease:
+        description: "Mark the GitHub Release as prerelease"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -37,12 +50,29 @@ jobs:
             throw "Release tag must look like v0.2.0. Actual: '$tag'"
           }
           $version = $tag.TrimStart("v")
+          $channel = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ inputs.channel }}"
+          } else {
+            "stable"
+          }
+          $prerelease = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ inputs.prerelease }}"
+          } else {
+            "false"
+          }
           $notesPath = ".\.github\release-notes\$tag.md"
           if (-not (Test-Path -LiteralPath $notesPath)) {
             throw "Missing release notes: $notesPath"
           }
+          $projectXml = [xml](Get-Content -LiteralPath ".\SVNManager\SVNManager.csproj")
+          $projectVersion = ($projectXml.Project.PropertyGroup | Select-Object -First 1).Version
+          if ($projectVersion -ne $version) {
+            throw "Project version ($projectVersion) does not match release tag ($version)."
+          }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
           "notes=$notesPath" >> $env:GITHUB_OUTPUT
 
       - name: Setup .NET
@@ -52,8 +82,17 @@ jobs:
 
       - name: Build release zip
         shell: pwsh
+        env:
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          NOTES: ${{ steps.meta.outputs.notes }}
         run: |
-          .\Publish-Release.ps1 -Configuration Release -Runtime win-x64
+          $releaseNotes = Get-Content -LiteralPath $env:NOTES -Raw
+          .\Publish-Release.ps1 `
+            -Configuration Release `
+            -Runtime win-x64 `
+            -Channel $env:CHANNEL `
+            -ReleaseNotes $releaseNotes `
+            -ReleaseBaseUrl "https://github.com/${{ github.repository }}/releases/download"
 
       - name: Publish GitHub Release asset
         shell: pwsh
@@ -62,13 +101,41 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
           NOTES: ${{ steps.meta.outputs.notes }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
           RELEASE_TITLE: SVNManager ${{ steps.meta.outputs.tag }}
         run: |
           $zip = Resolve-Path ".\artifacts\DreamSVNManager-win-x64-v$env:VERSION.zip"
+          $manifest = Resolve-Path ".\update.json"
+          $createArgs = @(
+            "release", "create", $env:TAG, $zip, $manifest,
+            "--repo", $env:GITHUB_REPOSITORY,
+            "--title", $env:RELEASE_TITLE,
+            "--notes-file", $env:NOTES
+          )
+          if ($env:PRERELEASE -eq "true") {
+            $createArgs += "--prerelease"
+          }
           gh release view $env:TAG --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:TAG $zip --repo $env:GITHUB_REPOSITORY --title $env:RELEASE_TITLE --notes-file $env:NOTES
+            gh @createArgs
           } else {
             gh release edit $env:TAG --repo $env:GITHUB_REPOSITORY --title $env:RELEASE_TITLE --notes-file $env:NOTES
-            gh release upload $env:TAG $zip --repo $env:GITHUB_REPOSITORY --clobber
+            gh release upload $env:TAG $zip $manifest --repo $env:GITHUB_REPOSITORY --clobber
           }
+
+      - name: Commit update manifest
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "update.json is already current."
+            exit 0
+          }
+          git commit -m "Update release manifest for $env:TAG"
+          git push

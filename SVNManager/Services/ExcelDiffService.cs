@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using DiffPlex;
 using NPOI.SS.UserModel;
 
 namespace SVNManager;
@@ -24,8 +25,9 @@ internal static class ExcelDiffService
     {
         var oldRawCells = SpreadsheetThreeWayMergeService.ReadRawCells(oldCells);
         var newRawCells = SpreadsheetThreeWayMergeService.ReadRawCells(newCells);
-        var oldRows = BuildRows(oldRawCells);
-        var newRows = BuildRows(newRawCells);
+        var columnAnalysis = AnalyzeColumns(oldRawCells, newRawCells);
+        var oldRows = BuildRows(oldRawCells, new Dictionary<string, string>(StringComparer.Ordinal));
+        var newRows = BuildRows(newRawCells, columnAnalysis.NewFieldKeyToOldFieldKey);
         var pairs = AlignRows(oldRows, newRows);
         var rows = pairs
             .Select(pair => CreateDiffRow(pair.OldRow, pair.NewRow, pair.AlignmentKind))
@@ -35,7 +37,10 @@ internal static class ExcelDiffService
             .ThenBy(row => Math.Min(row.OldRow < 0 ? int.MaxValue : row.OldRow, row.NewRow < 0 ? int.MaxValue : row.NewRow))
             .ThenBy(row => row.DisplayKey, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
-        return new SpreadsheetDiffReport(rows);
+        return new SpreadsheetDiffReport(rows)
+        {
+            ColumnChanges = columnAnalysis.Changes,
+        };
     }
 
     public static Dictionary<ExcelCellKey, string> ReadCellValues(string filePath)
@@ -230,62 +235,42 @@ internal static class ExcelDiffService
             return [];
         }
 
-        if ((long)oldRows.Count * newRows.Count > 250000)
-        {
-            return AlignUniqueSignatures(oldRows, newRows);
-        }
-
-        var lengths = new int[oldRows.Count + 1, newRows.Count + 1];
-        for (var oldIndex = oldRows.Count - 1; oldIndex >= 0; oldIndex--)
-        {
-            for (var newIndex = newRows.Count - 1; newIndex >= 0; newIndex--)
-            {
-                lengths[oldIndex, newIndex] = oldRows[oldIndex].Signature == newRows[newIndex].Signature
-                    ? lengths[oldIndex + 1, newIndex + 1] + 1
-                    : Math.Max(lengths[oldIndex + 1, newIndex], lengths[oldIndex, newIndex + 1]);
-            }
-        }
-
         var pairs = new List<SpreadsheetRowPair>();
-        var i = 0;
-        var j = 0;
-        while (i < oldRows.Count && j < newRows.Count)
+        var oldLines = oldRows.Select(row => StableRowHash(row.Signature)).ToArray();
+        var newLines = newRows.Select(row => StableRowHash(row.Signature)).ToArray();
+        var diff = new Differ().CreateLineDiffs(string.Join('\n', oldLines), string.Join('\n', newLines), false, false);
+        var oldCursor = 0;
+        var newCursor = 0;
+
+        foreach (var block in diff.DiffBlocks)
         {
-            if (oldRows[i].Signature == newRows[j].Signature)
+            while (oldCursor < block.DeleteStartA && newCursor < block.InsertStartB)
             {
-                pairs.Add(new SpreadsheetRowPair(oldRows[i], newRows[j], SpreadsheetDiffAlignmentKind.Weak));
-                i++;
-                j++;
+                if (oldLines[oldCursor] == newLines[newCursor])
+                {
+                    pairs.Add(new SpreadsheetRowPair(oldRows[oldCursor], newRows[newCursor], SpreadsheetDiffAlignmentKind.Weak));
+                }
+
+                oldCursor++;
+                newCursor++;
             }
-            else if (lengths[i + 1, j] >= lengths[i, j + 1])
+
+            oldCursor = block.DeleteStartA + block.DeleteCountA;
+            newCursor = block.InsertStartB + block.InsertCountB;
+        }
+
+        while (oldCursor < oldRows.Count && newCursor < newRows.Count)
+        {
+            if (oldLines[oldCursor] == newLines[newCursor])
             {
-                i++;
+                pairs.Add(new SpreadsheetRowPair(oldRows[oldCursor], newRows[newCursor], SpreadsheetDiffAlignmentKind.Weak));
             }
-            else
-            {
-                j++;
-            }
+
+            oldCursor++;
+            newCursor++;
         }
 
         return pairs;
-    }
-
-    private static IReadOnlyList<SpreadsheetRowPair> AlignUniqueSignatures(
-        IReadOnlyList<SpreadsheetDiffSourceRow> oldRows,
-        IReadOnlyList<SpreadsheetDiffSourceRow> newRows)
-    {
-        var oldUnique = oldRows
-            .GroupBy(row => row.Signature, StringComparer.Ordinal)
-            .Where(group => group.Count() == 1)
-            .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
-        var newUnique = newRows
-            .GroupBy(row => row.Signature, StringComparer.Ordinal)
-            .Where(group => group.Count() == 1)
-            .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
-        return oldUnique.Keys
-            .Intersect(newUnique.Keys, StringComparer.Ordinal)
-            .Select(key => new SpreadsheetRowPair(oldUnique[key], newUnique[key], SpreadsheetDiffAlignmentKind.Weak))
-            .ToList();
     }
 
     private static SpreadsheetDiffRow? CreateDiffRow(
@@ -340,7 +325,115 @@ internal static class ExcelDiffService
             cells);
     }
 
-    private static IReadOnlyList<SpreadsheetDiffSourceRow> BuildRows(IReadOnlyList<SpreadsheetMergeRawCell> rawCells)
+    private static SpreadsheetColumnAnalysis AnalyzeColumns(
+        IReadOnlyList<SpreadsheetMergeRawCell> oldCells,
+        IReadOnlyList<SpreadsheetMergeRawCell> newCells)
+    {
+        var oldColumns = BuildColumnInfos(oldCells);
+        var newColumns = BuildColumnInfos(newCells);
+        var changes = new List<SpreadsheetColumnChange>();
+        var keyMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var usedOld = new HashSet<SpreadsheetColumnInfo>();
+        var usedNew = new HashSet<SpreadsheetColumnInfo>();
+
+        var oldByScopedKey = oldColumns
+            .GroupBy(column => BuildScopedFieldKey(column.Sheet, column.FieldKey), StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+        var newByScopedKey = newColumns
+            .GroupBy(column => BuildScopedFieldKey(column.Sheet, column.FieldKey), StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+
+        foreach (var key in oldByScopedKey.Keys.Intersect(newByScopedKey.Keys, StringComparer.Ordinal))
+        {
+            usedOld.Add(oldByScopedKey[key]);
+            usedNew.Add(newByScopedKey[key]);
+        }
+
+        var unmatchedOld = oldColumns.Where(column => !usedOld.Contains(column)).ToList();
+        var unmatchedNew = newColumns.Where(column => !usedNew.Contains(column)).ToList();
+
+        foreach (var oldColumn in unmatchedOld.ToList())
+        {
+            var renamed = unmatchedNew
+                .Where(column =>
+                    string.Equals(column.Sheet, oldColumn.Sheet, StringComparison.Ordinal) &&
+                    !string.IsNullOrWhiteSpace(column.SampleSignature) &&
+                    string.Equals(column.SampleSignature, oldColumn.SampleSignature, StringComparison.Ordinal))
+                .OrderBy(column => Math.Abs(column.Column - oldColumn.Column))
+                .FirstOrDefault();
+            if (renamed == null)
+            {
+                continue;
+            }
+
+            usedOld.Add(oldColumn);
+            usedNew.Add(renamed);
+            unmatchedNew.Remove(renamed);
+            keyMap[BuildScopedFieldKey(renamed.Sheet, renamed.FieldKey)] = oldColumn.FieldKey;
+            changes.Add(new SpreadsheetColumnChange(
+                oldColumn.Sheet,
+                SpreadsheetColumnChangeKind.Renamed,
+                oldColumn.FieldName,
+                renamed.FieldName,
+                oldColumn.Column,
+                renamed.Column));
+        }
+
+        foreach (var oldColumn in oldColumns.Where(column => !usedOld.Contains(column)))
+        {
+            changes.Add(new SpreadsheetColumnChange(
+                oldColumn.Sheet,
+                SpreadsheetColumnChangeKind.Deleted,
+                oldColumn.FieldName,
+                "",
+                oldColumn.Column,
+                -1));
+        }
+
+        foreach (var newColumn in newColumns.Where(column => !usedNew.Contains(column)))
+        {
+            changes.Add(new SpreadsheetColumnChange(
+                newColumn.Sheet,
+                SpreadsheetColumnChangeKind.Added,
+                "",
+                newColumn.FieldName,
+                -1,
+                newColumn.Column));
+        }
+
+        return new SpreadsheetColumnAnalysis(changes, keyMap);
+    }
+
+    private static IReadOnlyList<SpreadsheetColumnInfo> BuildColumnInfos(IReadOnlyList<SpreadsheetMergeRawCell> cells)
+    {
+        return cells
+            .Where(cell => !string.IsNullOrWhiteSpace(cell.FieldName))
+            .GroupBy(cell => BuildScopedFieldKey(cell.Cell.Sheet, NormalizeFieldKey(cell.FieldName, cell.Cell.Column)), StringComparer.Ordinal)
+            .Select(group =>
+            {
+                var ordered = group.OrderBy(cell => cell.Cell.Row).ThenBy(cell => cell.Cell.Column).ToList();
+                var first = ordered.First();
+                var samples = ordered
+                    .Where(cell => cell.HasRowMergeKey)
+                    .OrderBy(cell => cell.Cell.Row)
+                    .Select(cell => NormalizeComparableValue(cell.Value))
+                    .Where(value => value.Length > 0)
+                    .Distinct(StringComparer.Ordinal)
+                    .Take(10)
+                    .ToList();
+                return new SpreadsheetColumnInfo(
+                    first.Cell.Sheet,
+                    NormalizeFieldKey(first.FieldName, first.Cell.Column),
+                    first.FieldName,
+                    first.Cell.Column,
+                    samples.Count == 0 ? "" : StableRowHash(string.Join("\u001f", samples)));
+            })
+            .ToList();
+    }
+
+    private static IReadOnlyList<SpreadsheetDiffSourceRow> BuildRows(
+        IReadOnlyList<SpreadsheetMergeRawCell> rawCells,
+        IReadOnlyDictionary<string, string> fieldKeyMap)
     {
         return rawCells
             .GroupBy(cell => cell.RowMergeKey, StringComparer.Ordinal)
@@ -348,7 +441,17 @@ internal static class ExcelDiffService
             {
                 var cells = group
                     .OrderBy(cell => cell.Cell.Column)
-                    .Select(cell => new SpreadsheetDiffSourceCell(cell, NormalizeFieldKey(cell.FieldName, cell.Cell.Column)))
+                    .Select(cell =>
+                    {
+                        var fieldKey = NormalizeFieldKey(cell.FieldName, cell.Cell.Column);
+                        var scopedKey = BuildScopedFieldKey(cell.Cell.Sheet, fieldKey);
+                        if (fieldKeyMap.TryGetValue(scopedKey, out var mappedFieldKey))
+                        {
+                            fieldKey = mappedFieldKey;
+                        }
+
+                        return new SpreadsheetDiffSourceCell(cell, fieldKey);
+                    })
                     .ToList();
                 var first = cells.First().Source;
                 var rowIds = group.Select(cell => cell.RowId).Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal).ToList();
@@ -471,6 +574,25 @@ internal static class ExcelDiffService
         return string.IsNullOrWhiteSpace(normalized) ? $"col_{column + 1}" : normalized;
     }
 
+    private static string BuildScopedFieldKey(string sheet, string fieldKey)
+    {
+        return $"{sheet}\u001f{fieldKey}";
+    }
+
+    private static string StableRowHash(string value)
+    {
+        const ulong offsetBasis = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        var hash = offsetBasis;
+        foreach (var character in value ?? "")
+        {
+            hash ^= character;
+            hash *= prime;
+        }
+
+        return hash.ToString("x16");
+    }
+
     private static ExcelCellDifference CreateDifference(
         SpreadsheetMergeRawCell? oldCell,
         SpreadsheetMergeRawCell? newCell,
@@ -591,54 +713,45 @@ internal static class ExcelDiffService
             return false;
         }
 
-        try
-        {
-            using var stream = File.OpenRead(filePath);
-            var document = XDocument.Load(stream, LoadOptions.None);
-            return document.Root?.Name.LocalName == "Workbook" &&
-                document.Root.Name.NamespaceName == "urn:schemas-microsoft-com:office:spreadsheet";
-        }
-        catch
-        {
-            return false;
-        }
+        return SpreadsheetXmlFormat.IsSpreadsheetXmlFile(filePath);
     }
 
     private static Dictionary<ExcelCellKey, string> ReadXmlSpreadsheetCells(string filePath)
     {
         var document = XDocument.Load(filePath, LoadOptions.PreserveWhitespace);
-        XNamespace spreadsheet = "urn:schemas-microsoft-com:office:spreadsheet";
         var cells = new Dictionary<ExcelCellKey, string>();
 
-        foreach (var worksheet in document.Root?.Elements(spreadsheet + "Worksheet") ?? Enumerable.Empty<XElement>())
+        foreach (var worksheet in document.Root == null
+            ? Enumerable.Empty<XElement>()
+            : SpreadsheetXmlFormat.Elements(document.Root, "Worksheet"))
         {
-            var sheetName = worksheet.Attribute(spreadsheet + "Name")?.Value ?? "Sheet";
-            var table = worksheet.Element(spreadsheet + "Table");
+            var sheetName = SpreadsheetXmlFormat.AttributeValue(worksheet, "Name") ?? "Sheet";
+            var table = SpreadsheetXmlFormat.Element(worksheet, "Table");
             if (table == null)
             {
                 continue;
             }
 
             var rowIndex = 0;
-            foreach (var row in table.Elements(spreadsheet + "Row"))
+            foreach (var row in SpreadsheetXmlFormat.Elements(table, "Row"))
             {
-                var explicitRowIndex = GetSpreadsheetIndex(row, spreadsheet);
+                var explicitRowIndex = GetSpreadsheetIndex(row);
                 if (explicitRowIndex.HasValue)
                 {
                     rowIndex = explicitRowIndex.Value - 1;
                 }
 
                 var columnIndex = 0;
-                foreach (var cell in row.Elements(spreadsheet + "Cell"))
+                foreach (var cell in SpreadsheetXmlFormat.Elements(row, "Cell"))
                 {
-                    var explicitColumnIndex = GetSpreadsheetIndex(cell, spreadsheet);
+                    var explicitColumnIndex = GetSpreadsheetIndex(cell);
                     if (explicitColumnIndex.HasValue)
                     {
                         columnIndex = explicitColumnIndex.Value - 1;
                     }
 
-                    var data = cell.Elements().FirstOrDefault(element => element.Name.LocalName == "Data");
-                    var value = NormalizeCellText(data?.Value ?? "");
+                    var data = SpreadsheetXmlFormat.Element(cell, "Data");
+                    var value = data == null ? "" : SpreadsheetXmlFormat.ReadCellText(data);
                     if (!string.IsNullOrEmpty(value))
                     {
                         cells[new ExcelCellKey(sheetName, rowIndex, columnIndex)] = value;
@@ -654,18 +767,10 @@ internal static class ExcelDiffService
         return cells;
     }
 
-    private static int? GetSpreadsheetIndex(XElement element, XNamespace spreadsheet)
+    private static int? GetSpreadsheetIndex(XElement element)
     {
-        var value = element.Attribute(spreadsheet + "Index")?.Value;
+        var value = SpreadsheetXmlFormat.AttributeValue(element, "Index");
         return int.TryParse(value, out var index) ? index : null;
-    }
-
-    private static string NormalizeCellText(string value)
-    {
-        return value
-            .Replace("\r\n", "\n", StringComparison.Ordinal)
-            .Replace('\r', '\n')
-            .Trim();
     }
 
     private static Dictionary<ExcelCellKey, string> ReadCells(IWorkbook workbook)
@@ -727,6 +832,17 @@ internal sealed record SpreadsheetRowPair(
     SpreadsheetDiffSourceRow? OldRow,
     SpreadsheetDiffSourceRow? NewRow,
     SpreadsheetDiffAlignmentKind AlignmentKind);
+
+internal sealed record SpreadsheetColumnAnalysis(
+    IReadOnlyList<SpreadsheetColumnChange> Changes,
+    IReadOnlyDictionary<string, string> NewFieldKeyToOldFieldKey);
+
+internal sealed record SpreadsheetColumnInfo(
+    string Sheet,
+    string FieldKey,
+    string FieldName,
+    int Column,
+    string SampleSignature);
 
 internal sealed record SpreadsheetDiffSourceRow(
     string Sheet,

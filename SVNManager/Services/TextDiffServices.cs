@@ -54,17 +54,7 @@ internal static class DiffFileKindDetector
             return false;
         }
 
-        try
-        {
-            using var stream = File.OpenRead(filePath);
-            var document = XDocument.Load(stream, LoadOptions.None);
-            return document.Root?.Name.LocalName == "Workbook" &&
-                document.Root.Name.NamespaceName == "urn:schemas-microsoft-com:office:spreadsheet";
-        }
-        catch
-        {
-            return false;
-        }
+        return SpreadsheetXmlFormat.IsSpreadsheetXmlFile(filePath);
     }
 }
 

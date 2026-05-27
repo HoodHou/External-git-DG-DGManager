@@ -104,18 +104,23 @@ public partial class Form1
             return;
         }
 
-        if (!Directory.Exists(Path.Combine(workingCopy, ".svn")))
-        {
-            items.Add(EnvironmentCheckItem.Error("工作副本", "不是 SVN 工作副本", "目录存在，但没有找到 .svn：" + workingCopy));
-            return;
-        }
-
         try
         {
-            var info = await Task.Run(() => _svn.GetWorkingCopyInfo(workingCopy));
+            var selectedInfo = await Task.Run(() => _svn.GetWorkingCopyInfo(workingCopy));
+            if (selectedInfo == WorkingCopyInfo.Empty)
+            {
+                items.Add(EnvironmentCheckItem.Error("工作副本", "不是 SVN 工作副本", "请选择 SVN 工作副本根目录或其子目录：" + workingCopy));
+                return;
+            }
+
+            var rootPath = ResolveWorkingCopyRootPath(workingCopy, selectedInfo);
+            var info = await Task.Run(() => _svn.GetWorkingCopyInfo(rootPath));
+            var scopeRelativePath = NormalizeRelativePath(GetRelativePathOrEmpty(rootPath, workingCopy));
             var detail = info == WorkingCopyInfo.Empty
                 ? workingCopy
-                : $"{info.DisplayContentRevisionText}  {info.Url}";
+                : $"{info.DisplayContentRevisionText}  {info.Url}" +
+                  (!string.IsNullOrWhiteSpace(scopeRelativePath) ? $"{Environment.NewLine}当前范围：{scopeRelativePath}" : "") +
+                  $"{Environment.NewLine}根目录：{rootPath}";
             items.Add(EnvironmentCheckItem.Ok("工作副本", "SVN 工作副本正常", detail));
         }
         catch (Exception ex)

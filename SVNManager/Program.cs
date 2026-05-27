@@ -13,6 +13,11 @@ static class Program
             return workerExitCode;
         }
 
+        if (DiffPlexProbe.TryRunFromCommandLine(args, out var probeExitCode))
+        {
+            return probeExitCode;
+        }
+
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, args) => HandleFatalException(args.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>

@@ -71,6 +71,7 @@ internal sealed class TextDiffForm : Form
             RowCount = 1,
             BackColor = Color.FromArgb(248, 249, 250),
         };
+        toolbar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
@@ -137,7 +138,9 @@ internal sealed class TextDiffForm : Form
             RowCount = 1,
             BackColor = Color.FromArgb(248, 250, 252),
             Padding = new Padding(0, 2, 0, 2),
+            Font = new Font("Microsoft YaHei UI", 9F),
         };
+        toolbar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
         toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 330));
@@ -168,21 +171,32 @@ internal sealed class TextDiffForm : Form
             FlatStyle = FlatStyle.Flat,
             BackColor = Color.White,
             ForeColor = Color.FromArgb(30, 41, 59),
+            Font = new Font("Microsoft YaHei UI", 9F),
+            TextAlign = ContentAlignment.MiddleCenter,
+            UseVisualStyleBackColor = false,
         };
+        applyButton.FlatAppearance.BorderSize = 1;
         applyButton.FlatAppearance.BorderColor = Color.FromArgb(203, 213, 225);
         var summaryLabel = new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.FromArgb(71, 85, 105),
+            Font = new Font("Microsoft YaHei UI", 9F),
+            Padding = new Padding(4, 0, 4, 0),
             Text = $"{currentContent.OldLabel}  ->  {currentContent.NewLabel}",
+            AutoEllipsis = true,
+            UseMnemonic = false,
         };
         var languageLabel = new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleRight,
             ForeColor = Color.FromArgb(100, 116, 139),
+            Font = new Font("Microsoft YaHei UI", 9F),
             Text = $"语言：{currentContent.Language}",
+            AutoEllipsis = true,
+            UseMnemonic = false,
         };
         toolbar.Controls.Add(unifiedButton, 0, 0);
         toolbar.Controls.Add(splitButton, 1, 0);
@@ -202,10 +216,14 @@ internal sealed class TextDiffForm : Form
             Form1.ClearControlsDisposing(host);
             control.Dock = DockStyle.Fill;
             host.Controls.Add(control);
+            unifiedButton.ForeColor = activeButton == unifiedButton ? Color.FromArgb(29, 78, 216) : Color.FromArgb(30, 41, 59);
+            splitButton.ForeColor = activeButton == splitButton ? Color.FromArgb(29, 78, 216) : Color.FromArgb(30, 41, 59);
             unifiedButton.Font = new Font(unifiedButton.Font, activeButton == unifiedButton ? FontStyle.Bold : FontStyle.Regular);
             splitButton.Font = new Font(splitButton.Font, activeButton == splitButton ? FontStyle.Bold : FontStyle.Regular);
             unifiedButton.BackColor = activeButton == unifiedButton ? Color.FromArgb(219, 234, 254) : Color.White;
             splitButton.BackColor = activeButton == splitButton ? Color.FromArgb(219, 234, 254) : Color.White;
+            unifiedButton.UseVisualStyleBackColor = false;
+            splitButton.UseVisualStyleBackColor = false;
         }
 
         DiffOptions BuildOptions()
@@ -260,12 +278,14 @@ internal sealed class TextDiffForm : Form
             AutoSize = true,
             Margin = new Padding(0, 8, 12, 0),
             ForeColor = Color.FromArgb(51, 65, 85),
+            Font = new Font("Microsoft YaHei UI", 9F),
+            UseVisualStyleBackColor = false,
         };
     }
 
     private static Button CreateDiffModeButton(string text)
     {
-        return new Button
+        var button = new Button
         {
             Text = text,
             Dock = DockStyle.Fill,
@@ -273,7 +293,11 @@ internal sealed class TextDiffForm : Form
             FlatStyle = FlatStyle.Flat,
             BackColor = Color.White,
             ForeColor = Color.FromArgb(30, 41, 59),
+            Font = new Font("Microsoft YaHei UI", 9F),
+            TextAlign = ContentAlignment.MiddleCenter,
+            UseVisualStyleBackColor = false,
         };
+        return button;
     }
 
     private static Control CreateSideBySideTextDiffView(TextDiffContent content)

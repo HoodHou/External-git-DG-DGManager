@@ -11,22 +11,25 @@ namespace SVNManager;
 internal sealed class SettingsForm : Form
 {
     private readonly TextBox _externalMergeToolText = new();
+    private readonly ComboBox _updateChannelBox = new();
 
     public SettingsForm(AppSettings settings)
     {
         Text = "设置";
         StartPosition = FormStartPosition.CenterParent;
         Width = 720;
-        Height = 220;
-        MinimumSize = new Size(600, 200);
+        Height = 290;
+        MinimumSize = new Size(600, 260);
 
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(12),
             ColumnCount = 1,
-            RowCount = 3,
+            RowCount = 5,
         };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -60,6 +63,35 @@ internal sealed class SettingsForm : Form
         pathRow.Controls.Add(clearButton, 2, 0);
         root.Controls.Add(pathRow, 0, 1);
 
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "工具更新通道",
+            Font = new Font(Font, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+        }, 0, 2);
+
+        var updateRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+        };
+        updateRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
+        updateRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        _updateChannelBox.Dock = DockStyle.Fill;
+        _updateChannelBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _updateChannelBox.Items.AddRange(new object[] { "stable", "beta" });
+        _updateChannelBox.SelectedItem = string.Equals(settings.UpdateChannel, "beta", StringComparison.OrdinalIgnoreCase) ? "beta" : "stable";
+        updateRow.Controls.Add(_updateChannelBox, 0, 0);
+        updateRow.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "stable 给普通用户使用；beta 用来先试用新包。",
+            ForeColor = SystemColors.GrayText,
+            TextAlign = ContentAlignment.MiddleLeft,
+        }, 1, 0);
+        root.Controls.Add(updateRow, 0, 3);
+
         var bottom = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -86,7 +118,7 @@ internal sealed class SettingsForm : Form
         buttons.Controls.Add(cancelButton);
         buttons.Controls.Add(okButton);
         bottom.Controls.Add(buttons, 1, 0);
-        root.Controls.Add(bottom, 0, 2);
+        root.Controls.Add(bottom, 0, 4);
 
         AcceptButton = okButton;
         CancelButton = cancelButton;
@@ -94,6 +126,7 @@ internal sealed class SettingsForm : Form
     }
 
     public string ExternalMergeToolPath => _externalMergeToolText.Text.Trim();
+    public string UpdateChannel => _updateChannelBox.SelectedItem?.ToString() == "beta" ? "beta" : "stable";
 
     private void BrowseExternalMergeTool()
     {

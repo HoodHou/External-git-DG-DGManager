@@ -42,7 +42,7 @@ public partial class Form1
         var tempBaseFile = DiffTempFileTracker.NewTempFile("SVNManager_BASE", extension);
         try
         {
-            var workingCopy = _configView.WorkingCopyPath.Trim();
+            var workingCopy = GetWorkingCopyRootPath();
             var localFile = Path.Combine(workingCopy, relativePath);
             var conflict = ConflictFileSet.Find(workingCopy, relativePath);
             if (conflict?.ServerPath != null)
@@ -94,7 +94,7 @@ public partial class Form1
 
     private async Task CompareLocalFileWithRemoteHeadAsync(string relativePath)
     {
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var localFile = Path.Combine(workingCopy, relativePath);
         if (!File.Exists(localFile))
         {
@@ -134,7 +134,7 @@ public partial class Form1
             return;
         }
 
-        var firstFile = Path.Combine(_configView.WorkingCopyPath.Trim(), relativePath);
+        var firstFile = Path.Combine(GetWorkingCopyRootPath(), relativePath);
         if (!File.Exists(firstFile))
         {
             MessageBox.Show("选中的本地文件不存在，无法快速比对。", "无法比对", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -169,7 +169,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var tempVersionFile = "";
         SetBusy(true, "正在准备历史表格版本...");
         try
@@ -233,11 +233,11 @@ public partial class Form1
             : SvnConflictArtifact.NormalizeToBasePath(forcedRelativePath);
         if (string.IsNullOrWhiteSpace(relativePath))
         {
-            MessageBox.Show("请先选中一个 XML / Excel 表格文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("请先选中一个 XML / Excel 文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var localFile = Path.Combine(workingCopy, relativePath);
         if (!File.Exists(localFile))
         {
@@ -245,13 +245,21 @@ public partial class Form1
             return;
         }
 
-        if (!SpreadsheetThreeWayMergeService.IsSupportedPath(localFile))
+        var selectedChange = GetSelectedChange();
+        var conflictForSupport = ConflictFileSet.Find(workingCopy, relativePath);
+        var supportProbeFile = conflictForSupport?.MinePath ?? localFile;
+        if (!SpreadsheetThreeWayMergeService.IsSupportedPath(supportProbeFile))
         {
-            MessageBox.Show("内置三方合并当前支持 .xls / .xlsx / .xlsm / SpreadsheetML XML 表格。", "文件类型不适合", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            if (XmlThreeWayMergeService.IsSupportedPath(supportProbeFile))
+            {
+                await RunInternalXmlMergeAsync(relativePath, selectedChange);
+                return;
+            }
+
+            MessageBox.Show("内置三方合并当前支持 .xls / .xlsx / .xlsm / SpreadsheetML XML 表格，以及普通业务 XML。", "文件类型不适合", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        var selectedChange = GetSelectedChange();
         if (selectedChange?.Status is SvnStatusKind.Unversioned or SvnStatusKind.Added)
         {
             MessageBox.Show("这是新增文件，没有 SVN BASE 版本可做三方合并。", "无法合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -260,24 +268,45 @@ public partial class Form1
 
         if (selectedChange?.Status is SvnStatusKind.Missing or SvnStatusKind.Deleted)
         {
-            MessageBox.Show("本地文件不存在或已删除，无法执行表格合并。", "无法合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("本地文件不存在或已删除，无法执行三方合并。", "无法合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
         var extension = GetComparableExtension(relativePath);
         var tempBaseFile = DiffTempFileTracker.NewTempFile("SVNManager_MERGE_BASE", extension);
         var tempRemoteFile = DiffTempFileTracker.NewTempFile("SVNManager_MERGE_HEAD", extension);
-        var wasConflict = selectedChange?.Status == SvnStatusKind.Conflicted || ConflictFileSet.Find(workingCopy, relativePath) != null;
+        var conflict = conflictForSupport;
+        var wasConflict = selectedChange?.Status == SvnStatusKind.Conflicted || conflict != null;
+        var localMergeInput = conflict?.MinePath ?? localFile;
 
         SetBusy(true, "正在准备内置表格三方合并...");
         try
         {
-            await _svn.WriteBaseFileAsync(workingCopy, relativePath, tempBaseFile);
-            await _svn.WriteHeadFileAsync(workingCopy, relativePath, tempRemoteFile);
-            var plan = await SpreadsheetMergeWorker.BuildPlanAsync(tempBaseFile, localFile, tempRemoteFile);
+            if (conflict?.BasePath != null && conflict.ServerPath != null)
+            {
+                File.Copy(conflict.BasePath, tempBaseFile, true);
+                File.Copy(conflict.ServerPath, tempRemoteFile, true);
+            }
+            else
+            {
+                await _svn.WriteBaseFileAsync(workingCopy, relativePath, tempBaseFile);
+                await _svn.WriteHeadFileAsync(workingCopy, relativePath, tempRemoteFile);
+            }
+
+            var plan = await SpreadsheetMergeWorker.BuildPlanAsync(tempBaseFile, localMergeInput, tempRemoteFile);
             if (plan.RelevantChangeCount == 0)
             {
-                MessageBox.Show("BASE、本地和远端 HEAD 没有需要合并的表格差异。", "无需合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                if (conflict != null)
+                {
+                    var restoredBackupPath = RestoreConflictMineToWorkingFile(localFile, localMergeInput);
+                    WriteOutput($"内置三方合并未发现表格差异，已用本地 .mine 恢复工作副本：{relativePath}\r\n备份：{restoredBackupPath}");
+                    await OfferResolveAfterInternalMergeAsync(relativePath, wasConflict);
+                }
+                else
+                {
+                    MessageBox.Show("BASE、本地和远端 HEAD 没有需要合并的表格差异。", "无需合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+
                 return;
             }
 
@@ -302,11 +331,22 @@ public partial class Form1
             if (writes.Count == 0)
             {
                 MessageBox.Show("当前选择全部保留本地，没有需要写入工作副本的远端表格改动。", "无需写入", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                if (conflict != null)
+                {
+                    var restoredBackupPath = RestoreConflictMineToWorkingFile(localFile, localMergeInput);
+                    WriteOutput($"已保留本地 .mine 作为合并结果：{relativePath}\r\n备份：{restoredBackupPath}");
+                }
+
                 await OfferResolveAfterInternalMergeAsync(relativePath, wasConflict);
                 return;
             }
 
             var backupPath = SpreadsheetThreeWayMergeService.CreateBackup(localFile);
+            if (conflict != null)
+            {
+                File.Copy(localMergeInput, localFile, true);
+            }
+
             await SpreadsheetMergeWorker.ApplyWritesAsync(localFile, writes);
             OperationLogger.Log("InternalSpreadsheetMergeSuccess", workingCopy, $"{relativePath}; writes={writes.Count}; backup={backupPath}");
             WriteOutput($"内置三方合并已写入 {writes.Count} 个单元格：{relativePath}\r\n备份：{backupPath}");
@@ -328,6 +368,112 @@ public partial class Form1
         }
     }
 
+    private async Task RunInternalXmlMergeAsync(string relativePath, SvnChange? selectedChange)
+    {
+        var workingCopy = GetWorkingCopyRootPath();
+        var localFile = Path.Combine(workingCopy, relativePath);
+        if (selectedChange?.Status is SvnStatusKind.Unversioned or SvnStatusKind.Added)
+        {
+            MessageBox.Show("这是新增文件，没有 SVN BASE 版本可做三方合并。", "无法合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (selectedChange?.Status is SvnStatusKind.Missing or SvnStatusKind.Deleted)
+        {
+            MessageBox.Show("本地文件不存在或已删除，无法执行 XML 合并。", "无法合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var extension = GetComparableExtension(relativePath);
+        var tempBaseFile = DiffTempFileTracker.NewTempFile("SVNManager_XML_MERGE_BASE", extension);
+        var tempRemoteFile = DiffTempFileTracker.NewTempFile("SVNManager_XML_MERGE_HEAD", extension);
+        var conflict = ConflictFileSet.Find(workingCopy, relativePath);
+        var wasConflict = selectedChange?.Status == SvnStatusKind.Conflicted || conflict != null;
+        var localMergeInput = conflict?.MinePath ?? localFile;
+
+        SetBusy(true, "正在准备普通 XML 三方合并...");
+        try
+        {
+            if (conflict?.BasePath != null && conflict.ServerPath != null)
+            {
+                File.Copy(conflict.BasePath, tempBaseFile, true);
+                File.Copy(conflict.ServerPath, tempRemoteFile, true);
+            }
+            else
+            {
+                await _svn.WriteBaseFileAsync(workingCopy, relativePath, tempBaseFile);
+                await _svn.WriteHeadFileAsync(workingCopy, relativePath, tempRemoteFile);
+            }
+
+            var plan = await Task.Run(() => XmlThreeWayMergeService.BuildPlan(tempBaseFile, localMergeInput, tempRemoteFile));
+            if (plan.RelevantChangeCount == 0)
+            {
+                if (conflict != null)
+                {
+                    var restoredBackupPath = RestoreConflictMineToWorkingFile(localFile, localMergeInput);
+                    WriteOutput($"普通 XML 三方合并未发现结构差异，已用本地 .mine 恢复工作副本：{relativePath}\r\n备份：{restoredBackupPath}");
+                    await OfferResolveAfterInternalMergeAsync(relativePath, wasConflict);
+                }
+                else
+                {
+                    MessageBox.Show("BASE、本地和远端 HEAD 没有需要合并的 XML 结构差异。", "无需合并", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+
+                return;
+            }
+
+            SetBusy(false, "等待确认 XML 合并项目");
+            using (var form = new XmlMergeConflictForm(relativePath, plan, "本地", "远端 HEAD", "写入工作副本"))
+            {
+                if (form.ShowDialog(this) != DialogResult.OK)
+                {
+                    WriteOutput($"已取消普通 XML 三方合并：{relativePath}");
+                    return;
+                }
+            }
+
+            SetBusy(true, "正在写入 XML 合并结果...");
+            var actions = plan.BuildActions();
+            if (actions.Count == 0)
+            {
+                MessageBox.Show("当前选择全部保留本地，没有需要写入工作副本的远端 XML 改动。", "无需写入", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                if (conflict != null)
+                {
+                    var restoredBackupPath = RestoreConflictMineToWorkingFile(localFile, localMergeInput);
+                    WriteOutput($"已保留本地 .mine 作为 XML 合并结果：{relativePath}\r\n备份：{restoredBackupPath}");
+                }
+
+                await OfferResolveAfterInternalMergeAsync(relativePath, wasConflict);
+                return;
+            }
+
+            var backupPath = SpreadsheetThreeWayMergeService.CreateBackup(localFile);
+            if (conflict != null)
+            {
+                File.Copy(localMergeInput, localFile, true);
+            }
+
+            await Task.Run(() => XmlThreeWayMergeService.ApplyActions(localFile, actions));
+            OperationLogger.Log("InternalXmlMergeSuccess", workingCopy, $"{relativePath}; actions={actions.Count}; backup={backupPath}");
+            WriteOutput($"普通 XML 三方合并已写入 {actions.Count} 项改动：{relativePath}\r\n备份：{backupPath}");
+            await OfferResolveAfterInternalMergeAsync(relativePath, wasConflict);
+            await RefreshStatusAsync();
+            LoadAllFiles();
+            await LoadRepositoryHistoryAsync();
+        }
+        catch (Exception ex)
+        {
+            OperationLogger.Log("InternalXmlMergeFailed", workingCopy, $"{relativePath}; {ex.Message}");
+            ShowError(ex);
+        }
+        finally
+        {
+            TryDelete(tempBaseFile);
+            TryDelete(tempRemoteFile);
+            SetBusy(false, "就绪");
+        }
+    }
+
     private async Task RunCrossRepositorySpreadsheetMergeAsync()
     {
         var defaultTargetFile = "";
@@ -336,7 +482,7 @@ public partial class Form1
             var relativePath = GetSelectedRelativePath();
             if (!string.IsNullOrWhiteSpace(relativePath))
             {
-                var candidate = Path.Combine(_configView.WorkingCopyPath.Trim(), relativePath);
+                var candidate = Path.Combine(GetWorkingCopyRootPath(), relativePath);
                 if (File.Exists(candidate))
                 {
                     defaultTargetFile = candidate;
@@ -399,7 +545,7 @@ public partial class Form1
 
             var backupPath = SpreadsheetThreeWayMergeService.CreateBackup(targetFile);
             await SpreadsheetMergeWorker.ApplyWritesAsync(targetFile, writes);
-            OperationLogger.Log("CrossRepositorySpreadsheetMergeSuccess", _configView.WorkingCopyPath.Trim(), $"{targetFile}; writes={writes.Count}; backup={backupPath}");
+            OperationLogger.Log("CrossRepositorySpreadsheetMergeSuccess", GetWorkingCopyRootPath(), $"{targetFile}; writes={writes.Count}; backup={backupPath}");
             WriteOutput(
                 $"跨库表格三方合并已写入 {writes.Count} 个单元格到目标 C：{targetFile}\r\n" +
                 $"A 改动前：{baseFile}\r\n" +
@@ -414,7 +560,7 @@ public partial class Form1
         }
         catch (Exception ex)
         {
-            OperationLogger.Log("CrossRepositorySpreadsheetMergeFailed", _configView.WorkingCopyPath.Trim(), $"{targetFile}; {ex.Message}");
+            OperationLogger.Log("CrossRepositorySpreadsheetMergeFailed", GetWorkingCopyRootPath(), $"{targetFile}; {ex.Message}");
             ShowError(ex);
         }
         finally
@@ -466,7 +612,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var tempBaseFile = CreateHistoryOpenTempPath($"r{firstRevision - 1}_before", file.TreePath);
         var tempChangedFile = CreateHistoryOpenTempPath($"r{lastRevision}_after", file.TreePath);
         SetBusy(true, "正在准备所选提交范围的三方合并...");
@@ -657,7 +803,7 @@ public partial class Form1
 
     private bool IsCurrentWorkingCopyFile(string filePath)
     {
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         if (string.IsNullOrWhiteSpace(workingCopy) || !Directory.Exists(workingCopy))
         {
             return false;
@@ -701,7 +847,7 @@ public partial class Form1
         }
 
         var confirm = MessageBox.Show(
-            $"表格合并结果已经保存到工作副本。是否现在执行 svn resolve --accept working？{Environment.NewLine}{Environment.NewLine}{relativePath}",
+            $"合并结果已经保存到工作副本。是否现在执行 svn resolve --accept working？{Environment.NewLine}{Environment.NewLine}{relativePath}",
             "标记冲突已解决",
             MessageBoxButtons.OKCancel,
             MessageBoxIcon.Question);
@@ -709,6 +855,13 @@ public partial class Form1
         {
             await ResolveConflictPathCoreAsync(relativePath);
         }
+    }
+
+    private static string RestoreConflictMineToWorkingFile(string localFile, string mineFile)
+    {
+        var backupPath = SpreadsheetThreeWayMergeService.CreateBackup(localFile);
+        File.Copy(mineFile, localFile, true);
+        return backupPath;
     }
 
 
@@ -729,7 +882,7 @@ public partial class Form1
         SetBusy(true, "正在准备外部对比...");
         try
         {
-            var workingCopy = _configView.WorkingCopyPath.Trim();
+            var workingCopy = GetWorkingCopyRootPath();
             var conflict = ConflictFileSet.Find(workingCopy, relativePath);
             if (conflict != null)
             {
@@ -800,7 +953,7 @@ public partial class Form1
         {
             if (_historyView.SelectedLog?.IsUncommitted == true && file.Action == "C")
             {
-                var conflict = ConflictFileSet.Find(_configView.WorkingCopyPath.Trim(), file.RelativePath);
+                var conflict = ConflictFileSet.Find(GetWorkingCopyRootPath(), file.RelativePath);
                 if (conflict != null)
                 {
                     LaunchExternalConflictCompare(conflict);
@@ -810,7 +963,7 @@ public partial class Form1
 
             var oldTemp = CreateExternalTempPath("OLD", file.TreePath);
             var newTemp = CreateExternalTempPath("NEW", file.TreePath);
-            var workingCopy = _configView.WorkingCopyPath.Trim();
+            var workingCopy = GetWorkingCopyRootPath();
             if (_historyView.SelectedLogs.Count > 1)
             {
                 var committedLogs = _historyView.SelectedLogs.Where(log => !log.IsUncommitted).OrderBy(log => log.Revision).ToList();
@@ -902,7 +1055,7 @@ public partial class Form1
         }
 
         Process.Start(startInfo);
-        OperationLogger.Log("OpenExternalMergeTool", _configView.WorkingCopyPath.Trim(), string.Join(" | ", filePaths));
+        OperationLogger.Log("OpenExternalMergeTool", GetWorkingCopyRootPath(), string.Join(" | ", filePaths));
         return true;
     }
 
@@ -1064,7 +1217,7 @@ public partial class Form1
         SetBusy(true, "正在读取文件差异...");
         try
         {
-            var workingCopy = _configView.WorkingCopyPath.Trim();
+            var workingCopy = GetWorkingCopyRootPath();
             var title = "";
             var cacheKey = "";
             if (_historyView.SelectedLogs.Count > 1)
@@ -1281,7 +1434,7 @@ public partial class Form1
 
     private string BuildHistoryDiffCacheKey(string scope, ChangedFileEntry file, long oldRevision, long newRevision, params string[] stamps)
     {
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var repository = _configView.RepositoryUrl.Trim();
         return string.Join("|",
             "history",

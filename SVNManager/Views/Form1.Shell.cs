@@ -403,7 +403,7 @@ public partial class Form1
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("查看改动", null, async (_, _) => await RefreshStatusAsync());
         _moreActionsMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
-        _moreActionsMenu.Items.Add("内置表格三方合并", null, async (_, _) => await RunInternalSpreadsheetMergeAsync());
+        _moreActionsMenu.Items.Add("内置三方合并", null, async (_, _) => await RunInternalSpreadsheetMergeAsync());
         _moreActionsMenu.Items.Add("跨库表格三方合并", null, async (_, _) => await RunCrossRepositorySpreadsheetMergeAsync());
         _moreActionsMenu.Items.Add("外部对比/合并", null, async (_, _) => await RunExternalCompareOrMergeAsync());
         _moreActionsMenu.Items.Add("冲突处理", null, async (_, _) => await RunConflictWorkflowAsync());
@@ -894,7 +894,7 @@ public partial class Form1
 
     private void ShowError(Exception ex)
     {
-        OperationLogger.Log("Error", _configView.WorkingCopyPath.Trim(), ex.ToString());
+        OperationLogger.Log("Error", GetWorkingCopyRootPath(), ex.ToString());
         WriteOutput(ex.ToString());
         MessageBox.Show(this, ex.Message, "操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }

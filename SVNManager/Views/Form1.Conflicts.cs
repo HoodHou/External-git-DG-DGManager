@@ -62,7 +62,7 @@ public partial class Form1
         await Task.Yield();
         try
         {
-            var workingCopy = _configView.WorkingCopyPath.Trim();
+            var workingCopy = GetWorkingCopyRootPath();
             var conflict = ConflictFileSet.Find(workingCopy, relativePath);
             if (conflict == null)
             {
@@ -209,8 +209,9 @@ public partial class Form1
 
     private async Task ResolveConflictPathCoreAsync(string relativePath)
     {
-        var result = await _svn.ResolveAsync(_configView.WorkingCopyPath.Trim(), relativePath);
-        OperationLogger.Log(result.ExitCode == 0 ? "ResolveConflictSuccess" : "ResolveConflictFailed", _configView.WorkingCopyPath.Trim(), relativePath);
+        var workingCopy = GetWorkingCopyRootPath();
+        var result = await _svn.ResolveAsync(workingCopy, relativePath);
+        OperationLogger.Log(result.ExitCode == 0 ? "ResolveConflictSuccess" : "ResolveConflictFailed", workingCopy, relativePath);
         WriteOutput(result.CombinedOutput);
         await RefreshStatusAsync();
         LoadAllFiles();
@@ -219,7 +220,7 @@ public partial class Form1
 
     private ConflictFileSet? FindConflictOrWarn(string relativePath)
     {
-        var conflict = ConflictFileSet.Find(_configView.WorkingCopyPath.Trim(), relativePath);
+        var conflict = ConflictFileSet.Find(GetWorkingCopyRootPath(), relativePath);
         if (conflict == null)
         {
             MessageBox.Show("没有找到 .mine / .r版本号 冲突辅助文件。请确认选中的是 SVN 冲突文件。", "不是冲突文件", MessageBoxButtons.OK, MessageBoxIcon.Information);

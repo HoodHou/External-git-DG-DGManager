@@ -4,19 +4,23 @@
 
 ## 软件更新
 
-- 软件启动时会检查 GitHub 最新 Release。
+- 软件启动时会优先读取仓库根目录的 `update.json` 更新清单，默认使用 `stable` 通道。
+- `update.json` 会提供版本号、Release zip 下载地址、SHA256 和更新说明；软件下载后会先校验 SHA256，校验失败不会安装。
+- 如果更新清单不可用，软件仍会回退检查 GitHub 最新 Release。
 - 如果发现新版本，状态栏会显示“工具有新版本”。
 - 点击状态栏提示，或点击“更多操作 -> 检查工具更新”，会打开更新面板。
-- 更新面板会显示当前版本、GitHub 最新版本、更新说明和下载文件。
+- 更新面板会显示当前版本、最新版本、更新通道、SHA256、更新说明和下载文件。
 - 点击“下载并更新”后，软件会下载 Release zip，关闭当前程序，覆盖当前目录，然后自动重启。
 - 开发环境下如果运行目录能找到 `.git`，仍支持通过 `git pull` 更新源码。
+- 在“更多操作 -> 设置”里可以把更新通道切到 `beta`，用于少量人员先试用新包。
 
 发布新版本时需要：
 
 1. 修改 `SVNManager/SVNManager.csproj` 里的 `Version` / `AssemblyVersion` / `FileVersion` / `InformationalVersion`。
-2. 运行 `.\Publish-Release.ps1`，脚本会用 Release 配置生成 Windows x64 发布目录和 zip。
+2. 运行 `.\Publish-Release.ps1`，脚本会用 Release 配置生成 Windows x64 发布目录、zip、SHA256，并更新 `update.json`。
 3. 在 GitHub 创建新的 Release，例如 `v0.1.1`。
 4. 把 zip 作为 Release 附件上传，文件名建议包含 `win-x64`，例如 `DreamSVNManager-win-x64-v0.1.1.zip`。
+5. 提交并推送更新后的 `update.json`，客户端才会通过 stable/beta 清单发现新版本。
 
 用户不需要每 10 分钟检查。软件只在启动时自动检查一次；之后用户可以手动点“检查工具更新”。
 

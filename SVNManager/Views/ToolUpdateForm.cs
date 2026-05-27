@@ -39,7 +39,7 @@ internal sealed class ToolUpdateForm : Form
             RowCount = 5,
         };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 128));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
@@ -136,8 +136,11 @@ internal sealed class ToolUpdateForm : Form
         };
         var info =
             $"当前版本：{status.CurrentVersion}{Environment.NewLine}" +
-            $"GitHub 最新：{(string.IsNullOrWhiteSpace(status.LatestTag) ? "未知" : status.LatestTag)}{Environment.NewLine}" +
+            $"最新版本：{(string.IsNullOrWhiteSpace(status.LatestTag) ? "未知" : status.LatestTag)}{Environment.NewLine}" +
+            $"更新通道：{status.Channel} / {status.Source}{Environment.NewLine}" +
+            $"强制更新：{(status.Required ? "是" : "否")}{Environment.NewLine}" +
             $"下载文件：{(string.IsNullOrWhiteSpace(status.AssetName) ? "未找到" : status.AssetName)}{Environment.NewLine}" +
+            $"SHA256：{(string.IsNullOrWhiteSpace(status.Sha256) ? "未提供" : status.Sha256)}{Environment.NewLine}" +
             $"安装目录：{AppContext.BaseDirectory}";
         var notes = status.State == ReleaseUpdateState.Unavailable
             ? status.Message

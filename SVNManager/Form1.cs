@@ -59,6 +59,8 @@ public partial class Form1 : Form
     private CancellationTokenSource? _fileTreeLoadCts;
     private readonly DiffPreviewCache _historyDiffPreviewCache;
     private CancellationTokenSource? _historyDiffPreviewCts;
+    private WorkingCopyContext? _workingCopyContextCache;
+    private string? _workingCopyContextCachePath;
     private const int InitialHistoryLimit = 80;
     private const int HistoryLoadMoreStep = 200;
     private const int HistoryDeepSearchLimit = 1000;

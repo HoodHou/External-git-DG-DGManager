@@ -4,16 +4,46 @@ namespace SVNManager;
 
 internal sealed record SpreadsheetDiffReport(IReadOnlyList<SpreadsheetDiffRow> Rows)
 {
+    public IReadOnlyList<SpreadsheetColumnChange> ColumnChanges { get; init; } = [];
     public int ChangedRowCount => Rows.Count;
     public int ModifiedRowCount => Rows.Count(row => row.ChangeKind == SpreadsheetDiffChangeKind.Modified);
     public int AddedRowCount => Rows.Count(row => row.ChangeKind == SpreadsheetDiffChangeKind.Added);
     public int DeletedRowCount => Rows.Count(row => row.ChangeKind == SpreadsheetDiffChangeKind.Deleted);
     public int WeakAlignedRowCount => Rows.Count(row => row.AlignmentKind == SpreadsheetDiffAlignmentKind.Weak);
     public int ChangedCellCount => Rows.Sum(row => row.ChangedCells.Count);
+    public int RenamedColumnCount => ColumnChanges.Count(change => change.Kind == SpreadsheetColumnChangeKind.Renamed);
+    public int AddedColumnCount => ColumnChanges.Count(change => change.Kind == SpreadsheetColumnChangeKind.Added);
+    public int DeletedColumnCount => ColumnChanges.Count(change => change.Kind == SpreadsheetColumnChangeKind.Deleted);
+    public string ColumnChangesSummary
+    {
+        get
+        {
+            if (ColumnChanges.Count == 0)
+            {
+                return "";
+            }
+
+            var samples = ColumnChanges
+                .Take(3)
+                .Select(change => change.Kind switch
+                {
+                    SpreadsheetColumnChangeKind.Renamed => $"{change.OldFieldName}→{change.NewFieldName}",
+                    SpreadsheetColumnChangeKind.Added => $"+{change.NewFieldName}",
+                    SpreadsheetColumnChangeKind.Deleted => $"-{change.OldFieldName}",
+                    _ => "",
+                })
+                .Where(text => !string.IsNullOrWhiteSpace(text))
+                .ToList();
+            return string.Join("，", samples) + (ColumnChanges.Count > samples.Count ? $" 等 {ColumnChanges.Count} 项" : "");
+        }
+    }
 
     public string Summary => ChangedRowCount == 0
-        ? "没有发现表格差异"
-        : $"发现 {ChangedRowCount} 行 / {ChangedCellCount} 个字段差异";
+        ? ColumnChanges.Count == 0
+            ? "没有发现表格差异"
+            : $"发现 {ColumnChanges.Count} 个列结构变化：{ColumnChangesSummary}"
+        : $"发现 {ChangedRowCount} 行 / {ChangedCellCount} 个字段差异" +
+            (ColumnChanges.Count == 0 ? "" : $"，列变化 {ColumnChanges.Count}（{ColumnChangesSummary}）");
 
     public IReadOnlyList<ExcelCellDifference> ToLegacyDifferences()
     {
@@ -87,6 +117,21 @@ internal sealed record SpreadsheetDiffReport(IReadOnlyList<SpreadsheetDiffRow> R
     }
 }
 
+internal sealed record SpreadsheetColumnChange(
+    string Sheet,
+    SpreadsheetColumnChangeKind Kind,
+    string OldFieldName,
+    string NewFieldName,
+    int OldColumn,
+    int NewColumn);
+
+internal enum SpreadsheetColumnChangeKind
+{
+    Renamed,
+    Added,
+    Deleted,
+}
+
 internal sealed record SpreadsheetDiffRow(
     string Sheet,
     string DisplayKey,
@@ -103,6 +148,19 @@ internal sealed record SpreadsheetDiffRow(
     public string OldAddress => OldRow >= 0 ? $"行 {OldRow + 1}" : "";
     public string NewAddress => NewRow >= 0 ? $"行 {NewRow + 1}" : "";
     public string AddressText => OldAddress == NewAddress ? OldAddress : $"{OldAddress} -> {NewAddress}".Trim(' ', '-', '>');
+    public string CompactDisplayKey
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(DisplayKey))
+            {
+                return RowMergeKey;
+            }
+
+            var slashIndex = DisplayKey.IndexOf('/');
+            return slashIndex > 0 ? DisplayKey[..slashIndex] : DisplayKey;
+        }
+    }
 
     public string ChangedFieldsSummary
     {
@@ -119,6 +177,17 @@ internal sealed record SpreadsheetDiffRow(
                 .Select(cell => $"{cell.FieldName}{SpreadsheetDiffCellKindLabels.Short(cell.Kind)}")
                 .ToList();
             return string.Join("，", names) + (changed.Count > 5 ? $" 等 {changed.Count} 项" : "");
+        }
+    }
+
+    public string CardSummary
+    {
+        get
+        {
+            var key = string.IsNullOrWhiteSpace(CompactDisplayKey) ? "(无 ID)" : CompactDisplayKey;
+            var firstLine = $"{key} · {AddressText} · {SpreadsheetDiffAlignmentKindLabels.Text(AlignmentKind)} · {SpreadsheetDiffChangeKindLabels.Text(ChangeKind)}";
+            var secondLine = ChangedFieldsSummary;
+            return string.IsNullOrWhiteSpace(Sheet) ? $"{firstLine}{Environment.NewLine}{secondLine}" : $"{firstLine} · {Sheet}{Environment.NewLine}{secondLine}";
         }
     }
 }

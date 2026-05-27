@@ -33,10 +33,11 @@ public partial class Form1
         }
 
         _settings.ExternalMergeToolPath = form.ExternalMergeToolPath;
+        _settings.UpdateChannel = form.UpdateChannel;
         _settings.Save();
         WriteOutput(string.IsNullOrWhiteSpace(_settings.ExternalMergeToolPath)
-            ? "已清空分久必合路径。"
-            : $"已保存分久必合路径：{_settings.ExternalMergeToolPath}");
+            ? $"已清空分久必合路径；工具更新通道：{_settings.UpdateChannel}。"
+            : $"已保存分久必合路径：{_settings.ExternalMergeToolPath}；工具更新通道：{_settings.UpdateChannel}。");
     }
 
     private void ShowRepositoryManagerDialog()
@@ -76,7 +77,7 @@ public partial class Form1
         var workingCopy = _configView.WorkingCopyPath.Trim();
         if (Directory.Exists(workingCopy) && Directory.EnumerateFileSystemEntries(workingCopy).Any())
         {
-            if (Directory.Exists(Path.Combine(workingCopy, ".svn")))
+            if (TryGetWorkingCopyContext() != null)
             {
                 SaveCurrentRepository();
                 WriteOutput($"已保存已有 SVN 工作副本：{workingCopy}");
@@ -105,8 +106,9 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
-        var preflightChanges = await _svn.GetStatusAsync(workingCopy);
+        var context = GetRequiredWorkingCopyContext();
+        var workingCopy = context.SelectedPath;
+        var preflightChanges = FilterChangesForCurrentScope(await _svn.GetStatusAsync(context.RootPath));
         if (!ConfirmUpdateWithLocalChanges(preflightChanges))
         {
             OperationLogger.Log("UpdateCancelled", workingCopy, $"localChanges={preflightChanges.Count}");
@@ -163,24 +165,6 @@ public partial class Form1
 
         MessageBox.Show("请填写 SVN 地址。", "缺少 SVN 地址", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         return false;
-    }
-
-    private bool ValidateWorkingCopyPath(bool allowMissing = false)
-    {
-        var path = _configView.WorkingCopyPath.Trim();
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            MessageBox.Show("请先选择本地目录。", "缺少本地目录", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return false;
-        }
-
-        if (!allowMissing && !Directory.Exists(path))
-        {
-            MessageBox.Show("本地目录不存在。", "目录错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return false;
-        }
-
-        return true;
     }
 
     private void SaveSettings()

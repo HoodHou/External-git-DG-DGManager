@@ -1,0 +1,13 @@
+{
+  "stable": {
+    "version": "0.3.2",
+    "tag": "v0.3.2",
+    "assetName": "DreamSVNManager-win-x64-v0.3.2.zip",
+    "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.2/DreamSVNManager-win-x64-v0.3.2.zip",
+    "sha256": "",
+    "required": false,
+    "notes": "修复 XML / 表格三方合并写回格式问题；支持 XML 冲突文件使用 .mine/.r 版本进行内置合并；新增合并风险概览。",
+    "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.2",
+    "publishedAt": "2026-05-27"
+  }
+}

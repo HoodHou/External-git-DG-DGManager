@@ -77,7 +77,7 @@ public partial class Form1
 
     private async Task ShowFileHistoryWindowAsync(IReadOnlyList<string> relativePaths)
     {
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var logs = await _svn.GetLogAsync(workingCopy, relativePaths, 80);
         using var form = new FileHistoryForm(workingCopy, relativePaths, logs, _svn);
         form.ShowDialog(this);
@@ -100,7 +100,7 @@ public partial class Form1
         SetBusy(true, $"正在读取仓库历史（最近 {requestedLimit} 条）...");
         try
         {
-            var logs = await _svn.GetRepositoryLogAsync(_configView.WorkingCopyPath.Trim(), requestedLimit);
+            var logs = FilterLogsForCurrentScope(await _svn.GetRepositoryLogAsync(GetRequiredWorkingCopyContext().SelectedPath, requestedLimit));
             _latestRemoteLog = logs.FirstOrDefault(log => !log.IsUncommitted);
             FillHistoryList(logs);
             UpdateHistoryBadge(logs.Count);
@@ -160,7 +160,7 @@ public partial class Form1
         SetBusy(true, $"正在读取版本范围 r{start}-r{end}...");
         try
         {
-            var rangeLogs = await _svn.GetRepositoryLogRangeAsync(_configView.WorkingCopyPath.Trim(), start, end, rangeLimit);
+            var rangeLogs = FilterLogsForCurrentScope(await _svn.GetRepositoryLogRangeAsync(GetRequiredWorkingCopyContext().SelectedPath, start, end, rangeLimit));
             var mergedLogs = _historyView.HistoryRows
                 .Where(log => !log.IsUncommitted)
                 .Concat(rangeLogs)
@@ -188,10 +188,11 @@ public partial class Form1
 
     private void FillHistoryList(IReadOnlyList<SvnLogEntry> logs)
     {
-        var workingCopy = _configView.WorkingCopyPath.Trim();
-        var hasWorkingCopy = Directory.Exists(workingCopy) && Directory.Exists(Path.Combine(workingCopy, ".svn"));
+        var context = TryGetWorkingCopyContext();
+        var workingCopy = context?.RootPath ?? _configView.WorkingCopyPath.Trim();
+        var hasWorkingCopy = context != null;
         var info = hasWorkingCopy ? RefreshWorkingCopyRevisionStatus() : WorkingCopyInfo.Empty;
-        var changes = hasWorkingCopy ? _svn.GetStatus(workingCopy) : [];
+        var changes = hasWorkingCopy ? FilterChangesForCurrentScope(_svn.GetStatus(workingCopy)) : [];
         var workingCopyRevision = info.CurrentContentRevision;
         var latestRemoteRevision = logs
             .Where(log => !log.IsUncommitted && log.Revision > 0)
@@ -229,7 +230,7 @@ public partial class Form1
                 workingCopyRevision,
                 "LOCAL",
                 DateTimeOffset.MinValue,
-                $"当前工作副本位于 r{workingCopyRevision}。这个版本不在当前已加载的最近 {logs.Count} 条历史中；可以点击“加载更多”“深度搜索”，或搜索 rev:{workingCopyRevision} 查看完整提交详情。")
+                $"当前工作副本内容位于 r{workingCopyRevision}。这个版本不在当前已加载的最近 {logs.Count} 条历史中；可以点击“加载更多”“深度搜索”，或搜索 rev:{workingCopyRevision} 查看完整提交详情。")
             {
                 IsWorkingCopyRevision = true,
             });
@@ -380,7 +381,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetRequiredWorkingCopyContext().SelectedPath;
         var changes = await _svn.GetStatusAsync(workingCopy);
         if (!ConfirmUpdateToRevision(log, changes))
         {
@@ -504,7 +505,7 @@ public partial class Form1
             return false;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var tempPath = CreateHistoryOpenTempPath(label, file.TreePath);
         try
         {
@@ -545,7 +546,7 @@ public partial class Form1
         SetBusy(true, "正在读取文件历史...");
         try
         {
-            await ShowFileHistoryWindowAsync(file.RelativePath);
+            await ShowFileHistoryWindowAsync(GetHistoryChangedWorkingCopyRelativePath(file));
         }
         catch (Exception ex)
         {
@@ -566,7 +567,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var relativePath = GetHistoryChangedWorkingCopyRelativePath(file);
         var localChanges = await _svn.GetStatusAsync(workingCopy);
         if (!ConfirmUpdateHistoryFileToRevision(file, relativePath, log, localChanges))
@@ -592,7 +593,7 @@ public partial class Form1
             return;
         }
 
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         var relativePath = GetHistoryChangedWorkingCopyRelativePath(file);
         SetBusy(true, "正在预览撤销改动...");
         ProcessResult preview;
@@ -692,10 +693,17 @@ public partial class Form1
 
     private string GetHistoryChangedLocalPath(ChangedFileEntry file)
     {
-        return Path.Combine(_configView.WorkingCopyPath.Trim(), GetHistoryChangedWorkingCopyRelativePath(file));
+        return Path.Combine(GetWorkingCopyRootPath(), GetHistoryChangedWorkingCopyRelativePath(file));
     }
 
     private string GetHistoryChangedWorkingCopyRelativePath(ChangedFileEntry file)
+    {
+        var workingCopy = GetWorkingCopyRootPath();
+        var workingCopyUrl = _svn.GetWorkingCopyInfo(workingCopy).Url;
+        return GetHistoryChangedWorkingCopyRelativePath(file, workingCopy, workingCopyUrl);
+    }
+
+    private static string GetHistoryChangedWorkingCopyRelativePath(ChangedFileEntry file, string workingCopy, string workingCopyUrl)
     {
         if (string.IsNullOrWhiteSpace(file.RepositoryPath))
         {
@@ -703,7 +711,6 @@ public partial class Form1
         }
 
         var repositoryPath = file.RepositoryPath.Trim('/').Replace('/', Path.DirectorySeparatorChar);
-        var workingCopyUrl = _svn.GetWorkingCopyInfo(_configView.WorkingCopyPath.Trim()).Url;
         var workingCopyRepositoryPath = ExtractWorkingCopyRepositoryPath(workingCopyUrl);
         if (!string.IsNullOrWhiteSpace(workingCopyRepositoryPath) &&
             repositoryPath.StartsWith(workingCopyRepositoryPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
@@ -720,8 +727,8 @@ public partial class Form1
         };
         return candidates.FirstOrDefault(candidate =>
             !string.IsNullOrWhiteSpace(candidate) &&
-            (File.Exists(Path.Combine(_configView.WorkingCopyPath.Trim(), candidate)) ||
-             Directory.Exists(Path.Combine(_configView.WorkingCopyPath.Trim(), candidate)))) ?? file.RelativePath;
+            (File.Exists(Path.Combine(workingCopy, candidate)) ||
+             Directory.Exists(Path.Combine(workingCopy, candidate)))) ?? file.RelativePath;
     }
 
     private static string ExtractWorkingCopyRepositoryPath(string url)
@@ -766,7 +773,7 @@ public partial class Form1
             return;
         }
 
-        await RunSvnOperationAsync("正在加入版本控制...", async () => await _svn.AddAsync(_configView.WorkingCopyPath.Trim(), relativePath));
+        await RunSvnOperationAsync("正在加入版本控制...", async () => await _svn.AddAsync(GetWorkingCopyRootPath(), relativePath));
         await RefreshStatusAsync();
         LoadAllFiles();
     }
@@ -887,6 +894,27 @@ public partial class Form1
     private void ClearHistoryChangedFiles()
     {
         _historyView.ClearChangedFiles();
+    }
+
+    private IReadOnlyList<SvnLogEntry> FilterLogsForCurrentScope(IReadOnlyList<SvnLogEntry> logs)
+    {
+        var context = TryGetWorkingCopyContext();
+        if (context == null || !context.IsScopedToSubdirectory)
+        {
+            return logs;
+        }
+
+        var workingCopy = context.RootPath;
+        var workingCopyUrl = context.Info.Url;
+        return logs
+            .Select(log => log with
+            {
+                ChangedFiles = log.ChangedFiles
+                    .Where(file => IsPathInsideScope(GetHistoryChangedWorkingCopyRelativePath(file, workingCopy, workingCopyUrl), context.ScopeRelativePath))
+                    .ToList(),
+            })
+            .Where(log => log.ChangedFiles.Count > 0)
+            .ToList();
     }
 
     private void PopulateHistoryChangedFiles(string rootText, IReadOnlyList<ChangedFileEntry> files)

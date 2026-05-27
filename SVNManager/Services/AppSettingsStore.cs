@@ -42,5 +42,8 @@ internal static class AppSettingsStore
         settings.FavoriteFileTreePaths ??= [];
         settings.ExpandedFileTreePaths ??= [];
         settings.UiLayout ??= new UiLayoutSettings();
+        settings.UpdateChannel = string.Equals(settings.UpdateChannel, "beta", StringComparison.OrdinalIgnoreCase)
+            ? "beta"
+            : "stable";
     }
 }

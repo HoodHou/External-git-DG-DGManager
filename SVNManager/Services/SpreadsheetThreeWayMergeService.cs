@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -794,16 +795,16 @@ internal static class SpreadsheetThreeWayMergeService
 
     private static void SetWorkbookCell(ISheet sheet, int rowIndex, int columnIndex, string value)
     {
-        var row = sheet.GetRow(rowIndex) ?? sheet.CreateRow(rowIndex);
-        var cell = row.GetCell(columnIndex) ?? row.CreateCell(columnIndex);
-        if (string.IsNullOrEmpty(value))
+        var row = GetOrCreateWorkbookRow(sheet, rowIndex, preferNextTemplate: false);
+        var cell = row.GetCell(columnIndex);
+        if (cell == null)
         {
-            cell.SetCellType(CellType.Blank);
+            cell = row.CreateCell(columnIndex);
+            CopyWorkbookCellStyle(FindWorkbookCellTemplate(sheet, rowIndex, columnIndex), cell);
         }
-        else
-        {
-            cell.SetCellValue(value);
-        }
+
+        var valueTemplate = FindWorkbookValueTemplate(sheet, rowIndex, columnIndex) ?? cell;
+        SetWorkbookCellValue(cell, value, valueTemplate);
     }
 
     private static void InsertWorkbookRow(ISheet sheet, int rowIndex)
@@ -813,7 +814,7 @@ internal static class SpreadsheetThreeWayMergeService
             sheet.ShiftRows(rowIndex, sheet.LastRowNum, 1, true, false);
         }
 
-        sheet.CreateRow(rowIndex);
+        CreateWorkbookRowFromTemplate(sheet, rowIndex, preferNextTemplate: true);
     }
 
     private static void DeleteWorkbookRow(ISheet sheet, int rowIndex)
@@ -828,6 +829,222 @@ internal static class SpreadsheetThreeWayMergeService
         {
             sheet.ShiftRows(rowIndex + 1, sheet.LastRowNum, -1, true, false);
         }
+    }
+
+    private static IRow GetOrCreateWorkbookRow(ISheet sheet, int rowIndex, bool preferNextTemplate)
+    {
+        return sheet.GetRow(rowIndex) ?? CreateWorkbookRowFromTemplate(sheet, rowIndex, preferNextTemplate);
+    }
+
+    private static IRow CreateWorkbookRowFromTemplate(ISheet sheet, int rowIndex, bool preferNextTemplate)
+    {
+        var row = sheet.CreateRow(rowIndex);
+        var template = FindWorkbookRowTemplate(sheet, rowIndex, preferNextTemplate);
+        if (template == null)
+        {
+            return row;
+        }
+
+        row.Height = template.Height;
+        row.ZeroHeight = template.ZeroHeight;
+        if (template.RowStyle != null)
+        {
+            row.RowStyle = template.RowStyle;
+        }
+
+        if (template.FirstCellNum < 0 || template.LastCellNum < 0)
+        {
+            return row;
+        }
+
+        for (var column = template.FirstCellNum; column < template.LastCellNum; column++)
+        {
+            var templateCell = template.GetCell(column);
+            if (templateCell == null)
+            {
+                continue;
+            }
+
+            var cell = row.CreateCell(column, CellType.Blank);
+            CopyWorkbookCellStyle(templateCell, cell);
+        }
+
+        return row;
+    }
+
+    private static IRow? FindWorkbookRowTemplate(ISheet sheet, int rowIndex, bool preferNextTemplate)
+    {
+        var next = rowIndex + 1;
+        var previous = rowIndex - 1;
+        if (preferNextTemplate && next <= sheet.LastRowNum)
+        {
+            var nextRow = sheet.GetRow(next);
+            if (nextRow != null)
+            {
+                return nextRow;
+            }
+        }
+
+        if (previous >= sheet.FirstRowNum)
+        {
+            var previousRow = sheet.GetRow(previous);
+            if (previousRow != null)
+            {
+                return previousRow;
+            }
+        }
+
+        if (!preferNextTemplate && next <= sheet.LastRowNum)
+        {
+            var nextRow = sheet.GetRow(next);
+            if (nextRow != null)
+            {
+                return nextRow;
+            }
+        }
+
+        return null;
+    }
+
+    private static ICell? FindWorkbookCellTemplate(ISheet sheet, int rowIndex, int columnIndex)
+    {
+        return FindWorkbookValueTemplate(sheet, rowIndex, columnIndex) ??
+            sheet.GetRow(rowIndex - 1)?.GetCell(columnIndex) ??
+            sheet.GetRow(rowIndex + 1)?.GetCell(columnIndex);
+    }
+
+    private static ICell? FindWorkbookValueTemplate(ISheet sheet, int rowIndex, int columnIndex)
+    {
+        var current = sheet.GetRow(rowIndex)?.GetCell(columnIndex);
+        if (current != null && current.CellType != CellType.Blank)
+        {
+            return current;
+        }
+
+        for (var row = rowIndex - 1; row >= sheet.FirstRowNum; row--)
+        {
+            var cell = sheet.GetRow(row)?.GetCell(columnIndex);
+            if (cell != null && cell.CellType != CellType.Blank)
+            {
+                return cell;
+            }
+        }
+
+        for (var row = rowIndex + 1; row <= sheet.LastRowNum; row++)
+        {
+            var cell = sheet.GetRow(row)?.GetCell(columnIndex);
+            if (cell != null && cell.CellType != CellType.Blank)
+            {
+                return cell;
+            }
+        }
+
+        return current;
+    }
+
+    private static void CopyWorkbookCellStyle(ICell? source, ICell target)
+    {
+        if (source?.CellStyle != null)
+        {
+            target.CellStyle = source.CellStyle;
+        }
+    }
+
+    private static void SetWorkbookCellValue(ICell cell, string value, ICell? template)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            cell.SetCellType(CellType.Blank);
+            return;
+        }
+
+        switch (GetWorkbookValueKind(template))
+        {
+            case WorkbookValueKind.Number:
+                if (TryParseDouble(value, out var number))
+                {
+                    cell.SetCellValue(number);
+                    return;
+                }
+
+                break;
+            case WorkbookValueKind.Boolean:
+                if (TryParseBoolean(value, out var boolean))
+                {
+                    cell.SetCellValue(boolean);
+                    return;
+                }
+
+                break;
+            case WorkbookValueKind.Date:
+                if (DateTime.TryParse(value, CultureInfo.CurrentCulture, DateTimeStyles.None, out var date) ||
+                    DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out date))
+                {
+                    cell.SetCellValue(date);
+                    return;
+                }
+
+                break;
+        }
+
+        cell.SetCellValue(value);
+    }
+
+    private static WorkbookValueKind GetWorkbookValueKind(ICell? cell)
+    {
+        if (cell == null)
+        {
+            return WorkbookValueKind.String;
+        }
+
+        if (DateUtil.IsCellDateFormatted(cell))
+        {
+            return WorkbookValueKind.Date;
+        }
+
+        var cellType = cell.CellType == CellType.Formula ? cell.CachedFormulaResultType : cell.CellType;
+        return cellType switch
+        {
+            CellType.Numeric => WorkbookValueKind.Number,
+            CellType.Boolean => WorkbookValueKind.Boolean,
+            _ => WorkbookValueKind.String,
+        };
+    }
+
+    private static bool TryParseDouble(string value, out double number)
+    {
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out number) ||
+            double.TryParse(value, NumberStyles.Float, CultureInfo.CurrentCulture, out number);
+    }
+
+    private static bool TryParseBoolean(string value, out bool boolean)
+    {
+        if (bool.TryParse(value, out boolean))
+        {
+            return true;
+        }
+
+        if (string.Equals(value, "1", StringComparison.Ordinal))
+        {
+            boolean = true;
+            return true;
+        }
+
+        if (string.Equals(value, "0", StringComparison.Ordinal))
+        {
+            boolean = false;
+            return true;
+        }
+
+        return false;
+    }
+
+    private enum WorkbookValueKind
+    {
+        String,
+        Number,
+        Boolean,
+        Date,
     }
 
     private static long GetConfiguredLimitBytes(string variableName, long defaultBytes)
@@ -859,8 +1076,11 @@ internal static class SpreadsheetThreeWayMergeService
     private static void ApplyXmlWrites(string localFilePath, IReadOnlyList<SpreadsheetMergeWrite> writes)
     {
         var document = XDocument.Load(localFilePath, LoadOptions.PreserveWhitespace);
-        XNamespace spreadsheet = "urn:schemas-microsoft-com:office:spreadsheet";
         var root = document.Root ?? throw new InvalidOperationException("XML 表格缺少 Workbook 根节点。");
+        if (!SpreadsheetXmlFormat.IsSpreadsheetWorkbook(root))
+        {
+            throw new InvalidOperationException("XML 文件不是可识别的 SpreadsheetML 表格。");
+        }
 
         foreach (var delete in writes
             .Where(write => write.Kind == SpreadsheetMergeWriteKind.DeleteRow)
@@ -868,11 +1088,11 @@ internal static class SpreadsheetThreeWayMergeService
             .OrderByDescending(group => group.Key.Sheet)
             .ThenByDescending(group => group.Key.Row))
         {
-            var worksheet = GetOrCreateWorksheet(root, spreadsheet, delete.Key.Sheet);
-            var table = worksheet.Element(spreadsheet + "Table");
+            var worksheet = GetOrCreateWorksheet(root, delete.Key.Sheet);
+            var table = SpreadsheetXmlFormat.Element(worksheet, "Table");
             if (table != null)
             {
-                DeleteXmlRow(table, spreadsheet, delete.Key.Row);
+                DeleteXmlRow(table, delete.Key.Row);
             }
         }
 
@@ -882,65 +1102,90 @@ internal static class SpreadsheetThreeWayMergeService
             .OrderByDescending(group => group.Key.Sheet)
             .ThenByDescending(group => group.Key.Row))
         {
-            var worksheet = GetOrCreateWorksheet(root, spreadsheet, insert.Key.Sheet);
-            var table = worksheet.Element(spreadsheet + "Table");
+            var worksheet = GetOrCreateWorksheet(root, insert.Key.Sheet);
+            var table = SpreadsheetXmlFormat.Element(worksheet, "Table");
             if (table == null)
             {
-                table = new XElement(spreadsheet + "Table");
+                table = SpreadsheetXmlFormat.CreateChild(worksheet, "Table");
                 worksheet.Add(table);
             }
 
-            InsertXmlRow(table, spreadsheet, insert.Key.Row);
+            InsertXmlRow(table, insert.Key.Row);
             foreach (var write in insert)
             {
-                SetXmlCell(table, spreadsheet, write.Cell, write.Value);
+                SetXmlCell(table, write.Cell, write.Value);
             }
         }
 
         foreach (var write in writes.Where(write => write.Kind == SpreadsheetMergeWriteKind.SetCell))
         {
-            var worksheet = GetOrCreateWorksheet(root, spreadsheet, write.Cell.Sheet);
-            var table = worksheet.Element(spreadsheet + "Table");
+            var worksheet = GetOrCreateWorksheet(root, write.Cell.Sheet);
+            var table = SpreadsheetXmlFormat.Element(worksheet, "Table");
             if (table == null)
             {
-                table = new XElement(spreadsheet + "Table");
+                table = SpreadsheetXmlFormat.CreateChild(worksheet, "Table");
                 worksheet.Add(table);
             }
 
-            SetXmlCell(table, spreadsheet, write.Cell, write.Value);
+            SetXmlCell(table, write.Cell, write.Value);
         }
 
-        foreach (var table in root.Descendants(spreadsheet + "Table"))
+        foreach (var table in SpreadsheetXmlFormat.Descendants(root, "Table"))
         {
-            UpdateXmlTableExtents(table, spreadsheet);
+            UpdateXmlTableExtents(table);
         }
 
-        document.Save(localFilePath);
+        document.Save(localFilePath, SaveOptions.DisableFormatting);
     }
 
-    private static void SetXmlCell(XElement table, XNamespace spreadsheet, ExcelCellKey cellKey, string value)
+    private static void SetXmlCell(XElement table, ExcelCellKey cellKey, string value)
     {
-        var row = GetOrCreateXmlRow(table, spreadsheet, cellKey.Row);
-        var cell = GetOrCreateXmlCell(row, spreadsheet, cellKey.Column);
-        RemoveXmlFormulaAttributes(cell, spreadsheet);
-        var data = cell.Elements().FirstOrDefault(element => element.Name.LocalName == "Data");
+        var row = GetOrCreateXmlRow(table, cellKey.Row);
+        var cell = GetOrCreateXmlCell(row, cellKey.Column);
+        RemoveXmlFormulaAttributes(cell);
+        var data = SpreadsheetXmlFormat.Element(cell, "Data");
+        var templateData = SpreadsheetXmlFormat.Element(FindXmlValueTemplate(table, cellKey.Row, cellKey.Column) ?? cell, "Data");
+        var normalizedValue = NormalizeXmlCellText(value);
+        if (string.IsNullOrEmpty(normalizedValue))
+        {
+            data?.Remove();
+            return;
+        }
+
         if (data == null)
         {
-            data = new XElement(spreadsheet + "Data", new XAttribute(spreadsheet + "Type", "String"));
+            data = SpreadsheetXmlFormat.CreateChild(cell, "Data");
+            CopyXmlAttributes(templateData, data);
             cell.Add(data);
         }
 
-        data.Value = NormalizeXmlCellText(value);
-        if (string.IsNullOrWhiteSpace(data.Attribute(spreadsheet + "Type")?.Value))
+        data.Value = normalizedValue;
+        var type = SpreadsheetXmlFormat.AttributeValue(data, "Type");
+        var templateType = templateData == null ? "" : SpreadsheetXmlFormat.AttributeValue(templateData, "Type");
+        var guessedType = GuessXmlCellType(normalizedValue);
+        if (string.IsNullOrWhiteSpace(type) && !string.IsNullOrWhiteSpace(templateType))
         {
-            data.SetAttributeValue(spreadsheet + "Type", GuessXmlCellType(value));
+            SpreadsheetXmlFormat.SetAttributeValue(data, "Type", templateType);
+            type = templateType;
+        }
+
+        if (string.IsNullOrWhiteSpace(type))
+        {
+            SpreadsheetXmlFormat.SetAttributeValue(data, "Type", guessedType);
+        }
+        else if (string.Equals(type, "Number", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(guessedType, "Number", StringComparison.OrdinalIgnoreCase))
+        {
+            SpreadsheetXmlFormat.SetAttributeValue(data, "Type", guessedType);
         }
     }
 
-    private static void InsertXmlRow(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    private static void InsertXmlRow(XElement table, int zeroBasedRow)
     {
-        var existing = GetXmlRowAt(table, spreadsheet, zeroBasedRow);
-        var created = new XElement(spreadsheet + "Row", new XAttribute(spreadsheet + "Index", zeroBasedRow + 1));
+        var existing = GetXmlRowAt(table, zeroBasedRow);
+        var template = existing ?? GetXmlRowAt(table, zeroBasedRow - 1);
+        var created = CreateXmlRowFromTemplate(table, zeroBasedRow, template);
+        SpreadsheetXmlFormat.SetAttributeValue(created, "Index", (zeroBasedRow + 1).ToString());
         if (existing != null)
         {
             existing.AddBeforeSelf(created);
@@ -950,21 +1195,21 @@ internal static class SpreadsheetThreeWayMergeService
             table.Add(created);
         }
 
-        NormalizeXmlRowIndexes(table, spreadsheet);
+        NormalizeXmlRowIndexes(table);
     }
 
-    private static void DeleteXmlRow(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    private static void DeleteXmlRow(XElement table, int zeroBasedRow)
     {
-        GetXmlRowAt(table, spreadsheet, zeroBasedRow)?.Remove();
-        NormalizeXmlRowIndexes(table, spreadsheet);
+        GetXmlRowAt(table, zeroBasedRow)?.Remove();
+        NormalizeXmlRowIndexes(table);
     }
 
-    private static XElement? GetXmlRowAt(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    private static XElement? GetXmlRowAt(XElement table, int zeroBasedRow)
     {
         var rowIndex = 0;
-        foreach (var row in table.Elements(spreadsheet + "Row"))
+        foreach (var row in SpreadsheetXmlFormat.Elements(table, "Row"))
         {
-            var explicitIndex = ReadSpreadsheetIndex(row, spreadsheet);
+            var explicitIndex = ReadSpreadsheetIndex(row);
             if (explicitIndex.HasValue)
             {
                 rowIndex = explicitIndex.Value - 1;
@@ -986,30 +1231,34 @@ internal static class SpreadsheetThreeWayMergeService
         return null;
     }
 
-    private static void NormalizeXmlRowIndexes(XElement table, XNamespace spreadsheet)
+    private static void NormalizeXmlRowIndexes(XElement table)
     {
         var rowIndex = 1;
-        foreach (var row in table.Elements(spreadsheet + "Row"))
+        foreach (var row in SpreadsheetXmlFormat.Elements(table, "Row"))
         {
-            row.SetAttributeValue(spreadsheet + "Index", rowIndex);
+            SpreadsheetXmlFormat.SetAttributeValue(row, "Index", rowIndex.ToString());
             rowIndex++;
         }
     }
 
-    private static void RemoveXmlFormulaAttributes(XElement cell, XNamespace spreadsheet)
+    private static void RemoveXmlFormulaAttributes(XElement cell)
     {
-        cell.Attribute(spreadsheet + "Formula")?.Remove();
-        cell.Attribute(spreadsheet + "ArrayRange")?.Remove();
+        foreach (var attribute in cell.Attributes()
+            .Where(attribute => attribute.Name.LocalName is "Formula" or "ArrayRange")
+            .ToList())
+        {
+            attribute.Remove();
+        }
     }
 
-    private static void UpdateXmlTableExtents(XElement table, XNamespace spreadsheet)
+    private static void UpdateXmlTableExtents(XElement table)
     {
         var maxRow = 0;
         var maxColumn = 0;
         var rowIndex = 0;
-        foreach (var row in table.Elements(spreadsheet + "Row"))
+        foreach (var row in SpreadsheetXmlFormat.Elements(table, "Row"))
         {
-            var explicitRowIndex = ReadSpreadsheetIndex(row, spreadsheet);
+            var explicitRowIndex = ReadSpreadsheetIndex(row);
             if (explicitRowIndex.HasValue)
             {
                 rowIndex = explicitRowIndex.Value - 1;
@@ -1017,9 +1266,9 @@ internal static class SpreadsheetThreeWayMergeService
 
             maxRow = Math.Max(maxRow, rowIndex + 1);
             var columnIndex = 0;
-            foreach (var cell in row.Elements(spreadsheet + "Cell"))
+            foreach (var cell in SpreadsheetXmlFormat.Elements(row, "Cell"))
             {
-                var explicitColumnIndex = ReadSpreadsheetIndex(cell, spreadsheet);
+                var explicitColumnIndex = ReadSpreadsheetIndex(cell);
                 if (explicitColumnIndex.HasValue)
                 {
                     columnIndex = explicitColumnIndex.Value - 1;
@@ -1034,36 +1283,38 @@ internal static class SpreadsheetThreeWayMergeService
 
         if (maxRow > 0)
         {
-            table.SetAttributeValue(spreadsheet + "ExpandedRowCount", maxRow.ToString());
+            SpreadsheetXmlFormat.SetAttributeValue(table, "ExpandedRowCount", maxRow.ToString());
         }
 
         if (maxColumn > 0)
         {
-            table.SetAttributeValue(spreadsheet + "ExpandedColumnCount", maxColumn.ToString());
+            SpreadsheetXmlFormat.SetAttributeValue(table, "ExpandedColumnCount", maxColumn.ToString());
         }
     }
 
-    private static XElement GetOrCreateWorksheet(XElement root, XNamespace spreadsheet, string sheetName)
+    private static XElement GetOrCreateWorksheet(XElement root, string sheetName)
     {
         var worksheet = root
-            .Elements(spreadsheet + "Worksheet")
-            .FirstOrDefault(element => string.Equals(element.Attribute(spreadsheet + "Name")?.Value, sheetName, StringComparison.Ordinal));
+            .Elements()
+            .Where(element => element.Name.LocalName == "Worksheet")
+            .FirstOrDefault(element => string.Equals(SpreadsheetXmlFormat.AttributeValue(element, "Name"), sheetName, StringComparison.Ordinal));
         if (worksheet != null)
         {
             return worksheet;
         }
 
-        worksheet = new XElement(spreadsheet + "Worksheet", new XAttribute(spreadsheet + "Name", sheetName));
+        worksheet = SpreadsheetXmlFormat.CreateChild(root, "Worksheet");
+        SpreadsheetXmlFormat.SetAttributeValue(worksheet, "Name", sheetName);
         root.Add(worksheet);
         return worksheet;
     }
 
-    private static XElement GetOrCreateXmlRow(XElement table, XNamespace spreadsheet, int zeroBasedRow)
+    private static XElement GetOrCreateXmlRow(XElement table, int zeroBasedRow)
     {
         var rowIndex = 0;
-        foreach (var row in table.Elements(spreadsheet + "Row"))
+        foreach (var row in SpreadsheetXmlFormat.Elements(table, "Row"))
         {
-            var explicitIndex = ReadSpreadsheetIndex(row, spreadsheet);
+            var explicitIndex = ReadSpreadsheetIndex(row);
             if (explicitIndex.HasValue)
             {
                 rowIndex = explicitIndex.Value - 1;
@@ -1076,7 +1327,9 @@ internal static class SpreadsheetThreeWayMergeService
 
             if (rowIndex > zeroBasedRow)
             {
-                var created = new XElement(spreadsheet + "Row", new XAttribute(spreadsheet + "Index", zeroBasedRow + 1));
+                var template = GetXmlRowAt(table, zeroBasedRow - 1) ?? row;
+                var created = CreateXmlRowFromTemplate(table, zeroBasedRow, template);
+                SpreadsheetXmlFormat.SetAttributeValue(created, "Index", (zeroBasedRow + 1).ToString());
                 row.AddBeforeSelf(created);
                 return created;
             }
@@ -1084,17 +1337,18 @@ internal static class SpreadsheetThreeWayMergeService
             rowIndex++;
         }
 
-        var appended = new XElement(spreadsheet + "Row", new XAttribute(spreadsheet + "Index", zeroBasedRow + 1));
+        var appended = CreateXmlRowFromTemplate(table, zeroBasedRow, GetXmlRowAt(table, zeroBasedRow - 1));
+        SpreadsheetXmlFormat.SetAttributeValue(appended, "Index", (zeroBasedRow + 1).ToString());
         table.Add(appended);
         return appended;
     }
 
-    private static XElement GetOrCreateXmlCell(XElement row, XNamespace spreadsheet, int zeroBasedColumn)
+    private static XElement GetOrCreateXmlCell(XElement row, int zeroBasedColumn)
     {
         var columnIndex = 0;
-        foreach (var cell in row.Elements(spreadsheet + "Cell"))
+        foreach (var cell in SpreadsheetXmlFormat.Elements(row, "Cell"))
         {
-            var explicitIndex = ReadSpreadsheetIndex(cell, spreadsheet);
+            var explicitIndex = ReadSpreadsheetIndex(cell);
             if (explicitIndex.HasValue)
             {
                 columnIndex = explicitIndex.Value - 1;
@@ -1107,7 +1361,9 @@ internal static class SpreadsheetThreeWayMergeService
 
             if (columnIndex > zeroBasedColumn)
             {
-                var created = new XElement(spreadsheet + "Cell", new XAttribute(spreadsheet + "Index", zeroBasedColumn + 1));
+                var template = FindXmlCellTemplate(row, zeroBasedColumn);
+                var created = CreateXmlCellFromTemplate(row, template);
+                SpreadsheetXmlFormat.SetAttributeValue(created, "Index", (zeroBasedColumn + 1).ToString());
                 cell.AddBeforeSelf(created);
                 return created;
             }
@@ -1115,20 +1371,176 @@ internal static class SpreadsheetThreeWayMergeService
             columnIndex++;
         }
 
-        var appended = new XElement(spreadsheet + "Cell", new XAttribute(spreadsheet + "Index", zeroBasedColumn + 1));
+        var appended = CreateXmlCellFromTemplate(row, FindXmlCellTemplate(row, zeroBasedColumn));
+        SpreadsheetXmlFormat.SetAttributeValue(appended, "Index", (zeroBasedColumn + 1).ToString());
         row.Add(appended);
         return appended;
     }
 
-    private static int? ReadSpreadsheetIndex(XElement element, XNamespace spreadsheet)
+    private static XElement CreateXmlRowFromTemplate(XElement table, int zeroBasedRow, XElement? template)
     {
-        var value = element.Attribute(spreadsheet + "Index")?.Value;
+        var row = SpreadsheetXmlFormat.CreateChild(table, "Row");
+        CopyXmlAttributes(template, row, "Index");
+
+        if (template == null)
+        {
+            return row;
+        }
+
+        foreach (var templateCell in SpreadsheetXmlFormat.Elements(template, "Cell"))
+        {
+            var cell = CreateXmlCellFromTemplate(row, templateCell);
+            var explicitIndex = ReadSpreadsheetIndex(templateCell);
+            if (explicitIndex.HasValue)
+            {
+                SpreadsheetXmlFormat.SetAttributeValue(cell, "Index", explicitIndex.Value.ToString(CultureInfo.InvariantCulture));
+            }
+
+            row.Add(cell);
+        }
+
+        return row;
+    }
+
+    private static XElement CreateXmlCellFromTemplate(XElement row, XElement? template)
+    {
+        var cell = SpreadsheetXmlFormat.CreateChild(row, "Cell");
+        CopyXmlAttributes(template, cell, "Formula", "ArrayRange", "Index");
+        return cell;
+    }
+
+    private static XElement? FindXmlCellTemplate(XElement row, int zeroBasedColumn)
+    {
+        return GetXmlCellAt(row, zeroBasedColumn) ??
+            FindXmlValueTemplate(row.Parent, GetXmlRowPosition(row), zeroBasedColumn);
+    }
+
+    private static XElement? FindXmlValueTemplate(XElement? table, int zeroBasedRow, int zeroBasedColumn)
+    {
+        if (table == null)
+        {
+            return null;
+        }
+
+        var current = GetXmlCellAt(GetXmlRowAt(table, zeroBasedRow), zeroBasedColumn);
+        if (current != null && SpreadsheetXmlFormat.Element(current, "Data") != null)
+        {
+            return current;
+        }
+
+        for (var row = zeroBasedRow - 1; row >= 0; row--)
+        {
+            var cell = GetXmlCellAt(GetXmlRowAt(table, row), zeroBasedColumn);
+            if (cell != null && SpreadsheetXmlFormat.Element(cell, "Data") != null)
+            {
+                return cell;
+            }
+        }
+
+        var maxRow = SpreadsheetXmlFormat.Elements(table, "Row").Count() + Math.Max(0, zeroBasedRow + 2);
+        for (var row = zeroBasedRow + 1; row <= maxRow; row++)
+        {
+            var cell = GetXmlCellAt(GetXmlRowAt(table, row), zeroBasedColumn);
+            if (cell != null && SpreadsheetXmlFormat.Element(cell, "Data") != null)
+            {
+                return cell;
+            }
+        }
+
+        return current;
+    }
+
+    private static XElement? GetXmlCellAt(XElement? row, int zeroBasedColumn)
+    {
+        if (row == null)
+        {
+            return null;
+        }
+
+        var columnIndex = 0;
+        foreach (var cell in SpreadsheetXmlFormat.Elements(row, "Cell"))
+        {
+            var explicitIndex = ReadSpreadsheetIndex(cell);
+            if (explicitIndex.HasValue)
+            {
+                columnIndex = explicitIndex.Value - 1;
+            }
+
+            if (columnIndex == zeroBasedColumn)
+            {
+                return cell;
+            }
+
+            if (columnIndex > zeroBasedColumn)
+            {
+                return null;
+            }
+
+            columnIndex++;
+        }
+
+        return null;
+    }
+
+    private static int GetXmlRowPosition(XElement row)
+    {
+        var table = row.Parent;
+        if (table == null)
+        {
+            return -1;
+        }
+
+        var rowIndex = 0;
+        foreach (var current in SpreadsheetXmlFormat.Elements(table, "Row"))
+        {
+            var explicitIndex = ReadSpreadsheetIndex(current);
+            if (explicitIndex.HasValue)
+            {
+                rowIndex = explicitIndex.Value - 1;
+            }
+
+            if (ReferenceEquals(current, row))
+            {
+                return rowIndex;
+            }
+
+            rowIndex++;
+        }
+
+        return -1;
+    }
+
+    private static void CopyXmlAttributes(XElement? source, XElement target, params string[] skippedLocalNames)
+    {
+        if (source == null)
+        {
+            return;
+        }
+
+        var skipped = skippedLocalNames.Length == 0
+            ? null
+            : new HashSet<string>(skippedLocalNames, StringComparer.Ordinal);
+        foreach (var attribute in source.Attributes())
+        {
+            if (attribute.IsNamespaceDeclaration ||
+                skipped?.Contains(attribute.Name.LocalName) == true)
+            {
+                continue;
+            }
+
+            target.SetAttributeValue(attribute.Name, attribute.Value);
+        }
+    }
+
+    private static int? ReadSpreadsheetIndex(XElement element)
+    {
+        var value = SpreadsheetXmlFormat.AttributeValue(element, "Index");
         return int.TryParse(value, out var index) ? index : null;
     }
 
     private static string NormalizeXmlCellText(string value)
     {
-        return (value ?? "").Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        return SpreadsheetXmlFormat.NormalizeCellText(value);
     }
 
     private static string GuessXmlCellType(string value)

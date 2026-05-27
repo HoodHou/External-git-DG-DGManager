@@ -153,14 +153,14 @@ internal sealed class RepositoryManagerForm : Form
             return "目录不存在";
         }
 
-        if (!Directory.Exists(Path.Combine(repository.WorkingCopyPath, ".svn")))
-        {
-            return "不是 SVN 工作副本";
-        }
-
         try
         {
             var info = _svn.GetWorkingCopyInfo(repository.WorkingCopyPath);
+            if (info == WorkingCopyInfo.Empty)
+            {
+                return "不是 SVN 工作副本";
+            }
+
             version = info == WorkingCopyInfo.Empty ? "未知" : info.DisplayContentRevisionText;
             return "正常 SVN 工作副本";
         }

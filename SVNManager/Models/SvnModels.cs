@@ -8,9 +8,16 @@ using NPOI.SS.UserModel;
 
 namespace SVNManager;
 
-internal sealed record WorkingCopyInfo(long Revision, long LastChangedRevision, long MinRevision, long MaxRevision, string Url)
+internal sealed record WorkingCopyInfo(
+    long Revision,
+    long LastChangedRevision,
+    long MinRevision,
+    long MaxRevision,
+    string Url,
+    string RepositoryRootUrl,
+    string WorkingCopyRootPath)
 {
-    public static WorkingCopyInfo Empty { get; } = new(0, 0, 0, 0, "");
+    public static WorkingCopyInfo Empty { get; } = new(0, 0, 0, 0, "", "", "");
 
     public long CheckedOutRevision => MaxRevision > 0
         ? MaxRevision
@@ -20,7 +27,7 @@ internal sealed record WorkingCopyInfo(long Revision, long LastChangedRevision, 
         ? LastChangedRevision
         : CheckedOutRevision;
 
-    public long CurrentContentRevision => CheckedOutRevision;
+    public long CurrentContentRevision => LastContentRevision;
 
     public bool IsMixedRevision => MinRevision > 0 && MaxRevision > 0 && MinRevision != MaxRevision;
 
@@ -35,6 +42,7 @@ internal sealed record WorkingCopyInfo(long Revision, long LastChangedRevision, 
     public string RevisionDetailText =>
         $"内容最后变更：r{LastContentRevision}{Environment.NewLine}" +
         $"工作副本已更新到：{DisplayRevisionText}{Environment.NewLine}" +
+        (string.IsNullOrWhiteSpace(WorkingCopyRootPath) ? "" : $"工作副本根目录：{WorkingCopyRootPath}{Environment.NewLine}") +
         Url;
 }
 
@@ -590,6 +598,8 @@ internal sealed record FileTreeNodeInfo(string RelativePath, bool IsFile);
 
 internal sealed record FileTreeLoadRequest(
     string RootPath,
+    string SvnRootPath,
+    string ScopeRelativePath,
     string Search,
     bool ChangedOnly,
     bool IsFiltering,

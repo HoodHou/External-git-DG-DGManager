@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -31,7 +32,11 @@ internal sealed record ReleaseUpdateStatus(
     string ReleaseUrl,
     string AssetName,
     string AssetDownloadUrl,
-    string Message);
+    string Message,
+    string Source,
+    string Channel,
+    string Sha256,
+    bool Required);
 
 internal static class AppInfo
 {
@@ -53,17 +58,26 @@ internal sealed record GitUpdateStatus(GitUpdateState State, string LocalSha, st
 
 internal static class ReleaseUpdateChecker
 {
-    private const string LatestReleaseUrl = "https://api.github.com/repos/HoodHou/External-git-DG-SVNManager/releases/latest";
+    private const string UpdateManifestUrl = "https://raw.githubusercontent.com/HoodHou/External-git-DG-DGManager/main/update.json";
+    private const string LatestReleaseUrl = "https://api.github.com/repos/HoodHou/External-git-DG-DGManager/releases/latest";
+    private const string ReleasesUrl = "https://github.com/HoodHou/External-git-DG-DGManager/releases";
     private static readonly HttpClient Http = CreateHttpClient();
 
-    public static async Task<ReleaseUpdateStatus> CheckLatestAsync(Version currentVersion)
+    public static async Task<ReleaseUpdateStatus> CheckLatestAsync(Version currentVersion, string channel)
     {
+        var normalizedChannel = NormalizeChannel(channel);
+        var manifestStatus = await TryCheckManifestAsync(currentVersion, normalizedChannel);
+        if (manifestStatus != null)
+        {
+            return manifestStatus;
+        }
+
         try
         {
             using var response = await Http.GetAsync(LatestReleaseUrl);
             if (!response.IsSuccessStatusCode)
             {
-                return Unavailable($"GitHub Release 检查失败：HTTP {(int)response.StatusCode}");
+                return Unavailable($"GitHub Release 检查失败：HTTP {(int)response.StatusCode}", normalizedChannel);
             }
 
             await using var stream = await response.Content.ReadAsStreamAsync();
@@ -77,7 +91,7 @@ internal static class ReleaseUpdateChecker
             var asset = FindWindowsZipAsset(root);
             if (string.IsNullOrWhiteSpace(tag) || latestVersion == null)
             {
-                return Unavailable("GitHub Release 没有有效版本号。");
+                return Unavailable("GitHub Release 没有有效版本号。", normalizedChannel);
             }
 
             var state = latestVersion > NormalizeVersion(currentVersion)
@@ -92,15 +106,19 @@ internal static class ReleaseUpdateChecker
                 url,
                 asset.Name,
                 asset.DownloadUrl,
-                "");
+                "",
+                "GitHub Release",
+                normalizedChannel,
+                "",
+                false);
         }
         catch (Exception ex)
         {
-            return Unavailable(ex.Message);
+            return Unavailable(ex.Message, normalizedChannel);
         }
     }
 
-    public static async Task<string> DownloadAssetAsync(string assetDownloadUrl, string tag)
+    public static async Task<string> DownloadAssetAsync(string assetDownloadUrl, string tag, string expectedSha256)
     {
         if (string.IsNullOrWhiteSpace(assetDownloadUrl))
         {
@@ -115,10 +133,91 @@ internal static class ReleaseUpdateChecker
         await using var input = await response.Content.ReadAsStreamAsync();
         await using var output = File.Create(zipPath);
         await input.CopyToAsync(output);
+
+        if (!string.IsNullOrWhiteSpace(expectedSha256))
+        {
+            var actualSha256 = ComputeSha256(zipPath);
+            if (!string.Equals(NormalizeSha256(expectedSha256), actualSha256, StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    File.Delete(zipPath);
+                }
+                catch
+                {
+                }
+
+                throw new InvalidOperationException($"更新包校验失败：期望 {NormalizeSha256(expectedSha256)}，实际 {actualSha256}。");
+            }
+        }
+
         return zipPath;
     }
 
-    private static ReleaseUpdateStatus Unavailable(string message)
+    private static async Task<ReleaseUpdateStatus?> TryCheckManifestAsync(Version currentVersion, string channel)
+    {
+        try
+        {
+            using var response = await Http.GetAsync(UpdateManifestUrl);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            using var document = await JsonDocument.ParseAsync(stream);
+            if (!TryGetManifestChannel(document.RootElement, channel, out var entry))
+            {
+                return null;
+            }
+
+            var tag = ReadString(entry, "tag");
+            var versionText = ReadString(entry, "version");
+            if (string.IsNullOrWhiteSpace(tag))
+            {
+                tag = versionText.StartsWith("v", StringComparison.OrdinalIgnoreCase) ? versionText : "v" + versionText;
+            }
+
+            var latestVersion = ParseVersion(string.IsNullOrWhiteSpace(versionText) ? tag : versionText);
+            if (latestVersion == null)
+            {
+                return null;
+            }
+
+            var assetUrl = FirstNonEmpty(
+                ReadString(entry, "url"),
+                ReadString(entry, "assetDownloadUrl"),
+                ReadString(entry, "downloadUrl"));
+            var assetName = FirstNonEmpty(ReadString(entry, "assetName"), TryGetFileName(assetUrl));
+            var releaseUrl = FirstNonEmpty(ReadString(entry, "releaseUrl"), ReleasesUrl);
+            var notes = FirstNonEmpty(ReadString(entry, "notes"), ReadString(entry, "releaseNotes"));
+            var required = ReadBool(entry, "required");
+            var state = latestVersion > NormalizeVersion(currentVersion)
+                ? ReleaseUpdateState.UpdateAvailable
+                : ReleaseUpdateState.UpToDate;
+
+            return new ReleaseUpdateStatus(
+                state,
+                AppInfo.VersionText,
+                tag,
+                FirstNonEmpty(ReadString(entry, "name"), tag),
+                notes,
+                releaseUrl,
+                assetName,
+                assetUrl,
+                "",
+                "update.json",
+                channel,
+                NormalizeSha256(ReadString(entry, "sha256")),
+                required);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static ReleaseUpdateStatus Unavailable(string message, string channel)
     {
         return new ReleaseUpdateStatus(
             ReleaseUpdateState.Unavailable,
@@ -126,10 +225,14 @@ internal static class ReleaseUpdateChecker
             "",
             "",
             "",
-            "https://github.com/HoodHou/External-git-DG-SVNManager/releases",
+            ReleasesUrl,
             "",
             "",
-            message);
+            message,
+            "GitHub Release",
+            channel,
+            "",
+            false);
     }
 
     private static HttpClient CreateHttpClient()
@@ -139,6 +242,28 @@ internal static class ReleaseUpdateChecker
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         client.Timeout = TimeSpan.FromSeconds(15);
         return client;
+    }
+
+    private static bool TryGetManifestChannel(JsonElement root, string channel, out JsonElement entry)
+    {
+        if (root.ValueKind == JsonValueKind.Object)
+        {
+            if (root.TryGetProperty(channel, out entry) && entry.ValueKind == JsonValueKind.Object)
+            {
+                return true;
+            }
+
+            if (root.TryGetProperty("channels", out var channels) &&
+                channels.ValueKind == JsonValueKind.Object &&
+                channels.TryGetProperty(channel, out entry) &&
+                entry.ValueKind == JsonValueKind.Object)
+            {
+                return true;
+            }
+        }
+
+        entry = default;
+        return false;
     }
 
     private static (string Name, string DownloadUrl) FindWindowsZipAsset(JsonElement release)
@@ -183,6 +308,44 @@ internal static class ReleaseUpdateChecker
         return element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
             ? property.GetString() ?? ""
             : "";
+    }
+
+    private static bool ReadBool(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var property) &&
+            property.ValueKind == JsonValueKind.True;
+    }
+
+    private static string NormalizeChannel(string channel)
+    {
+        return string.Equals(channel, "beta", StringComparison.OrdinalIgnoreCase) ? "beta" : "stable";
+    }
+
+    private static string NormalizeSha256(string value)
+    {
+        return Regex.Replace(value ?? "", "[^0-9a-fA-F]", "", RegexOptions.None, TimeSpan.FromSeconds(1)).ToLowerInvariant();
+    }
+
+    private static string ComputeSha256(string path)
+    {
+        using var stream = File.OpenRead(path);
+        var hash = SHA256.HashData(stream);
+        return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static string FirstNonEmpty(params string[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
+    }
+
+    private static string TryGetFileName(string url)
+    {
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return Path.GetFileName(uri.LocalPath);
+        }
+
+        return "";
     }
 }
 

@@ -229,7 +229,7 @@ internal sealed class FileStatusView : UserControl
         _menu.Items.Clear();
         _menu.Items.Add("查看差异", null, (_, _) => DiffRequested?.Invoke(this, EventArgs.Empty));
         _menu.Items.Add("和另一个表快速比对...", null, (_, _) => CompareTableRequested?.Invoke(this, EventArgs.Empty));
-        _menu.Items.Add("内置表格三方合并", null, (_, _) => InternalMergeRequested?.Invoke(this, EventArgs.Empty));
+        _menu.Items.Add("内置三方合并", null, (_, _) => InternalMergeRequested?.Invoke(this, EventArgs.Empty));
         _menu.Items.Add("跨库表格三方合并", null, (_, _) => CrossMergeRequested?.Invoke(this, EventArgs.Empty));
         _menu.Items.Add("打开文件", null, (_, _) => OpenFileRequested?.Invoke(this, EventArgs.Empty));
         _menu.Items.Add("打开所在目录", null, (_, _) => OpenFolderRequested?.Invoke(this, EventArgs.Empty));

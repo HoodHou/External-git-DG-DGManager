@@ -10,6 +10,16 @@ namespace SVNManager;
 
 internal sealed class SpreadsheetMergeConflictForm : Form
 {
+    private static readonly Font BaseFont = new("Microsoft YaHei UI", 9F);
+    private static readonly Font TitleFont = new("Microsoft YaHei UI", 9F, FontStyle.Bold);
+    private static readonly Font ChipFontRegular = new("Microsoft YaHei UI", 8.5F, FontStyle.Regular);
+    private static readonly Font ChipFontBold = new("Microsoft YaHei UI", 8.5F, FontStyle.Bold);
+    private static readonly Font WarningIconFont = new("Microsoft YaHei UI", 10F, FontStyle.Bold);
+    private static readonly Font MonospaceFont = new("Consolas", 9F);
+
+    private static readonly Dictionary<int, SolidBrush> IndicatorBrushCache = new();
+    private static readonly object IndicatorBrushLock = new();
+
     private readonly SpreadsheetMergePlan _plan;
     private readonly List<SpreadsheetMergeConflictGridRow> _rows;
     private readonly BindingSource _source = new();
@@ -29,6 +39,9 @@ internal sealed class SpreadsheetMergeConflictForm : Form
     private readonly string _insertRowText;
     private readonly string _deleteRowText;
     private readonly string[] _operationTexts;
+    private readonly List<FilterChipState> _filterChips = [];
+    private MergeRowFilter _activeFilter = MergeRowFilter.All;
+    private MergeDiffOverviewStrip? _overviewStrip;
     private bool _syncingRowOperation;
 
     public SpreadsheetMergeConflictForm(
@@ -61,7 +74,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         StartPosition = FormStartPosition.CenterParent;
         MinimumSize = new Size(1180, 700);
         Size = new Size(1400, 840);
-        Font = new Font("Microsoft YaHei UI", 9F);
+        Font = BaseFont;
 
         var root = new TableLayoutPanel
         {
@@ -76,13 +89,10 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         Controls.Add(root);
 
-        _summaryLabel.Dock = DockStyle.Fill;
-        _summaryLabel.TextAlign = ContentAlignment.MiddleLeft;
-        _summaryLabel.ForeColor = Color.FromArgb(45, 55, 72);
-        root.Controls.Add(_summaryLabel, 0, 0);
+        root.Controls.Add(CreateSummaryHeaderPanel(), 0, 0);
 
         ConfigureGrid();
-        root.Controls.Add(_grid, 0, 1);
+        root.Controls.Add(CreateGridOverviewPanel(), 0, 1);
         root.Controls.Add(CreateDetailPanel(), 0, 2);
 
         var buttons = new FlowLayoutPanel
@@ -116,6 +126,90 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         UpdateMergeDetail();
     }
 
+    private Control CreateSummaryHeaderPanel()
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+
+        var chips = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = Padding.Empty,
+            Padding = new Padding(0, 4, 0, 5),
+        };
+        AddFilterChip(chips, $"自动应用 {_plan.AutoRemoteChanges.Count}", MergeRowFilter.AutoRemote, Color.FromArgb(236, 253, 245), Color.FromArgb(22, 101, 62));
+        AddFilterChip(chips, $"本地保留 {_plan.LocalOnlyChanges.Count}", MergeRowFilter.LocalOnly, Color.FromArgb(239, 246, 255), Color.FromArgb(30, 64, 175));
+        AddFilterChip(chips, $"冲突 {_plan.Conflicts.Count}", MergeRowFilter.Conflict, Color.FromArgb(255, 247, 237), Color.FromArgb(154, 52, 18));
+        AddFilterChip(chips, $"风险 {_rows.Count(IsHighRisk)}", MergeRowFilter.Risk, Color.FromArgb(254, 226, 226), Color.FromArgb(153, 27, 27));
+        panel.Controls.Add(chips, 0, 0);
+
+        _summaryLabel.Dock = DockStyle.Fill;
+        _summaryLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _summaryLabel.ForeColor = Color.FromArgb(45, 55, 72);
+        panel.Controls.Add(_summaryLabel, 0, 1);
+        return panel;
+    }
+
+    private void AddFilterChip(FlowLayoutPanel parent, string text, MergeRowFilter filter, Color backColor, Color foreColor)
+    {
+        var button = new Button
+        {
+            Text = text,
+            Tag = filter,
+            AutoSize = true,
+            Height = 32,
+            FlatStyle = FlatStyle.Flat,
+            Margin = new Padding(0, 0, 8, 0),
+            Padding = new Padding(12, 0, 12, 0),
+            UseVisualStyleBackColor = false,
+            BackColor = backColor,
+            ForeColor = foreColor,
+            Font = ChipFontRegular,
+        };
+        button.FlatAppearance.BorderSize = 1;
+        button.FlatAppearance.BorderColor = Color.FromArgb(226, 232, 240);
+        button.Click += (_, _) =>
+        {
+            _activeFilter = _activeFilter == filter ? MergeRowFilter.All : filter;
+            ApplyChipFilter();
+        };
+        _filterChips.Add(new FilterChipState(button, filter, backColor, foreColor));
+        parent.Controls.Add(button);
+    }
+
+    private Control CreateGridOverviewPanel()
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+        };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 18));
+        panel.Controls.Add(_grid, 0, 0);
+
+        _overviewStrip = new MergeDiffOverviewStrip(_grid, GetVisibleRows, JumpToVisibleRow)
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(4, 0, 0, 0),
+        };
+        panel.Controls.Add(_overviewStrip, 1, 0);
+        return panel;
+    }
+
     private void ConfigureGrid()
     {
         _grid.Dock = DockStyle.Fill;
@@ -130,13 +224,23 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         _grid.EnableHeadersVisualStyles = false;
         _grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
         _grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(45, 55, 72);
-        _grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        _grid.ColumnHeadersDefaultCellStyle.Font = TitleFont;
         _grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
         _grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(15, 23, 42);
         _grid.RowTemplate.Height = 86;
         _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None;
-        _grid.DataBindingComplete += (_, _) => ApplyRowStyles();
-        _grid.SelectionChanged += (_, _) => UpdateMergeDetail();
+        _grid.DataBindingComplete += (_, _) =>
+        {
+            ApplyRowStyles();
+            _overviewStrip?.Invalidate();
+        };
+        _grid.SelectionChanged += (_, _) =>
+        {
+            UpdateMergeDetail();
+            _overviewStrip?.Invalidate();
+        };
+        _grid.Scroll += (_, _) => _overviewStrip?.Invalidate();
+        _grid.CellPainting += PaintRiskIndicatorCell;
         _grid.CellPainting += PaintMergeComparisonCell;
         _grid.CellDoubleClick += (_, args) =>
         {
@@ -153,6 +257,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
                 UpdateSummary();
                 ApplyRowStyles();
                 UpdateMergeDetail();
+                _overviewStrip?.Invalidate();
             }
         };
         _grid.DataError += (_, args) => args.ThrowException = false;
@@ -165,18 +270,34 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         };
         _grid.CellToolTipTextNeeded += (_, args) =>
         {
-            if (args.RowIndex < 0 || args.RowIndex >= _rows.Count)
+            if (args.RowIndex < 0 ||
+                args.RowIndex >= _grid.Rows.Count ||
+                _grid.Rows[args.RowIndex].DataBoundItem is not SpreadsheetMergeConflictGridRow row)
             {
                 return;
             }
 
-            var row = _rows[args.RowIndex];
-            args.ToolTipText =
+            var tooltip =
                 $"BASE：{row.BaseValue}{Environment.NewLine}" +
                 $"{_targetLabel}：{row.LocalValue}{Environment.NewLine}" +
                 $"{_sourceLabel}：{row.RemoteValue}";
+            if (IsHighRisk(row))
+            {
+                tooltip += $"{Environment.NewLine}⚠ 风险原因：{GetRiskReason(row)}";
+            }
+
+            args.ToolTipText = tooltip;
         };
 
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "",
+            Name = "RiskIndicator",
+            Width = 28,
+            ReadOnly = true,
+            SortMode = DataGridViewColumnSortMode.NotSortable,
+            Frozen = true,
+        });
         _grid.Columns.Add(new DataGridViewComboBoxColumn
         {
             HeaderText = "操作",
@@ -184,6 +305,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
             DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.OperationText),
             DataSource = _operationTexts,
             Width = 132,
+            Frozen = true,
         });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "类型", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.KindText), Width = 108, ReadOnly = true });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "对齐状态", DataPropertyName = nameof(SpreadsheetMergeConflictGridRow.AlignmentText), Width = 170, ReadOnly = true });
@@ -224,7 +346,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
 
         _detailTitleLabel.Dock = DockStyle.Fill;
         _detailTitleLabel.TextAlign = ContentAlignment.MiddleLeft;
-        _detailTitleLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        _detailTitleLabel.Font = TitleFont;
         _detailTitleLabel.ForeColor = Color.FromArgb(30, 41, 59);
         panel.Controls.Add(_detailTitleLabel, 0, 0);
 
@@ -261,7 +383,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
             Dock = DockStyle.Fill,
             Text = title,
             ForeColor = titleColor,
-            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+            Font = TitleFont,
         }, 0, 0);
         box.Dock = DockStyle.Fill;
         box.ReadOnly = true;
@@ -269,7 +391,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         box.ScrollBars = RichTextBoxScrollBars.Both;
         box.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
         box.BackColor = Color.White;
-        box.Font = new Font("Consolas", 9F);
+        box.Font = MonospaceFont;
         box.DetectUrls = false;
         panel.Controls.Add(box, 0, 1);
         return panel;
@@ -277,8 +399,14 @@ internal sealed class SpreadsheetMergeConflictForm : Form
 
     private void UpdateMergeDetail()
     {
-        var row = _grid.CurrentRow?.DataBoundItem as SpreadsheetMergeConflictGridRow ??
-            _rows.FirstOrDefault();
+        var row = _grid.CurrentRow?.DataBoundItem as SpreadsheetMergeConflictGridRow;
+        if (row == null &&
+            _grid.Rows.Count > 0 &&
+            _grid.Rows[0].DataBoundItem is SpreadsheetMergeConflictGridRow firstVisibleRow)
+        {
+            row = firstVisibleRow;
+        }
+
         if (row == null)
         {
             _detailTitleLabel.Text = "未选择合并项目";
@@ -318,6 +446,44 @@ internal sealed class SpreadsheetMergeConflictForm : Form
 
         box.Select(0, 0);
         box.ResumeLayout();
+    }
+
+    private void PaintRiskIndicatorCell(object? sender, DataGridViewCellPaintingEventArgs args)
+    {
+        if (sender is not DataGridView grid ||
+            args.RowIndex < 0 ||
+            args.ColumnIndex < 0 ||
+            args.Graphics == null ||
+            grid.Columns[args.ColumnIndex].Name != "RiskIndicator" ||
+            grid.Rows[args.RowIndex].DataBoundItem is not SpreadsheetMergeConflictGridRow row)
+        {
+            return;
+        }
+
+        args.Handled = true;
+        args.PaintBackground(args.CellBounds, grid.Rows[args.RowIndex].Selected);
+
+        if (!IsHighRisk(row))
+        {
+            var guideBrush = GetIndicatorBrush(Color.FromArgb(203, 213, 225));
+            args.Graphics.FillRectangle(guideBrush, new Rectangle(args.CellBounds.Left + 12, args.CellBounds.Top + 8, 1, Math.Max(8, args.CellBounds.Height - 16)));
+            return;
+        }
+
+        var isMissingTarget = !row.TargetRowExists && row.SourceCellExists;
+        var accentColor = isMissingTarget ? Color.FromArgb(220, 38, 38) : Color.FromArgb(217, 119, 6);
+        var accentBrush = GetIndicatorBrush(accentColor);
+        args.Graphics.FillRectangle(accentBrush, new Rectangle(args.CellBounds.Left + 3, args.CellBounds.Top + 6, 4, Math.Max(8, args.CellBounds.Height - 12)));
+
+        var icon = isMissingTarget ? "⚠" : "◆";
+        var iconBounds = new Rectangle(args.CellBounds.Left + 8, args.CellBounds.Top, Math.Max(1, args.CellBounds.Width - 8), args.CellBounds.Height);
+        TextRenderer.DrawText(
+            args.Graphics,
+            icon,
+            WarningIconFont,
+            iconBounds,
+            accentColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
     }
 
     private void PaintMergeComparisonCell(object? sender, DataGridViewCellPaintingEventArgs args)
@@ -513,7 +679,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
-            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+            Font = TitleFont,
             Text = $"{row.KindText}    默认 {row.Sheet}!{row.Address}    写入 {row.WriteSheet}!{row.WriteAddress}    ID: {row.RowId}    字段: {row.FieldName}",
         }, 0, 0);
         root.Controls.Add(CreatePopupMergeValueBox("BASE", row.BaseValue, Color.FromArgb(71, 85, 105), Color.FromArgb(226, 232, 240), []), 0, 1);
@@ -533,6 +699,56 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         panel.Margin = new Padding(0, 0, 0, 8);
         SetMergeDetailText(box, value, textColor, highlightColor, highlights);
         return panel;
+    }
+
+    private static SolidBrush GetIndicatorBrush(Color color)
+    {
+        lock (IndicatorBrushLock)
+        {
+            if (!IndicatorBrushCache.TryGetValue(color.ToArgb(), out var brush))
+            {
+                brush = new SolidBrush(color);
+                IndicatorBrushCache[color.ToArgb()] = brush;
+            }
+
+            return brush;
+        }
+    }
+
+    private static bool IsHighRisk(SpreadsheetMergeConflictGridRow row)
+        => !row.TargetRowExists && row.SourceCellExists ||
+            row.Kind == SpreadsheetMergeChangeKind.Conflict;
+
+    private static string GetRiskReason(SpreadsheetMergeConflictGridRow row)
+    {
+        if (!row.TargetRowExists && row.SourceCellExists)
+        {
+            return "目标行缺失但来源单元格将写入，建议确认新增/插入位置。";
+        }
+
+        if (row.Kind == SpreadsheetMergeChangeKind.Conflict)
+        {
+            return "目标与来源同时改动，需要人工确认取舍。";
+        }
+
+        return "无高风险。";
+    }
+
+    private static Color GetRiskColor(SpreadsheetMergeConflictGridRow row)
+    {
+        if (!row.TargetRowExists && row.SourceCellExists)
+        {
+            return Color.FromArgb(220, 38, 38);
+        }
+
+        return row.Kind switch
+        {
+            SpreadsheetMergeChangeKind.Conflict => Color.FromArgb(217, 119, 6),
+            SpreadsheetMergeChangeKind.AutoRemote => Color.FromArgb(22, 163, 74),
+            SpreadsheetMergeChangeKind.LocalOnly => Color.FromArgb(37, 99, 235),
+            SpreadsheetMergeChangeKind.SameBoth => Color.FromArgb(148, 163, 184),
+            _ => Color.FromArgb(203, 213, 225),
+        };
     }
 
     private void ApplyRowStyles()
@@ -573,6 +789,64 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         UpdateSummary();
         ApplyRowStyles();
         UpdateMergeDetail();
+        _overviewStrip?.Invalidate();
+    }
+
+    private void ApplyChipFilter()
+    {
+        var filtered = _activeFilter switch
+        {
+            MergeRowFilter.AutoRemote => _rows.Where(row => row.Kind == SpreadsheetMergeChangeKind.AutoRemote).ToList(),
+            MergeRowFilter.LocalOnly => _rows.Where(row => row.Kind == SpreadsheetMergeChangeKind.LocalOnly).ToList(),
+            MergeRowFilter.Conflict => _rows.Where(row => row.Kind == SpreadsheetMergeChangeKind.Conflict).ToList(),
+            MergeRowFilter.Risk => _rows.Where(IsHighRisk).ToList(),
+            _ => _rows.ToList(),
+        };
+
+        _source.DataSource = filtered;
+        _source.ResetBindings(false);
+        if (_grid.Rows.Count > 0)
+        {
+            _grid.ClearSelection();
+            _grid.Rows[0].Selected = true;
+            _grid.CurrentCell = _grid.Rows[0].Cells[Math.Min(1, _grid.Columns.Count - 1)];
+        }
+
+        UpdateFilterChipStyles();
+        UpdateSummary();
+        ApplyRowStyles();
+        UpdateMergeDetail();
+        _overviewStrip?.Invalidate();
+    }
+
+    private void UpdateFilterChipStyles()
+    {
+        foreach (var chip in _filterChips)
+        {
+            var selected = chip.Filter == _activeFilter;
+            chip.Button.BackColor = chip.BackColor;
+            chip.Button.ForeColor = chip.ForeColor;
+            chip.Button.FlatAppearance.BorderColor = selected ? chip.ForeColor : Color.FromArgb(226, 232, 240);
+            chip.Button.Font = selected ? ChipFontBold : ChipFontRegular;
+        }
+    }
+
+    private IReadOnlyList<SpreadsheetMergeConflictGridRow> GetVisibleRows()
+        => _source.List.OfType<SpreadsheetMergeConflictGridRow>().ToList();
+
+    private void JumpToVisibleRow(int rowIndex)
+    {
+        if (rowIndex < 0 || rowIndex >= _grid.Rows.Count)
+        {
+            return;
+        }
+
+        _grid.ClearSelection();
+        _grid.Rows[rowIndex].Selected = true;
+        _grid.CurrentCell = _grid.Rows[rowIndex].Cells[Math.Min(1, _grid.Columns.Count - 1)];
+        _grid.FirstDisplayedScrollingRowIndex = rowIndex;
+        _grid.Focus();
+        _overviewStrip?.Invalidate();
     }
 
     private void SynchronizeRowOperation(int rowIndex, int columnIndex)
@@ -623,6 +897,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
             }
 
             _source.ResetBindings(false);
+            _overviewStrip?.Invalidate();
         }
         finally
         {
@@ -666,6 +941,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
     private void UpdateSummary()
     {
         var writeCount = _rows.Count(row => row.OperationText != _keepTargetText);
+        var riskCount = _rows.Count(IsHighRisk);
         var missingTargetRows = _rows
             .Where(row => !row.TargetRowExists && row.SourceCellExists)
             .Select(row => row.RowMergeKey)
@@ -674,9 +950,137 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         var plannedWrites = _rows.Count(row =>
             row.OperationText != _keepTargetText &&
             !string.Equals(row.LocalValue, row.RemoteValue, StringComparison.Ordinal));
+        var filterText = _activeFilter == MergeRowFilter.All
+            ? $"当前显示全部 {_rows.Count} 项"
+            : $"已筛选: {_source.Count} / {_rows.Count} 项（{GetFilterText(_activeFilter)}）";
         _summaryLabel.Text =
-            $"可应用{_sourceLabel} {_plan.AutoRemoteChanges.Count} 项；{_targetLabel}独有 {_plan.LocalOnlyChanges.Count} 项；两边相同 {_plan.SameBothChanges.Count} 项；冲突 {_plan.Conflicts.Count} 项。{Environment.NewLine}" +
-            $"当前选择写入/插入/删除 {writeCount} 项、保留 {_rows.Count - writeCount} 项；目标缺行 {missingTargetRows} 行；预计生成 {plannedWrites} 个写入动作。";
+            $"可应用{_sourceLabel} {_plan.AutoRemoteChanges.Count} 项；{_targetLabel}独有 {_plan.LocalOnlyChanges.Count} 项；两边相同 {_plan.SameBothChanges.Count} 项；冲突 {_plan.Conflicts.Count} 项；风险 {riskCount} 项。{Environment.NewLine}" +
+            $"当前选择写入/插入/删除 {writeCount} 项、保留 {_rows.Count - writeCount} 项；目标缺行 {missingTargetRows} 行；预计生成 {plannedWrites} 个写入动作；{filterText}。";
+    }
+
+    private static string GetFilterText(MergeRowFilter filter)
+    {
+        return filter switch
+        {
+            MergeRowFilter.AutoRemote => "自动应用",
+            MergeRowFilter.LocalOnly => "本地保留",
+            MergeRowFilter.Conflict => "冲突",
+            MergeRowFilter.Risk => "风险",
+            _ => "全部",
+        };
+    }
+
+    private enum MergeRowFilter
+    {
+        All,
+        AutoRemote,
+        LocalOnly,
+        Conflict,
+        Risk,
+    }
+
+    private sealed record FilterChipState(Button Button, MergeRowFilter Filter, Color BackColor, Color ForeColor);
+
+    private sealed class MergeDiffOverviewStrip : Control
+    {
+        private readonly DataGridView _grid;
+        private readonly Func<IReadOnlyList<SpreadsheetMergeConflictGridRow>> _rowsProvider;
+        private readonly Action<int> _onJump;
+
+        public MergeDiffOverviewStrip(
+            DataGridView grid,
+            Func<IReadOnlyList<SpreadsheetMergeConflictGridRow>> rowsProvider,
+            Action<int> onJump)
+        {
+            _grid = grid;
+            _rowsProvider = rowsProvider;
+            _onJump = onJump;
+            DoubleBuffered = true;
+            Cursor = Cursors.Hand;
+            BackColor = Color.White;
+            MinimumSize = new Size(12, 0);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var bounds = ClientRectangle;
+            if (bounds.Width <= 0 || bounds.Height <= 0)
+            {
+                return;
+            }
+
+            e.Graphics.FillRectangle(GetIndicatorBrush(Color.White), bounds);
+            var rows = _rowsProvider();
+            if (rows.Count == 0)
+            {
+                using var emptyPen = new Pen(Color.FromArgb(226, 232, 240));
+                e.Graphics.DrawRectangle(emptyPen, new Rectangle(bounds.Left, bounds.Top, bounds.Width - 1, bounds.Height - 1));
+                return;
+            }
+
+            for (var index = 0; index < rows.Count; index++)
+            {
+                var top = bounds.Top + (int)Math.Floor(index * bounds.Height / (double)rows.Count);
+                var bottom = bounds.Top + (int)Math.Ceiling((index + 1) * bounds.Height / (double)rows.Count);
+                var height = Math.Max(1, bottom - top);
+                var rowBounds = new Rectangle(bounds.Left + 2, top, Math.Max(1, bounds.Width - 4), height);
+                e.Graphics.FillRectangle(GetIndicatorBrush(GetRiskColor(rows[index])), rowBounds);
+            }
+
+            DrawViewport(e.Graphics, bounds, rows.Count);
+            DrawSelectedRow(e.Graphics, bounds, rows.Count);
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            base.OnMouseClick(e);
+            var rows = _rowsProvider();
+            if (rows.Count == 0 || Height <= 0)
+            {
+                return;
+            }
+
+            var rowIndex = Math.Clamp((int)Math.Floor(e.Y / (double)Math.Max(1, Height) * rows.Count), 0, rows.Count - 1);
+            _onJump(rowIndex);
+        }
+
+        private void DrawViewport(Graphics graphics, Rectangle bounds, int rowCount)
+        {
+            if (_grid.RowCount <= 0 || rowCount <= 0)
+            {
+                return;
+            }
+
+            var first = 0;
+            try
+            {
+                first = Math.Max(0, _grid.FirstDisplayedScrollingRowIndex);
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+
+            var displayed = Math.Max(1, _grid.DisplayedRowCount(true));
+            var top = bounds.Top + (int)Math.Floor(first * bounds.Height / (double)rowCount);
+            var bottom = bounds.Top + (int)Math.Ceiling(Math.Min(rowCount, first + displayed) * bounds.Height / (double)rowCount);
+            using var pen = new Pen(Color.FromArgb(51, 65, 85));
+            graphics.DrawRectangle(pen, new Rectangle(bounds.Left, top, bounds.Width - 1, Math.Max(3, bottom - top)));
+        }
+
+        private void DrawSelectedRow(Graphics graphics, Rectangle bounds, int rowCount)
+        {
+            var selectedIndex = _grid.CurrentCell?.RowIndex ?? -1;
+            if (selectedIndex < 0 || selectedIndex >= rowCount)
+            {
+                return;
+            }
+
+            var y = bounds.Top + (int)Math.Round((selectedIndex + 0.5) * bounds.Height / (double)rowCount);
+            using var pen = new Pen(Color.FromArgb(37, 99, 235), 2F);
+            graphics.DrawLine(pen, bounds.Left, y, bounds.Right - 1, y);
+        }
     }
 }
 

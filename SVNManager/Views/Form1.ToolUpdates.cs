@@ -20,7 +20,7 @@ public partial class Form1
         _checkingToolUpdate = true;
         try
         {
-            _lastReleaseUpdateStatus = await ReleaseUpdateChecker.CheckLatestAsync(AppInfo.Version);
+            _lastReleaseUpdateStatus = await ReleaseUpdateChecker.CheckLatestAsync(AppInfo.Version, _settings.UpdateChannel);
             if (_lastReleaseUpdateStatus.State == ReleaseUpdateState.UpdateAvailable)
             {
                 _toolUpdateStatusLabel.Text = $"工具有新版本 {_lastReleaseUpdateStatus.LatestTag}";
@@ -174,6 +174,8 @@ public partial class Form1
 
         var confirm = MessageBox.Show(
             $"准备下载并安装 {status.LatestTag}。{Environment.NewLine}{Environment.NewLine}" +
+            $"更新通道：{status.Channel}{Environment.NewLine}" +
+            $"来源：{status.Source}{Environment.NewLine}" +
             "程序会在下载完成后自动关闭、覆盖当前目录并重新启动。继续？",
             "自动更新工具",
             MessageBoxButtons.OKCancel,
@@ -187,7 +189,7 @@ public partial class Form1
         SetBusy(true, "正在下载工具更新...");
         try
         {
-            var zipPath = await ReleaseUpdateChecker.DownloadAssetAsync(status.AssetDownloadUrl, status.LatestTag);
+            var zipPath = await ReleaseUpdateChecker.DownloadAssetAsync(status.AssetDownloadUrl, status.LatestTag, status.Sha256);
             OperationLogger.Log("ToolReleaseDownloadSuccess", AppContext.BaseDirectory, zipPath);
             StartSelfUpdater(zipPath);
             Application.Exit();
@@ -257,7 +259,7 @@ try {{
 
     private WorkingCopyInfo RefreshWorkingCopyRevisionStatus(bool showFailure = false)
     {
-        var workingCopy = _configView.WorkingCopyPath.Trim();
+        var workingCopy = GetWorkingCopyRootPath();
         if (string.IsNullOrWhiteSpace(workingCopy))
         {
             SetWorkingCopyRevisionStatus(WorkingCopyInfo.Empty, "本地：未选择", SystemColors.ControlText, "未选择工作副本。");
@@ -329,7 +331,7 @@ try {{
         _checkingRemote = true;
         try
         {
-            var workingCopy = _configView.WorkingCopyPath.Trim();
+            var workingCopy = GetRequiredWorkingCopyContext().SelectedPath;
             var info = RefreshWorkingCopyRevisionStatus();
             var latest = await _svn.GetLatestRepositoryLogAsync(workingCopy);
             if (latest == null)
@@ -390,12 +392,6 @@ try {{
         {
             _checkingRemote = false;
         }
-    }
-
-    private bool ValidateWorkingCopyPathForBackground()
-    {
-        var path = _configView.WorkingCopyPath.Trim();
-        return Directory.Exists(path) && Directory.Exists(Path.Combine(path, ".svn"));
     }
 
 }
