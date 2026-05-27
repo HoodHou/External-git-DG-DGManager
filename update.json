@@ -1,13 +1,13 @@
 {
   "stable": {
-    "version": "0.3.3",
-    "tag": "v0.3.3",
-    "assetName": "DreamSVNManager-win-x64-v0.3.3.zip",
-    "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.3/DreamSVNManager-win-x64-v0.3.3.zip",
+    "version": "0.3.4",
+    "tag": "v0.3.4",
+    "assetName": "DreamSVNManager-win-x64-v0.3.4.zip",
+    "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.4/DreamSVNManager-win-x64-v0.3.4.zip",
     "sha256": "",
     "required": false,
-    "notes": "# Dream SVNManager v0.3.3\n\n## 重点更新\n\n- 自动更新下载改为流式读取，底部状态栏会显示下载进度、已下载大小、总大小和平均速度。\n- 更新包下载超时从 15 秒放宽到 5 分钟，减少 GitHub/CDN 较慢时误判失败。\n- 下载超时提示改为可读原因，便于判断是网络慢、代理不可用还是组织网络策略阻断。\n\n## 发布说明\n\n- 这是自动更新链路的紧急修复版本。\n- 如果进度一直停在“正在连接”，通常表示还没有拿到 GitHub/CDN 响应；如果字节数在增长，则说明正在下载但网络较慢。\n",
-    "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.3",
+    "notes": "# Dream SVNManager v0.3.4\n\n## 重点更新\n\n- 修复 SpreadsheetML XML 表格合并后单元格出现大量换行、缩进空格和异常可见符号的问题。\n- 读取 XML 表格单元格时会清理 XML 格式化缩进产生的空白，同时保留普通单行文本里的正常空格。\n\n## 发布说明\n\n- 这是表格三方合并写回的紧急修复版本。\n- 已经被污染的旧临时 xlsx 或旧合并结果需要重新用本版本执行合并/对比，旧文件本身不会自动清理。\n",
+    "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.4",
     "publishedAt": "2026-05-27"
   }
 }

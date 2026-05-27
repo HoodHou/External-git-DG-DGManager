@@ -1,3 +1,4 @@
+using System.Text;
 using System.Xml.Linq;
 
 namespace SVNManager;
@@ -75,10 +76,23 @@ internal static class SpreadsheetXmlFormat
 
     public static string NormalizeCellText(string? value)
     {
-        return (value ?? "")
-            .Replace("\r\n", "\n", StringComparison.Ordinal)
-            .Replace('\r', '\n')
-            .Trim();
+        var normalized = NormalizeLineEndings(value);
+        if (!normalized.Contains('\n', StringComparison.Ordinal))
+        {
+            return normalized.Trim();
+        }
+
+        var builder = new StringBuilder(normalized.Length);
+        foreach (var line in normalized.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length > 0)
+            {
+                builder.Append(trimmed);
+            }
+        }
+
+        return builder.ToString();
     }
 
     private static bool IsNamed(XElement element, string localName)
@@ -104,9 +118,10 @@ internal static class SpreadsheetXmlFormat
         {
             if (node is XText text)
             {
-                if (!string.IsNullOrWhiteSpace(text.Value))
+                var value = NormalizeTextNode(text.Value);
+                if (!string.IsNullOrEmpty(value))
                 {
-                    parts.Add(text.Value);
+                    parts.Add(value);
                 }
 
                 continue;
@@ -117,6 +132,39 @@ internal static class SpreadsheetXmlFormat
                 AppendNodeText(element.Nodes(), parts);
             }
         }
+    }
+
+    private static string NormalizeTextNode(string? value)
+    {
+        var normalized = NormalizeLineEndings(value);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return "";
+        }
+
+        if (!normalized.Contains('\n', StringComparison.Ordinal))
+        {
+            return normalized;
+        }
+
+        var builder = new StringBuilder(normalized.Length);
+        foreach (var line in normalized.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length > 0)
+            {
+                builder.Append(trimmed);
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private static string NormalizeLineEndings(string? value)
+    {
+        return (value ?? "")
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n');
     }
 
     private static XName ElementName(XElement parent, string localName)
