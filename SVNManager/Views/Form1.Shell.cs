@@ -314,6 +314,17 @@ public partial class Form1
         };
         _statusLabel.Text = "就绪";
         statusStrip.Items.Add(_statusLabel);
+
+        _toolUpdateDownloadProgressBar.Minimum = 0;
+        _toolUpdateDownloadProgressBar.Maximum = 100;
+        _toolUpdateDownloadProgressBar.Width = 160;
+        _toolUpdateDownloadProgressBar.Style = ProgressBarStyle.Marquee;
+        _toolUpdateDownloadProgressBar.Visible = false;
+        statusStrip.Items.Add(_toolUpdateDownloadProgressBar);
+
+        _toolUpdateDownloadProgressLabel.Visible = false;
+        statusStrip.Items.Add(_toolUpdateDownloadProgressLabel);
+
         statusStrip.Items.Add(new ToolStripStatusLabel { Spring = true });
 
         _localRevisionStatusLabel.Text = "本地：未检查";

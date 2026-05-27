@@ -40,6 +40,8 @@ public partial class Form1 : Form
     private readonly ContextMenuStrip _moreActionsMenu = new();
     private readonly ImageList _treeImages = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
+    private readonly ToolStripProgressBar _toolUpdateDownloadProgressBar = new();
+    private readonly ToolStripStatusLabel _toolUpdateDownloadProgressLabel = new();
     private readonly ToolStripStatusLabel _localRevisionStatusLabel = new();
     private readonly ToolStripStatusLabel _toolUpdateStatusLabel = new();
     private readonly ToolStripStatusLabel _remoteStatusLabel = new();

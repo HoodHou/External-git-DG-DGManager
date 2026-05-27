@@ -38,6 +38,13 @@ internal sealed record ReleaseUpdateStatus(
     string Sha256,
     bool Required);
 
+internal sealed record ReleaseDownloadProgress(long BytesReceived, long? TotalBytes, double BytesPerSecond)
+{
+    public int Percent => TotalBytes.HasValue && TotalBytes.Value > 0
+        ? (int)Math.Clamp(BytesReceived * 100d / TotalBytes.Value, 0d, 100d)
+        : -1;
+}
+
 internal static class AppInfo
 {
     public static Version Version { get; } = Assembly.GetExecutingAssembly().GetName().Version ?? new Version(0, 0, 0, 0);
@@ -61,7 +68,9 @@ internal static class ReleaseUpdateChecker
     private const string UpdateManifestUrl = "https://raw.githubusercontent.com/HoodHou/External-git-DG-DGManager/main/update.json";
     private const string LatestReleaseUrl = "https://api.github.com/repos/HoodHou/External-git-DG-DGManager/releases/latest";
     private const string ReleasesUrl = "https://github.com/HoodHou/External-git-DG-DGManager/releases";
-    private static readonly HttpClient Http = CreateHttpClient();
+    private static readonly TimeSpan DownloadTimeout = TimeSpan.FromMinutes(5);
+    private static readonly HttpClient Http = CreateHttpClient(TimeSpan.FromSeconds(15));
+    private static readonly HttpClient DownloadHttp = CreateHttpClient(DownloadTimeout);
 
     public static async Task<ReleaseUpdateStatus> CheckLatestAsync(Version currentVersion, string channel)
     {
@@ -118,7 +127,12 @@ internal static class ReleaseUpdateChecker
         }
     }
 
-    public static async Task<string> DownloadAssetAsync(string assetDownloadUrl, string tag, string expectedSha256)
+    public static async Task<string> DownloadAssetAsync(
+        string assetDownloadUrl,
+        string tag,
+        string expectedSha256,
+        IProgress<ReleaseDownloadProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(assetDownloadUrl))
         {
@@ -128,25 +142,62 @@ internal static class ReleaseUpdateChecker
         var directory = Path.Combine(Path.GetTempPath(), "DreamSVNManagerUpdate");
         Directory.CreateDirectory(directory);
         var zipPath = Path.Combine(directory, $"DreamSVNManager-{tag}-{Guid.NewGuid():N}.zip");
-        using var response = await Http.GetAsync(assetDownloadUrl);
-        response.EnsureSuccessStatusCode();
-        await using var input = await response.Content.ReadAsStreamAsync();
-        await using var output = File.Create(zipPath);
-        await input.CopyToAsync(output);
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(DownloadTimeout);
+            var token = timeoutCts.Token;
+            using var request = new HttpRequestMessage(HttpMethod.Get, assetDownloadUrl);
+            using var response = await DownloadHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+            response.EnsureSuccessStatusCode();
+
+            var totalBytes = response.Content.Headers.ContentLength;
+            var stopwatch = Stopwatch.StartNew();
+            ReportDownloadProgress(progress, 0, totalBytes, stopwatch);
+
+            await using var input = await response.Content.ReadAsStreamAsync(token);
+            await using var output = File.Create(zipPath);
+            var buffer = new byte[81920];
+            var bytesReceived = 0L;
+            var reportStopwatch = Stopwatch.StartNew();
+            while (true)
+            {
+                var read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), token);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                await output.WriteAsync(buffer.AsMemory(0, read), token);
+                bytesReceived += read;
+                if (reportStopwatch.ElapsedMilliseconds >= 200)
+                {
+                    ReportDownloadProgress(progress, bytesReceived, totalBytes, stopwatch);
+                    reportStopwatch.Restart();
+                }
+            }
+
+            ReportDownloadProgress(progress, bytesReceived, totalBytes, stopwatch);
+        }
+        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            TryDeleteFile(zipPath);
+            throw new TimeoutException(
+                $"下载更新包超时（超过 {DownloadTimeout.TotalMinutes:0} 分钟）。可能是 GitHub/CDN 访问较慢、被网络策略阻断，或代理不可用。",
+                ex);
+        }
+        catch
+        {
+            TryDeleteFile(zipPath);
+            throw;
+        }
 
         if (!string.IsNullOrWhiteSpace(expectedSha256))
         {
             var actualSha256 = ComputeSha256(zipPath);
             if (!string.Equals(NormalizeSha256(expectedSha256), actualSha256, StringComparison.OrdinalIgnoreCase))
             {
-                try
-                {
-                    File.Delete(zipPath);
-                }
-                catch
-                {
-                }
-
+                TryDeleteFile(zipPath);
                 throw new InvalidOperationException($"更新包校验失败：期望 {NormalizeSha256(expectedSha256)}，实际 {actualSha256}。");
             }
         }
@@ -235,13 +286,42 @@ internal static class ReleaseUpdateChecker
             false);
     }
 
-    private static HttpClient CreateHttpClient()
+    private static HttpClient CreateHttpClient(TimeSpan timeout)
     {
         var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd("DreamSVNManager/" + AppInfo.VersionText);
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
-        client.Timeout = TimeSpan.FromSeconds(15);
+        client.Timeout = timeout;
         return client;
+    }
+
+    private static void ReportDownloadProgress(
+        IProgress<ReleaseDownloadProgress>? progress,
+        long bytesReceived,
+        long? totalBytes,
+        Stopwatch stopwatch)
+    {
+        if (progress == null)
+        {
+            return;
+        }
+
+        var elapsedSeconds = Math.Max(stopwatch.Elapsed.TotalSeconds, 0.001d);
+        progress.Report(new ReleaseDownloadProgress(bytesReceived, totalBytes, bytesReceived / elapsedSeconds));
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+        }
     }
 
     private static bool TryGetManifestChannel(JsonElement root, string channel, out JsonElement entry)

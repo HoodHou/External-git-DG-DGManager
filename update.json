@@ -1,13 +1,13 @@
 {
   "stable": {
-    "version": "0.3.2",
-    "tag": "v0.3.2",
-    "assetName": "DreamSVNManager-win-x64-v0.3.2.zip",
-    "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.2/DreamSVNManager-win-x64-v0.3.2.zip",
+    "version": "0.3.3",
+    "tag": "v0.3.3",
+    "assetName": "DreamSVNManager-win-x64-v0.3.3.zip",
+    "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.3/DreamSVNManager-win-x64-v0.3.3.zip",
     "sha256": "",
     "required": false,
-    "notes": "修复 XML / 表格三方合并写回格式问题；支持 XML 冲突文件使用 .mine/.r 版本进行内置合并；新增合并风险概览。",
-    "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.2",
+    "notes": "# Dream SVNManager v0.3.3\n\n## 重点更新\n\n- 自动更新下载改为流式读取，底部状态栏会显示下载进度、已下载大小、总大小和平均速度。\n- 更新包下载超时从 15 秒放宽到 5 分钟，减少 GitHub/CDN 较慢时误判失败。\n- 下载超时提示改为可读原因，便于判断是网络慢、代理不可用还是组织网络策略阻断。\n\n## 发布说明\n\n- 这是自动更新链路的紧急修复版本。\n- 如果进度一直停在“正在连接”，通常表示还没有拿到 GitHub/CDN 响应；如果字节数在增长，则说明正在下载但网络较慢。\n",
+    "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.3",
     "publishedAt": "2026-05-27"
   }
 }

@@ -186,10 +186,12 @@ public partial class Form1
             return;
         }
 
-        SetBusy(true, "正在下载工具更新...");
+        SetBusy(true, "正在连接更新下载...");
+        BeginReleaseDownloadProgress();
         try
         {
-            var zipPath = await ReleaseUpdateChecker.DownloadAssetAsync(status.AssetDownloadUrl, status.LatestTag, status.Sha256);
+            var progress = new Progress<ReleaseDownloadProgress>(UpdateReleaseDownloadProgress);
+            var zipPath = await ReleaseUpdateChecker.DownloadAssetAsync(status.AssetDownloadUrl, status.LatestTag, status.Sha256, progress);
             OperationLogger.Log("ToolReleaseDownloadSuccess", AppContext.BaseDirectory, zipPath);
             StartSelfUpdater(zipPath);
             Application.Exit();
@@ -200,8 +202,75 @@ public partial class Form1
         }
         finally
         {
+            HideReleaseDownloadProgress();
             SetBusy(false, "就绪");
         }
+    }
+
+    private void BeginReleaseDownloadProgress()
+    {
+        _toolUpdateDownloadProgressBar.Value = 0;
+        _toolUpdateDownloadProgressBar.Style = ProgressBarStyle.Marquee;
+        _toolUpdateDownloadProgressBar.Visible = true;
+        _toolUpdateDownloadProgressLabel.Text = "正在连接...";
+        _toolUpdateDownloadProgressLabel.Visible = true;
+    }
+
+    private void UpdateReleaseDownloadProgress(ReleaseDownloadProgress progress)
+    {
+        if (progress.Percent >= 0)
+        {
+            _toolUpdateDownloadProgressBar.Style = ProgressBarStyle.Continuous;
+            _toolUpdateDownloadProgressBar.Value = Math.Clamp(progress.Percent, _toolUpdateDownloadProgressBar.Minimum, _toolUpdateDownloadProgressBar.Maximum);
+        }
+        else
+        {
+            _toolUpdateDownloadProgressBar.Style = ProgressBarStyle.Marquee;
+        }
+
+        var text = FormatReleaseDownloadProgress(progress);
+        _toolUpdateDownloadProgressLabel.Text = text;
+        _statusLabel.Text = progress.BytesReceived > 0
+            ? $"正在下载工具更新：{text}"
+            : "正在连接更新下载...";
+    }
+
+    private void HideReleaseDownloadProgress()
+    {
+        _toolUpdateDownloadProgressBar.Style = ProgressBarStyle.Continuous;
+        _toolUpdateDownloadProgressBar.Value = 0;
+        _toolUpdateDownloadProgressBar.Visible = false;
+        _toolUpdateDownloadProgressLabel.Text = "";
+        _toolUpdateDownloadProgressLabel.Visible = false;
+    }
+
+    private static string FormatReleaseDownloadProgress(ReleaseDownloadProgress progress)
+    {
+        var downloaded = FormatDownloadBytes(progress.BytesReceived);
+        var speed = progress.BytesPerSecond > 0
+            ? $"{FormatDownloadBytes((long)progress.BytesPerSecond)}/s"
+            : "等待数据";
+        if (progress.TotalBytes.HasValue && progress.TotalBytes.Value > 0)
+        {
+            return $"{progress.Percent}%  {downloaded}/{FormatDownloadBytes(progress.TotalBytes.Value)}  {speed}";
+        }
+
+        return $"{downloaded}  {speed}";
+    }
+
+    private static string FormatDownloadBytes(long bytes)
+    {
+        if (bytes >= 1024L * 1024L * 1024L)
+        {
+            return $"{bytes / 1024d / 1024d / 1024d:0.##} GB";
+        }
+
+        if (bytes >= 1024L * 1024L)
+        {
+            return $"{bytes / 1024d / 1024d:0.##} MB";
+        }
+
+        return bytes >= 1024L ? $"{bytes / 1024d:0.##} KB" : $"{bytes} B";
     }
 
     private static void StartSelfUpdater(string zipPath)
