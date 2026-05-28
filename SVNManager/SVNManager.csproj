@@ -7,10 +7,10 @@
     <UseWindowsForms>true</UseWindowsForms>
     <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Version>0.3.5</Version>
-    <AssemblyVersion>0.3.5.0</AssemblyVersion>
-    <FileVersion>0.3.5.0</FileVersion>
-    <InformationalVersion>0.3.5</InformationalVersion>
+    <Version>0.3.6</Version>
+    <AssemblyVersion>0.3.6.0</AssemblyVersion>
+    <FileVersion>0.3.6.0</FileVersion>
+    <InformationalVersion>0.3.6</InformationalVersion>
     <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
     <NuGetAudit>false</NuGetAudit>
   </PropertyGroup>
