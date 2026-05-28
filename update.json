@@ -1,13 +1,13 @@
 {
   "stable": {
-    "version": "0.3.4",
-    "tag": "v0.3.4",
-    "assetName": "DreamSVNManager-win-x64-v0.3.4.zip",
-    "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.4/DreamSVNManager-win-x64-v0.3.4.zip",
-    "sha256": "",
+    "version": "0.3.5",
+    "tag": "v0.3.5",
+    "assetName": "DreamSVNManager-win-x64-v0.3.5.zip",
+    "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.5/DreamSVNManager-win-x64-v0.3.5.zip",
+    "sha256": "13873d6490350f73cabdef655526f230eb89f404c151eacb25725874e7e065f6",
     "required": false,
-    "notes": "# Dream SVNManager v0.3.4\n\n## 重点更新\n\n- 修复 SpreadsheetML XML 表格合并后单元格出现大量换行、缩进空格和异常可见符号的问题。\n- 读取 XML 表格单元格时会清理 XML 格式化缩进产生的空白，同时保留普通单行文本里的正常空格。\n\n## 发布说明\n\n- 这是表格三方合并写回的紧急修复版本。\n- 已经被污染的旧临时 xlsx 或旧合并结果需要重新用本版本执行合并/对比，旧文件本身不会自动清理。\n",
-    "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.4",
-    "publishedAt": "2026-05-27"
+    "notes": "# Dream SVNManager v0.3.5\n\n## 重点更新\n\n- 表格三方合并改为 WPF 合并工作台，突出 BASE / 目标 / 来源三栏对比和逐项决策。\n- 表格合并只处理来源 diff 相关内容：自动应用项和真实冲突项，不再要求处理目标侧独有改动。\n- 新增整行上下文视图，当前行的字段、BASE、目标、来源会完整展示，便于判断缺行和关联字段。\n- 目标缺行但来源存在时，采用来源会按新增/插入整行处理，避免只写单个单元格造成半行数据。\n- 更新窗口的更新内容支持自动换行，长发布说明不再需要横向滚动。\n\n## 修复\n\n- 修复 WPF 资源初始化和只读属性双向绑定导致合并窗口打不开的问题。\n- 优化合并窗口决策时的列表刷新，减少大量冲突项下的卡顿。",
+    "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.5",
+    "publishedAt": "2026-05-28"
   }
 }

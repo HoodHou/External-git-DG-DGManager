@@ -62,11 +62,14 @@ internal sealed class SpreadsheetMergePlan
         .Concat(SameBothChanges)
         .Concat(Conflicts)
         .ToList();
+    public IReadOnlyList<SpreadsheetMergeChange> MergeWorkChanges => AutoRemoteChanges
+        .Concat(Conflicts)
+        .ToList();
     public int ResolvedConflictCount => Conflicts.Count(change => change.Resolution == SpreadsheetMergeResolution.UseRemote);
     public int PlannedWriteCount => AllChanges.Count(change =>
         change.Operation != SpreadsheetMergeOperation.KeepTarget &&
         !string.Equals(change.LocalValue, change.RemoteValue, StringComparison.Ordinal));
-    public int RelevantChangeCount => AutoRemoteChanges.Count + LocalOnlyChanges.Count + SameBothChanges.Count + Conflicts.Count;
+    public int RelevantChangeCount => MergeWorkChanges.Count;
 
     public IReadOnlyList<SpreadsheetMergeWrite> BuildWrites()
     {
@@ -80,17 +83,57 @@ internal sealed class SpreadsheetMergePlan
             .Select(group => new SpreadsheetMergeWrite(new ExcelCellKey(group.Key.Sheet, group.Key.Row, 0), "", SpreadsheetMergeWriteKind.DeleteRow));
         var inserts = selectedChanges
             .Where(change => change.Operation == SpreadsheetMergeOperation.InsertRow)
-            .Select(change => new SpreadsheetMergeWrite(change.WriteCell, change.RemoteValue, SpreadsheetMergeWriteKind.InsertRow));
+            .GroupBy(change => new ExcelRowKey(change.WriteCell.Sheet, change.WriteCell.Row))
+            .SelectMany(group => BuildSourceRowWrites(group, SpreadsheetMergeWriteKind.InsertRow));
+        var appends = selectedChanges
+            .Where(change => change.Operation == SpreadsheetMergeOperation.AppendRow)
+            .GroupBy(change => new ExcelRowKey(change.WriteCell.Sheet, change.WriteCell.Row))
+            .SelectMany(group => BuildSourceRowWrites(group, SpreadsheetMergeWriteKind.SetCell));
         var sets = selectedChanges
-            .Where(change => change.Operation is SpreadsheetMergeOperation.WriteCell or SpreadsheetMergeOperation.AppendRow)
+            .Where(change => change.Operation == SpreadsheetMergeOperation.WriteCell)
             .Select(change => new SpreadsheetMergeWrite(change.WriteCell, change.RemoteValue, SpreadsheetMergeWriteKind.SetCell));
 
         return deletes
             .Concat(inserts)
+            .Concat(appends)
             .Concat(sets)
             .GroupBy(write => $"{write.Kind}|{write.Cell.Sheet}|{write.Cell.Row}|{write.Cell.Column}", StringComparer.Ordinal)
             .Select(group => group.Last())
             .ToList();
+    }
+
+    private static IEnumerable<SpreadsheetMergeWrite> BuildSourceRowWrites(
+        IEnumerable<SpreadsheetMergeChange> changes,
+        SpreadsheetMergeWriteKind kind)
+    {
+        var groupedChanges = changes.ToList();
+        if (groupedChanges.Count == 0)
+        {
+            yield break;
+        }
+
+        var anchor = groupedChanges.First();
+        var row = anchor.WriteCell.Row;
+        var sheet = anchor.WriteCell.Sheet;
+        var contextFields = anchor.RowContext.Fields
+            .Where(field => field.ColumnIndex >= 0)
+            .Where(field => !string.IsNullOrEmpty(field.RemoteValue))
+            .OrderBy(field => field.ColumnIndex)
+            .ToList();
+        if (contextFields.Count == 0)
+        {
+            foreach (var change in groupedChanges)
+            {
+                yield return new SpreadsheetMergeWrite(change.WriteCell, change.RemoteValue, kind);
+            }
+
+            yield break;
+        }
+
+        foreach (var field in contextFields)
+        {
+            yield return new SpreadsheetMergeWrite(new ExcelCellKey(sheet, row, field.ColumnIndex), field.RemoteValue, kind);
+        }
     }
 }
 
@@ -107,7 +150,8 @@ internal sealed class SpreadsheetMergeChange
         bool targetCellExists = true,
         bool targetRowExists = true,
         bool sourceCellExists = true,
-        string rowMergeKey = "")
+        string rowMergeKey = "",
+        SpreadsheetMergeRowContext? rowContext = null)
     {
         Kind = kind;
         TargetCell = targetCell;
@@ -121,6 +165,7 @@ internal sealed class SpreadsheetMergeChange
         TargetRowExists = targetRowExists;
         SourceCellExists = sourceCellExists;
         RowMergeKey = rowMergeKey;
+        RowContext = rowContext ?? new SpreadsheetMergeRowContext([]);
         Resolution = kind == SpreadsheetMergeChangeKind.AutoRemote
             ? SpreadsheetMergeResolution.UseRemote
             : SpreadsheetMergeResolution.UseLocal;
@@ -148,12 +193,24 @@ internal sealed class SpreadsheetMergeChange
     public bool TargetRowExists { get; set; }
     public bool SourceCellExists { get; set; }
     public string RowMergeKey { get; set; }
+    public SpreadsheetMergeRowContext RowContext { get; }
     public string Sheet => TargetCell.Sheet;
     public string ColumnName => ExcelDiffService.ToColumnName(TargetCell.Column);
     public string Address => $"{ColumnName}{TargetCell.Row + 1}";
 }
 
 internal sealed record SpreadsheetMergeWrite(ExcelCellKey Cell, string Value, SpreadsheetMergeWriteKind Kind = SpreadsheetMergeWriteKind.SetCell);
+
+internal sealed record SpreadsheetMergeRowContext(IReadOnlyList<SpreadsheetMergeRowContextField> Fields);
+
+internal sealed record SpreadsheetMergeRowContextField(
+    string FieldName,
+    int ColumnIndex,
+    string ColumnName,
+    string BaseValue,
+    string LocalValue,
+    string RemoteValue,
+    bool IsCurrentField);
 
 internal sealed record SpreadsheetMergeRawCell(
     ExcelCellKey Cell,
@@ -313,26 +370,27 @@ internal static class SpreadsheetThreeWayMergeService
             var target = ResolveTargetCell(localCell, baseCell, remoteCell, localRows, nextAppendRowBySheet, suggestedRows);
             var fieldName = FirstNonEmpty(localCell?.FieldName, remoteCell?.FieldName, baseCell?.FieldName);
             var rowId = FirstNonEmpty(localCell?.RowId, remoteCell?.RowId, baseCell?.RowId);
+            var rowContext = BuildRowContext(baseRaw, localRaw, remoteRaw, baseCell, localCell, remoteCell, target, fieldName);
 
             if (remoteChanged && !localChanged)
             {
-                autoRemote.Add(CreateChange(SpreadsheetMergeChangeKind.AutoRemote, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null));
+                autoRemote.Add(CreateChange(SpreadsheetMergeChangeKind.AutoRemote, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null, rowContext));
                 continue;
             }
 
             if (localChanged && !remoteChanged)
             {
-                localOnly.Add(CreateChange(SpreadsheetMergeChangeKind.LocalOnly, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null));
+                localOnly.Add(CreateChange(SpreadsheetMergeChangeKind.LocalOnly, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null, rowContext));
                 continue;
             }
 
             if (string.Equals(localValue, remoteValue, StringComparison.Ordinal))
             {
-                sameBoth.Add(CreateChange(SpreadsheetMergeChangeKind.SameBoth, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null));
+                sameBoth.Add(CreateChange(SpreadsheetMergeChangeKind.SameBoth, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null, rowContext));
                 continue;
             }
 
-            conflicts.Add(CreateChange(SpreadsheetMergeChangeKind.Conflict, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null));
+            conflicts.Add(CreateChange(SpreadsheetMergeChangeKind.Conflict, target, fieldName, rowId, baseValue, localValue, remoteValue, remoteCell != null, rowContext));
         }
 
         return new SpreadsheetMergePlan(autoRemote, localOnly, sameBoth, conflicts);
@@ -346,7 +404,8 @@ internal static class SpreadsheetThreeWayMergeService
         string baseValue,
         string localValue,
         string remoteValue,
-        bool sourceCellExists)
+        bool sourceCellExists,
+        SpreadsheetMergeRowContext rowContext)
     {
         return new SpreadsheetMergeChange(
             kind,
@@ -359,7 +418,8 @@ internal static class SpreadsheetThreeWayMergeService
             target.TargetCellExists,
             target.TargetRowExists,
             sourceCellExists,
-            target.RowMergeKey);
+            target.RowMergeKey,
+            rowContext);
     }
 
     public static string CreateBackup(string localFilePath)
@@ -661,6 +721,125 @@ internal static class SpreadsheetThreeWayMergeService
                 group => group.Key,
                 group => group.Max(cell => cell.Cell.Row) + 1,
                 StringComparer.Ordinal);
+    }
+
+    private static SpreadsheetMergeRowContext BuildRowContext(
+        IReadOnlyList<SpreadsheetMergeRawCell> baseRaw,
+        IReadOnlyList<SpreadsheetMergeRawCell> localRaw,
+        IReadOnlyList<SpreadsheetMergeRawCell> remoteRaw,
+        SpreadsheetMergeCell? baseCell,
+        SpreadsheetMergeCell? localCell,
+        SpreadsheetMergeCell? remoteCell,
+        SpreadsheetMergeResolvedTarget target,
+        string currentFieldName)
+    {
+        var rowMergeKey = FirstNonEmpty(localCell?.RowMergeKey, remoteCell?.RowMergeKey, baseCell?.RowMergeKey, target.RowMergeKey);
+        var baseRow = GetRowContextCells(baseRaw, rowMergeKey, baseCell?.Cell);
+        var localRow = GetRowContextCells(localRaw, rowMergeKey, localCell?.Cell ?? target.Cell);
+        var remoteRow = GetRowContextCells(remoteRaw, rowMergeKey, remoteCell?.Cell);
+        var currentFieldKey = NormalizeHeader(currentFieldName);
+
+        var fieldKeys = baseRow
+            .Concat(localRow)
+            .Concat(remoteRow)
+            .Select(cell => NormalizeHeader(cell.FieldName))
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .Append(currentFieldKey)
+            .Distinct(StringComparer.Ordinal)
+            .Select(key => new
+            {
+                Key = key,
+                Column = MinColumnForField(key, baseRow, localRow, remoteRow),
+                FieldName = FirstFieldNameForKey(key, currentFieldName, baseRow, localRow, remoteRow),
+            })
+            .OrderBy(field => field.Column)
+            .ThenBy(field => field.FieldName, StringComparer.Ordinal)
+            .ToList();
+
+        var fields = fieldKeys
+            .Select(field => new SpreadsheetMergeRowContextField(
+                field.FieldName,
+                field.Column,
+                field.Column >= 0 ? ExcelDiffService.ToColumnName(field.Column) : "",
+                RowContextValue(baseRow, field.Key),
+                RowContextValue(localRow, field.Key),
+                RowContextValue(remoteRow, field.Key),
+                string.Equals(field.Key, currentFieldKey, StringComparison.Ordinal)))
+            .ToList();
+        return new SpreadsheetMergeRowContext(fields);
+    }
+
+    private static IReadOnlyList<SpreadsheetMergeRawCell> GetRowContextCells(
+        IReadOnlyList<SpreadsheetMergeRawCell> rawCells,
+        string rowMergeKey,
+        ExcelCellKey? fallbackCell)
+    {
+        if (!string.IsNullOrWhiteSpace(rowMergeKey))
+        {
+            var semanticRow = rawCells
+                .Where(cell => string.Equals(cell.RowMergeKey, rowMergeKey, StringComparison.Ordinal))
+                .OrderBy(cell => cell.Cell.Column)
+                .ToList();
+            if (semanticRow.Count > 0)
+            {
+                return semanticRow;
+            }
+        }
+
+        if (fallbackCell == null)
+        {
+            return [];
+        }
+
+        return rawCells
+            .Where(cell => string.Equals(cell.Cell.Sheet, fallbackCell.Sheet, StringComparison.Ordinal) && cell.Cell.Row == fallbackCell.Row)
+            .OrderBy(cell => cell.Cell.Column)
+            .ToList();
+    }
+
+    private static int MinColumnForField(
+        string fieldKey,
+        params IReadOnlyList<SpreadsheetMergeRawCell>[] rows)
+    {
+        return rows
+            .SelectMany(row => row)
+            .Where(cell => string.Equals(NormalizeHeader(cell.FieldName), fieldKey, StringComparison.Ordinal))
+            .Select(cell => cell.Cell.Column)
+            .DefaultIfEmpty(-1)
+            .Min();
+    }
+
+    private static string FirstFieldNameForKey(
+        string fieldKey,
+        string currentFieldName,
+        params IReadOnlyList<SpreadsheetMergeRawCell>[] rows)
+    {
+        if (string.Equals(fieldKey, NormalizeHeader(currentFieldName), StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(currentFieldName))
+        {
+            return currentFieldName;
+        }
+
+        return rows
+            .SelectMany(row => row)
+            .Where(cell => string.Equals(NormalizeHeader(cell.FieldName), fieldKey, StringComparison.Ordinal))
+            .Select(cell => cell.FieldName)
+            .FirstOrDefault(field => !string.IsNullOrWhiteSpace(field)) ?? fieldKey;
+    }
+
+    private static string RowContextValue(IReadOnlyList<SpreadsheetMergeRawCell> row, string fieldKey)
+    {
+        var values = row
+            .Where(cell => string.Equals(NormalizeHeader(cell.FieldName), fieldKey, StringComparison.Ordinal))
+            .OrderBy(cell => cell.Cell.Column)
+            .Select(cell => cell.Value)
+            .ToList();
+        if (values.Count <= 1)
+        {
+            return values.FirstOrDefault() ?? "";
+        }
+
+        return string.Join(" | ", values);
     }
 
     private static SpreadsheetMergeResolvedTarget ResolveTargetCell(

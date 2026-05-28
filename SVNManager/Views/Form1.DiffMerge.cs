@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using NPOI.SS.UserModel;
+using SVNManager.Views.SpreadsheetMerge;
 
 namespace SVNManager;
 
@@ -311,7 +312,8 @@ public partial class Form1
             }
 
             SetBusy(false, "等待确认合并项目");
-            using (var form = new SpreadsheetMergeConflictForm(
+            if (!ShowSpreadsheetMergeDialog(
+                this,
                 relativePath,
                 plan,
                 "内置表格三方合并 - 合并项目预览",
@@ -319,11 +321,8 @@ public partial class Form1
                 "远端 HEAD",
                 "写入工作副本"))
             {
-                if (form.ShowDialog(this) != DialogResult.OK)
-                {
-                    WriteOutput($"已取消内置三方合并：{relativePath}");
-                    return;
-                }
+                WriteOutput($"已取消内置三方合并：{relativePath}");
+                return;
             }
 
             SetBusy(true, "正在写入合并结果...");
@@ -516,7 +515,8 @@ public partial class Form1
             }
 
             SetBusy(false, "等待确认跨库合并项目");
-            using (var conflictForm = new SpreadsheetMergeConflictForm(
+            if (!ShowSpreadsheetMergeDialog(
+                this,
                 displayName,
                 plan,
                 "跨库表格三方合并 - 合并项目预览",
@@ -524,11 +524,8 @@ public partial class Form1
                 "B 改动后",
                 "写入目标 C"))
             {
-                if (conflictForm.ShowDialog(this) != DialogResult.OK)
-                {
-                    WriteOutput($"已取消跨库表格三方合并：{targetFile}");
-                    return;
-                }
+                WriteOutput($"已取消跨库表格三方合并：{targetFile}");
+                return;
             }
 
             SetBusy(true, "正在写入跨库合并结果...");
@@ -645,7 +642,8 @@ public partial class Form1
             }
 
             SetBusy(false, "等待确认所选提交范围合并项目");
-            using (var conflictForm = new SpreadsheetMergeConflictForm(
+            if (!ShowSpreadsheetMergeDialog(
+                this,
                 file.TreePath,
                 plan,
                 $"用 {scopeLabel} 提交范围三方合并 - 合并项目预览",
@@ -653,11 +651,8 @@ public partial class Form1
                 scopeLabel,
                 "写入目标 C"))
             {
-                if (conflictForm.ShowDialog(this) != DialogResult.OK)
-                {
-                    WriteOutput($"已取消用 {scopeLabel} 三方合并：{file.TreePath}");
-                    return;
-                }
+                WriteOutput($"已取消用 {scopeLabel} 三方合并：{file.TreePath}");
+                return;
             }
 
             SetBusy(true, "正在写入所选提交范围三方合并结果...");
@@ -837,6 +832,30 @@ public partial class Form1
             MessageBoxButtons.OKCancel,
             MessageBoxIcon.Information,
             MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+
+    private static bool ShowSpreadsheetMergeDialog(
+        System.Windows.Forms.IWin32Window owner,
+        string relativePath,
+        SpreadsheetMergePlan plan,
+        string titlePrefix,
+        string targetLabel,
+        string sourceLabel,
+        string applyButtonText)
+    {
+        var viewModel = new SpreadsheetMergeViewModel(
+            relativePath,
+            plan,
+            titlePrefix,
+            targetLabel,
+            sourceLabel,
+            applyButtonText);
+        var window = new SpreadsheetMergeWindow
+        {
+            DataContext = viewModel,
+        };
+        new System.Windows.Interop.WindowInteropHelper(window).Owner = owner.Handle;
+        return window.ShowDialog() == true;
     }
 
     private async Task OfferResolveAfterInternalMergeAsync(string relativePath, bool wasConflict)

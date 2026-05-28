@@ -67,7 +67,7 @@ internal sealed class SpreadsheetMergeConflictForm : Form
         _insertRowText = "插入新行";
         _deleteRowText = $"删除{targetLabel}行";
         _operationTexts = [_keepTargetText, _writeCellText, _appendRowText, _insertRowText, _deleteRowText];
-        _rows = plan.AllChanges
+        _rows = plan.MergeWorkChanges
             .Select(change => new SpreadsheetMergeConflictGridRow(change, _keepTargetText, _writeCellText, _appendRowText, _insertRowText, _deleteRowText))
             .ToList();
         Text = $"{titlePrefix} - {relativePath}";

@@ -76,8 +76,8 @@ internal sealed class ToolUpdateForm : Form
             Dock = DockStyle.Fill,
             Multiline = true,
             ReadOnly = true,
-            ScrollBars = ScrollBars.Both,
-            WordWrap = false,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = true,
             Text = string.IsNullOrWhiteSpace(updateLog) ? "暂无更新内容。" : updateLog,
         }, 0, 3);
 
