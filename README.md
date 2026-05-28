@@ -17,12 +17,12 @@
 发布新版本时需要：
 
 1. 修改 `SVNManager/SVNManager.csproj` 里的 `Version` / `AssemblyVersion` / `FileVersion` / `InformationalVersion`。
-2. 运行 `.\Publish-Release.ps1 -IncludeDesktopRuntimeInstaller`，脚本会用 Release 配置生成 Windows x64 发布目录、zip、SHA256，并更新 `update.json`。
+2. 运行 `.\Publish-Release.ps1 -CreateDesktopRuntimePackage`，脚本会用 Release 配置生成 Windows x64 主程序 zip、独立 .NET 运行环境 zip、SHA256，并更新 `update.json`。
 3. 在 GitHub 创建新的 Release，例如 `v0.1.1`。
-4. 把 zip 作为 Release 附件上传，文件名建议包含 `win-x64`，例如 `DreamSVNManager-win-x64-v0.1.1.zip`。
+4. 把主程序 zip 和运行环境 zip 作为 Release 附件上传，文件名建议包含 `win-x64`，例如 `DreamSVNManager-win-x64-v0.1.1.zip`。
 5. 提交并推送更新后的 `update.json`，客户端才会通过 stable/beta 清单发现新版本。
 
-发布 zip 会在 `redist/` 中内置 Microsoft .NET 8 Desktop Runtime x64 安装包，并在根目录生成 `Install-DotNet-DesktopRuntime.cmd` 和 `运行环境说明.txt`。SVN 操作仍需要用户本机已安装 TortoiseSVN command line tools 或 Apache Subversion，并且 `svn.exe` 在 PATH 中。
+主程序 zip 不内置 Microsoft .NET 8 Desktop Runtime x64 安装包，软件内更新只下载主程序 zip。运行环境 zip 单独提供给新机器，内含 `Install-DotNet-DesktopRuntime.cmd` 和 `运行环境说明.txt`。SVN 操作仍需要用户本机已安装 TortoiseSVN command line tools 或 Apache Subversion，并且 `svn.exe` 在 PATH 中。
 
 用户不需要每 10 分钟检查。软件只在启动时自动检查一次；之后用户可以手动点“检查工具更新”。
 

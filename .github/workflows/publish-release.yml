@@ -93,7 +93,7 @@ jobs:
             -Channel $env:CHANNEL `
             -ReleaseNotes $releaseNotes `
             -ReleaseBaseUrl "https://github.com/${{ github.repository }}/releases/download" `
-            -IncludeDesktopRuntimeInstaller
+            -CreateDesktopRuntimePackage
 
       - name: Publish GitHub Release asset
         shell: pwsh
@@ -106,9 +106,10 @@ jobs:
           RELEASE_TITLE: SVNManager ${{ steps.meta.outputs.tag }}
         run: |
           $zip = Resolve-Path ".\artifacts\DreamSVNManager-win-x64-v$env:VERSION.zip"
+          $runtimeZip = Resolve-Path ".\artifacts\DreamSVNManager-dotnet-runtime-win-x64-v$env:VERSION.zip"
           $manifest = Resolve-Path ".\update.json"
           $createArgs = @(
-            "release", "create", $env:TAG, $zip, $manifest,
+            "release", "create", $env:TAG, $zip, $runtimeZip, $manifest,
             "--repo", $env:GITHUB_REPOSITORY,
             "--title", $env:RELEASE_TITLE,
             "--notes-file", $env:NOTES
@@ -121,7 +122,7 @@ jobs:
             gh @createArgs
           } else {
             gh release edit $env:TAG --repo $env:GITHUB_REPOSITORY --title $env:RELEASE_TITLE --notes-file $env:NOTES
-            gh release upload $env:TAG $zip $manifest --repo $env:GITHUB_REPOSITORY --clobber
+            gh release upload $env:TAG $zip $runtimeZip $manifest --repo $env:GITHUB_REPOSITORY --clobber
           }
 
       - name: Commit update manifest
