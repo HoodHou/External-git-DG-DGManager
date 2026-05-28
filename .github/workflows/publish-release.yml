@@ -92,7 +92,8 @@ jobs:
             -Runtime win-x64 `
             -Channel $env:CHANNEL `
             -ReleaseNotes $releaseNotes `
-            -ReleaseBaseUrl "https://github.com/${{ github.repository }}/releases/download"
+            -ReleaseBaseUrl "https://github.com/${{ github.repository }}/releases/download" `
+            -IncludeDesktopRuntimeInstaller
 
       - name: Publish GitHub Release asset
         shell: pwsh

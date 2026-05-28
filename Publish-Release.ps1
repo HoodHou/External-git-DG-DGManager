@@ -17,6 +17,12 @@ param(
 
     [string]$ReleaseBaseUrl = "https://github.com/HoodHou/External-git-DG-DGManager/releases/download",
 
+    [switch]$IncludeDesktopRuntimeInstaller,
+
+    [string]$DesktopRuntimeVersion = "8.0.26",
+
+    [string]$DesktopRuntimeInstallerUrl = "",
+
     [switch]$NoManifest
 )
 
@@ -81,6 +87,81 @@ if ($LASTEXITCODE -ne 0) {
 
 if (-not (Test-Path -LiteralPath (Join-Path $OutputDirectory "SVNManager.exe"))) {
     throw "Publish output is missing SVNManager.exe: $OutputDirectory"
+}
+
+if ($IncludeDesktopRuntimeInstaller) {
+    if ([string]::IsNullOrWhiteSpace($DesktopRuntimeVersion)) {
+        throw "DesktopRuntimeVersion is required when IncludeDesktopRuntimeInstaller is set."
+    }
+
+    $InstallerName = "windowsdesktop-runtime-$DesktopRuntimeVersion-win-x64.exe"
+    $InstallerUrl = if ([string]::IsNullOrWhiteSpace($DesktopRuntimeInstallerUrl)) {
+        "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/$DesktopRuntimeVersion/$InstallerName"
+    } else {
+        $DesktopRuntimeInstallerUrl
+    }
+
+    $RedistCache = Join-Path $Artifacts "redist"
+    $CachedInstaller = Join-Path $RedistCache $InstallerName
+    New-Item -ItemType Directory -Force -Path $RedistCache | Out-Null
+
+    if (-not (Test-Path -LiteralPath $CachedInstaller) -or (Get-Item -LiteralPath $CachedInstaller).Length -eq 0) {
+        Write-Host "Downloading .NET Desktop Runtime $DesktopRuntimeVersion installer..."
+        Invoke-WebRequest -Uri $InstallerUrl -OutFile $CachedInstaller
+    } else {
+        Write-Host "Using cached .NET Desktop Runtime installer: $CachedInstaller"
+    }
+
+    $PackageRedist = Join-Path $OutputDirectory "redist"
+    New-Item -ItemType Directory -Force -Path $PackageRedist | Out-Null
+    $PackageInstaller = Join-Path $PackageRedist $InstallerName
+    Copy-Item -LiteralPath $CachedInstaller -Destination $PackageInstaller -Force
+
+    $InstallerSha256 = (Get-FileHash -LiteralPath $PackageInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -LiteralPath (Join-Path $PackageRedist "$InstallerName.sha256.txt") -Encoding UTF8 -Value @(
+        "$InstallerSha256  $InstallerName",
+        "Source: $InstallerUrl"
+    )
+
+    Set-Content -LiteralPath (Join-Path $OutputDirectory "Install-DotNet-DesktopRuntime.cmd") -Encoding ASCII -Value @(
+        "@echo off",
+        "setlocal",
+        "set ""DIR=%~dp0""",
+        "set ""INSTALLER=%DIR%redist\$InstallerName""",
+        "if not exist ""%INSTALLER%"" (",
+        "  echo Missing installer: %INSTALLER%",
+        "  pause",
+        "  exit /b 1",
+        ")",
+        "echo Installing Microsoft .NET Desktop Runtime $DesktopRuntimeVersion x64...",
+        "start /wait """" ""%INSTALLER%"" /install /passive /norestart",
+        "set ""EXITCODE=%ERRORLEVEL%""",
+        "if not ""%EXITCODE%""==""0"" (",
+        "  echo Install failed. Exit code: %EXITCODE%",
+        "  pause",
+        "  exit /b %EXITCODE%",
+        ")",
+        "echo Done. You can now run SVNManager.exe.",
+        "pause"
+    )
+
+    Set-Content -LiteralPath (Join-Path $OutputDirectory "运行环境说明.txt") -Encoding UTF8 -Value @(
+        "Dream SVNManager v$Version 运行环境说明",
+        "",
+        "本包已内置 Microsoft .NET 8 Desktop Runtime x64 安装包：",
+        "redist\$InstallerName",
+        "",
+        "首次使用或系统提示缺少 .NET 时，请先运行：",
+        "Install-DotNet-DesktopRuntime.cmd",
+        "",
+        "安装完成后运行 SVNManager.exe。",
+        "",
+        "说明：.NET Desktop Runtime 已包含普通 .NET Runtime；WPF/WinForms 桌面程序需要 Desktop Runtime。",
+        "SVN 操作仍需要本机已安装 TortoiseSVN command line tools 或 Apache Subversion，并且 svn.exe 在 PATH 中。"
+    )
+
+    Write-Host ".NET Desktop Runtime installer included: $PackageInstaller"
+    Write-Host ".NET Desktop Runtime installer SHA256: $InstallerSha256"
 }
 
 if (-not $NoZip) {
