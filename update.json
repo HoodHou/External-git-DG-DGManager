@@ -4,13 +4,13 @@
     "tag": "v0.3.7",
     "assetName": "DreamSVNManager-win-x64-v0.3.7.zip",
     "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.7/DreamSVNManager-win-x64-v0.3.7.zip",
-    "sha256": "d3e70f8042f335451588af90e3310bdcf2c22a48854e83f08adc43ed56337d0c",
+    "sha256": "2c80c5f4b491c41855e24f392735ab42c1ea7b2b12324aa89de5572815238a8c",
     "required": false,
     "notes": "# Dream SVNManager v0.3.7\n\n## 重点更新\n\n- 主程序 zip 和 .NET 运行环境包拆分发布，软件内更新只下载小体积主程序 zip。\n- GitHub Release 页面额外提供 `DreamSVNManager-dotnet-runtime-win-x64-v0.3.7.zip`，新机器缺少 .NET 时再单独下载。\n- 主程序 zip 保留 `运行环境说明.txt`，提示缺少 .NET 时应下载独立运行环境包。\n\n## 说明\n\n- 已安装 .NET 8 Desktop Runtime 的机器只需要下载主程序 zip。\n- 未安装 .NET 的机器先下载并解压运行环境包，运行 `Install-DotNet-DesktopRuntime.cmd` 后再启动 `SVNManager.exe`。\n",
     "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.7",
     "publishedAt": "2026-05-28",
     "runtimeAssetName": "DreamSVNManager-dotnet-runtime-win-x64-v0.3.7.zip",
     "runtimeUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.7/DreamSVNManager-dotnet-runtime-win-x64-v0.3.7.zip",
-    "runtimeSha256": "6d7e90d571c3ca3b8112a9e89f9d3b9f27483de96f077ee8cce70d75e36bf8d0"
+    "runtimeSha256": "88dc12c5464df0dd1776ec55ffe07192168f55a333f5b0e360bdedb4fd576300"
   }
 }
