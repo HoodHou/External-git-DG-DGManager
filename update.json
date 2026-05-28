@@ -4,7 +4,7 @@
     "tag": "v0.3.6",
     "assetName": "DreamSVNManager-win-x64-v0.3.6.zip",
     "url": "https://github.com/HoodHou/External-git-DG-DGManager/releases/download/v0.3.6/DreamSVNManager-win-x64-v0.3.6.zip",
-    "sha256": "242be297f6616d56d8f5c90872a39c9816162a655f97f6e1b27967bc1ff2ce3e",
+    "sha256": "6cd1171a54a85184c13fdd3d7396d619e18caed72cb8cdfa6e7c73d0185875e1",
     "required": false,
     "notes": "# Dream SVNManager v0.3.6\n\n## 重点更新\n\n- 重新打包发布 zip，内置 .NET 8 Desktop Runtime x64 安装包和运行环境说明。\n- 缺少 .NET 的机器可先运行 `Install-DotNet-DesktopRuntime.cmd`，再启动 `SVNManager.exe`。\n- 保留 v0.3.5 的表格三方合并工作台、来源 diff 范围处理、整行上下文视图和更新内容自动换行等改动。\n\n## 环境说明\n\n- zip 根目录会生成 `运行环境说明.txt`。\n- .NET 安装包位于 `redist/windowsdesktop-runtime-8.0.26-win-x64.exe`。\n- SVN 操作仍需要本机已安装 TortoiseSVN command line tools 或 Apache Subversion，并且 `svn.exe` 在 PATH 中。\n",
     "releaseUrl": "https://github.com/HoodHou/External-git-DG-DGManager/releases/tag/v0.3.6",
