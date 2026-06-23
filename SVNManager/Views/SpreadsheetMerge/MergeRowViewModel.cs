@@ -34,7 +34,7 @@ internal sealed class MergeOperationLabels
     public IReadOnlyList<string> All { get; }
 }
 
-internal sealed class MergeRowViewModel : INotifyPropertyChanged
+internal sealed class MergeRowViewModel : INotifyPropertyChanged, IMergeReviewRow
 {
     private readonly SpreadsheetMergeChange _change;
     private readonly MergeOperationLabels _labels;
@@ -44,6 +44,11 @@ internal sealed class MergeRowViewModel : INotifyPropertyChanged
     private bool _isDecisionTouched;
     private bool _isSelected;
     private bool _suppressEditEvent;
+    private bool _isManual;
+    private string? _manualDraft;
+
+    /// <summary>由拥有者(VM)注入,使决议改动走 撤销 + 行级联动 的统一通道。</summary>
+    internal Action<string>? OperationApplier { get; set; }
 
     public MergeRowViewModel(SpreadsheetMergeChange change, MergeOperationLabels labels)
     {
@@ -215,8 +220,112 @@ internal sealed class MergeRowViewModel : INotifyPropertyChanged
         ? "当前项目没有整行上下文。"
         : $"整行字段 {RowContextFields.Count} 个，当前字段已高亮。";
 
+    // ===== IMergeReviewRow:表格直显投影 + 单元格决议 =====
+    public string SheetName => Sheet;
+    public string RecordKey => string.IsNullOrEmpty(RowMergeKey)
+        ? $"{Sheet}|P|{_change.TargetCell.Row}"
+        : RowMergeKey;
+    public string RecordTitle => RowId;
+    public int ColumnOrder => _change.TargetCell.Column;
+    public string ColumnHeader => string.IsNullOrWhiteSpace(FieldName) ? WriteColumnName : FieldName;
+    public string EffectiveValue => IsRemoteOperation ? RemoteValue : LocalValue;
+    public bool IsConflict => Kind == SpreadsheetMergeChangeKind.Conflict;
+    public bool IsRowLevel => !TargetRowExists || !SourceCellExists;
+    public bool SupportsManual => !IsRowLevel;
+    public string RowLevelKindText => !TargetRowExists && SourceCellExists
+        ? "整行新增"
+        : !SourceCellExists ? "整行删除" : "";
+
+    public MergeDecision Decision
+    {
+        get
+        {
+            if (IsDecisionPending)
+            {
+                return MergeDecision.Pending;
+            }
+
+            if (!IsRemoteOperation)
+            {
+                return MergeDecision.KeepLocal;
+            }
+
+            return _isManual ? MergeDecision.Manual : MergeDecision.TakeRemote;
+        }
+    }
+
+    public string ManualValue
+    {
+        get => _manualDraft ?? RemoteValue;
+        set
+        {
+            if (_manualDraft == value)
+            {
+                return;
+            }
+
+            _manualDraft = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public void TakeLocal()
+    {
+        _isManual = false;
+        Apply(_labels.KeepTargetText);
+    }
+
+    public void TakeRemote()
+    {
+        _isManual = false;
+        var operation = SourceCellExists
+            ? RequiresWholeRowSource ? _labels.AppendRowText : _labels.WriteCellText
+            : _labels.DeleteRowText;
+        Apply(operation);
+    }
+
+    public void ApplyManual(string value)
+    {
+        if (!SupportsManual)
+        {
+            return;
+        }
+
+        _change.RemoteValue = value ?? "";
+        _manualDraft = value ?? "";
+        _isManual = true;
+        Apply(_labels.WriteCellText);
+        OnPropertyChanged(nameof(RemoteValue));
+        OnPropertyChanged(nameof(ManualValue));
+        OnPropertyChanged(nameof(EffectiveValue));
+    }
+
+    /// <summary>
+    /// 投影构建时调用。远端删除行的引擎初值是 WriteCell(对"删除"无效,旧 UI 要求用户手动改),
+    /// 这里归一为"保留本地",保证默认可写,由用户显式采纳删除。
+    /// </summary>
+    internal void NormalizeInitialState()
+    {
+        if (!SourceCellExists && IsRemoteOperation)
+        {
+            SetOperationText(_labels.KeepTargetText, markDecisionTouched: false, raiseEditEvent: false);
+        }
+    }
+
+    private void Apply(string operationText)
+    {
+        if (OperationApplier != null)
+        {
+            OperationApplier(operationText);
+        }
+        else
+        {
+            OperationText = operationText;
+        }
+    }
+
     internal MergeRowSnapshot Capture()
-        => new(this, OperationText, WriteSheet, WriteAddress, IsDecisionTouched);
+        => new(this, OperationText, WriteSheet, WriteAddress, IsDecisionTouched, RemoteValue, _isManual);
 
     internal void Restore(MergeRowSnapshot snapshot)
     {
@@ -227,7 +336,12 @@ internal sealed class MergeRowViewModel : INotifyPropertyChanged
             _writeSheet = snapshot.WriteSheet;
             _writeAddress = snapshot.WriteAddress;
             _isDecisionTouched = snapshot.IsDecisionTouched;
+            _change.RemoteValue = snapshot.RemoteValue;
+            _isManual = snapshot.IsManual;
+            _manualDraft = snapshot.IsManual ? snapshot.RemoteValue : null;
             RaiseAllMutableProperties();
+            OnPropertyChanged(nameof(RemoteValue));
+            OnPropertyChanged(nameof(ManualValue));
         }
         finally
         {
@@ -412,6 +526,8 @@ internal sealed class MergeRowViewModel : INotifyPropertyChanged
         OnPropertyChanged(nameof(PlannedWriteCellCount));
         OnPropertyChanged(nameof(ListSubtitle));
         OnPropertyChanged(nameof(DecisionStatusText));
+        OnPropertyChanged(nameof(EffectiveValue));
+        OnPropertyChanged(nameof(Decision));
         foreach (var side in Sides)
         {
             side.Refresh();
@@ -527,6 +643,7 @@ internal sealed class MergeRowContextFieldViewModel
     {
         FieldName = field.FieldName;
         ColumnName = field.ColumnName;
+        ColumnIndex = field.ColumnIndex;
         BaseValue = field.BaseValue;
         LocalValue = field.LocalValue;
         RemoteValue = field.RemoteValue;
@@ -535,6 +652,7 @@ internal sealed class MergeRowContextFieldViewModel
 
     public string FieldName { get; }
     public string ColumnName { get; }
+    public int ColumnIndex { get; }
     public string FieldLabel => string.IsNullOrWhiteSpace(ColumnName) ? FieldName : $"{ColumnName}  {FieldName}";
     public string BaseValue { get; }
     public string LocalValue { get; }
@@ -614,6 +732,8 @@ internal sealed record MergeRowSnapshot(
     string OperationText,
     string WriteSheet,
     string WriteAddress,
-    bool IsDecisionTouched);
+    bool IsDecisionTouched,
+    string RemoteValue,
+    bool IsManual);
 
 internal sealed record MergeRowEditedEventArgs(MergeRowViewModel Row, string PropertyName);

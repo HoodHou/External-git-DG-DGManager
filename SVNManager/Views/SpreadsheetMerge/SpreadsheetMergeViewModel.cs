@@ -5,10 +5,11 @@ using System.Windows.Input;
 
 namespace SVNManager.Views.SpreadsheetMerge;
 
-internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
+internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged, IMergeReviewModel
 {
     private readonly MergeOperationLabels _labels;
     private readonly Stack<IReadOnlyList<MergeRowSnapshot>> _undoStack = new();
+    private readonly Dictionary<IMergeReviewRow, MergeCellViewModel> _cellByRow = new();
     private MergeRowViewModel? _selectedRow;
     private string _activeFilter = FilterAll;
     private string _searchText = "";
@@ -40,6 +41,9 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
         foreach (var row in Rows)
         {
             row.Edited += OnRowEdited;
+            var captured = row;
+            row.OperationApplier = operationText => ChangeRowOperation(captured, operationText);
+            row.NormalizeInitialState();
         }
 
         Groups =
@@ -61,12 +65,16 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
         UndoLastDecisionCommand = new RelayCommand(_ => UndoLastDecision(), _ => _undoStack.Count > 0);
         AllLocalCommand = new RelayCommand(_ => SetAllLocal(), _ => Rows.Count > 0);
         AllRemoteCommand = new RelayCommand(_ => SetAllRemote(), _ => Rows.Count > 0);
+        AllConflictsLocalCommand = new RelayCommand(_ => SetAllConflicts(useRemote: false), _ => Plan.Conflicts.Count > 0);
+        AllConflictsRemoteCommand = new RelayCommand(_ => SetAllConflicts(useRemote: true), _ => Plan.Conflicts.Count > 0);
         WriteCommand = new RelayCommand(_ => Write());
         CancelCommand = new RelayCommand(_ => RequestClose?.Invoke(false));
         ShowHelpCommand = new RelayCommand(_ => ShowKeyboardHelp());
         ClassicViewCommand = new RelayCommand(_ => RequestClassicView?.Invoke());
 
         RefreshGroups();
+        BuildSheets();
+        RefreshSheetFilters();
         SelectRow(Rows.FirstOrDefault(row => row.Kind == SpreadsheetMergeChangeKind.Conflict) ?? Rows.FirstOrDefault());
         RefreshDerivedState();
     }
@@ -76,6 +84,7 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
     public event Action<string, string>? RequestMessage;
     public event Func<string, string, bool>? RequestConfirmation;
     public event Action? RequestClassicView;
+    public event Action<MergeCellViewModel>? RequestRevealCell;
 
     public SpreadsheetMergePlan Plan { get; }
     public string RelativePath { get; }
@@ -86,6 +95,7 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
     public string ApplyButtonText { get; }
     public ObservableCollection<MergeRowViewModel> Rows { get; }
     public ObservableCollection<MergeRowGroupViewModel> Groups { get; }
+    public ObservableCollection<MergeSheetViewModel> Sheets { get; } = [];
     public ObservableCollection<MergeRowViewModel> SelectedRelatedRows { get; } = [];
     public IReadOnlyList<string> OperationOptions => _labels.All;
 
@@ -102,6 +112,8 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
     public ICommand UndoLastDecisionCommand { get; }
     public ICommand AllLocalCommand { get; }
     public ICommand AllRemoteCommand { get; }
+    public ICommand AllConflictsLocalCommand { get; }
+    public ICommand AllConflictsRemoteCommand { get; }
     public ICommand WriteCommand { get; }
     public ICommand CancelCommand { get; }
     public ICommand ShowHelpCommand { get; }
@@ -167,6 +179,7 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
             _searchText = value ?? "";
             OnPropertyChanged();
             RefreshGroups();
+            RefreshSheetFilters();
         }
     }
 
@@ -265,6 +278,7 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
     {
         _activeFilter = _activeFilter == filter ? FilterAll : filter;
         RefreshGroups();
+        RefreshSheetFilters();
         var firstVisible = GetFilteredRows().FirstOrDefault();
         if (firstVisible != null && (SelectedRow == null || !GetFilteredRows().Contains(SelectedRow)))
         {
@@ -312,6 +326,15 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
             ? (delta > 0 ? 0 : conflicts.Count - 1)
             : (index + delta + conflicts.Count) % conflicts.Count;
         SelectRow(conflicts[next]);
+        RaiseReveal(conflicts[next]);
+    }
+
+    private void RaiseReveal(IMergeReviewRow row)
+    {
+        if (_cellByRow.TryGetValue(row, out var cell))
+        {
+            RequestRevealCell?.Invoke(cell);
+        }
     }
 
     private void KeepLocal()
@@ -405,6 +428,29 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
         });
     }
 
+    private void SetAllConflicts(bool useRemote)
+    {
+        var conflicts = Rows.Where(row => row.Kind == SpreadsheetMergeChangeKind.Conflict).ToList();
+        if (conflicts.Count == 0)
+        {
+            return;
+        }
+
+        var target = useRemote ? $"{_labels.WriteCellText} / 删除行" : _labels.KeepTargetText;
+        if (RequestConfirmation?.Invoke("批量处理冲突", $"确认把全部 {conflicts.Count} 个冲突改为“{target}”？") == false)
+        {
+            return;
+        }
+
+        ChangeRowsWithUndo(conflicts, () =>
+        {
+            foreach (var row in conflicts)
+            {
+                row.SetOperationFromOwner(useRemote ? GetRemoteOperationText(row) : _labels.KeepTargetText, markDecisionTouched: true);
+            }
+        });
+    }
+
     private void ChangeRowOperation(MergeRowViewModel row, string operationText)
     {
         operationText = NormalizeOperationForRow(row, operationText);
@@ -449,7 +495,8 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
         => snapshot.OperationText != snapshot.Row.OperationText ||
             snapshot.WriteSheet != snapshot.Row.WriteSheet ||
             snapshot.WriteAddress != snapshot.Row.WriteAddress ||
-            snapshot.IsDecisionTouched != snapshot.Row.IsDecisionTouched;
+            snapshot.IsDecisionTouched != snapshot.Row.IsDecisionTouched ||
+            snapshot.RemoteValue != snapshot.Row.RemoteValue;
 
     private void UndoLastDecision()
     {
@@ -653,6 +700,144 @@ internal sealed class SpreadsheetMergeViewModel : INotifyPropertyChanged
         OnPropertyChanged(nameof(IsSameFilterActive));
         OnPropertyChanged(nameof(IsConflictFilterActive));
         OnPropertyChanged(nameof(IsRiskFilterActive));
+    }
+
+    // ===== 表格直显投影:把 Rows(扁平改动)重组成 工作表 -> 记录 -> 字段 =====
+    private void BuildSheets()
+    {
+        Sheets.Clear();
+        _cellByRow.Clear();
+
+        foreach (var sheetGroup in Rows.GroupBy(row => row.Sheet).OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var sheetRows = sheetGroup.ToList();
+
+            // 列 = 整行上下文字段并集(按列号),并确保每个改动自身的列存在
+            var headerByColumn = new SortedDictionary<int, string>();
+            foreach (var row in sheetRows)
+            {
+                foreach (var field in row.RowContextFields)
+                {
+                    if (field.ColumnIndex >= 0 && !headerByColumn.ContainsKey(field.ColumnIndex))
+                    {
+                        headerByColumn[field.ColumnIndex] = string.IsNullOrWhiteSpace(field.FieldName) ? field.ColumnName : field.FieldName;
+                    }
+                }
+
+                if (!headerByColumn.ContainsKey(row.ColumnOrder))
+                {
+                    headerByColumn[row.ColumnOrder] = row.ColumnHeader;
+                }
+            }
+
+            var columns = new List<MergeColumn>();
+            var columnSeq = 0;
+            foreach (var entry in headerByColumn)
+            {
+                columns.Add(new MergeColumn($"c{columnSeq++}", entry.Value, entry.Key));
+            }
+
+            // 记录 = 按 RowMergeKey 分组
+            var records = new List<MergeRecordViewModel>();
+            foreach (var recordGroup in sheetRows.GroupBy(row => row.RecordKey))
+            {
+                var recordRows = recordGroup.ToList();
+                var anchor = recordRows[0];
+
+                var interactiveByColumn = new Dictionary<int, MergeRowViewModel>();
+                foreach (var row in recordRows)
+                {
+                    interactiveByColumn.TryAdd(row.ColumnOrder, row);
+                }
+
+                var contextByColumn = new Dictionary<int, MergeRowContextFieldViewModel>();
+                foreach (var field in anchor.RowContextFields)
+                {
+                    if (field.ColumnIndex >= 0)
+                    {
+                        contextByColumn.TryAdd(field.ColumnIndex, field);
+                    }
+                }
+
+                var cellsByKey = new Dictionary<string, MergeCellViewModel>(StringComparer.Ordinal);
+                var cellsInOrder = new List<MergeCellViewModel>();
+                foreach (var column in columns)
+                {
+                    MergeCellViewModel cell;
+                    if (interactiveByColumn.TryGetValue(column.Order, out var interactiveRow))
+                    {
+                        cell = new MergeCellViewModel(interactiveRow);
+                        _cellByRow[interactiveRow] = cell;
+                    }
+                    else if (contextByColumn.TryGetValue(column.Order, out var contextField))
+                    {
+                        cell = new MergeCellViewModel(contextField.LocalValue, ClassifyContext(contextField));
+                    }
+                    else
+                    {
+                        cell = MergeCellViewModel.Blank;
+                    }
+
+                    cellsByKey[column.Key] = cell;
+                    cellsInOrder.Add(cell);
+                }
+
+                var isRowLevel = anchor.IsRowLevel;
+                var kind = recordRows.Any(row => row.IsConflict)
+                    ? SpreadsheetMergeChangeKind.Conflict
+                    : recordRows.Any(row => row.Kind == SpreadsheetMergeChangeKind.AutoRemote)
+                        ? SpreadsheetMergeChangeKind.AutoRemote
+                        : anchor.Kind;
+
+                records.Add(new MergeRecordViewModel(
+                    recordGroup.Key,
+                    anchor.RecordTitle,
+                    kind,
+                    isRowLevel,
+                    anchor.RowLevelKindText,
+                    cellsInOrder,
+                    cellsByKey,
+                    isRowLevel ? anchor : null));
+            }
+
+            Sheets.Add(new MergeSheetViewModel(sheetGroup.Key, columns, records));
+        }
+    }
+
+    private static SpreadsheetMergeChangeKind ClassifyContext(MergeRowContextFieldViewModel field)
+    {
+        var localChanged = !string.Equals(field.LocalValue, field.BaseValue, StringComparison.Ordinal);
+        var remoteChanged = !string.Equals(field.RemoteValue, field.BaseValue, StringComparison.Ordinal);
+        return localChanged && !remoteChanged
+            ? SpreadsheetMergeChangeKind.LocalOnly
+            : SpreadsheetMergeChangeKind.SameBoth;
+    }
+
+    private void RefreshSheetFilters()
+    {
+        foreach (var sheet in Sheets)
+        {
+            sheet.ApplyFilter(RecordMatches);
+        }
+    }
+
+    private bool RecordMatches(MergeRecordViewModel record)
+    {
+        var filterMatch = _activeFilter switch
+        {
+            FilterAutoRemote => record.HasAuto,
+            FilterConflict => record.HasConflict,
+            FilterRisk => record.HasRisk,
+            FilterLocalOnly => false,
+            FilterSameBoth => false,
+            _ => true,
+        };
+        if (!filterMatch)
+        {
+            return false;
+        }
+
+        return string.IsNullOrWhiteSpace(SearchText) || record.MatchesSearch(SearchText.Trim());
     }
 
     private void OnPropertyChanged([CallerMemberName] string propertyName = "")

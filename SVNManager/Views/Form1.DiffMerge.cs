@@ -422,13 +422,10 @@ public partial class Form1
             }
 
             SetBusy(false, "等待确认 XML 合并项目");
-            using (var form = new XmlMergeConflictForm(relativePath, plan, "本地", "远端 HEAD", "写入工作副本"))
+            if (!ShowXmlMergeDialog(this, relativePath, plan))
             {
-                if (form.ShowDialog(this) != DialogResult.OK)
-                {
-                    WriteOutput($"已取消普通 XML 三方合并：{relativePath}");
-                    return;
-                }
+                WriteOutput($"已取消普通 XML 三方合并：{relativePath}");
+                return;
             }
 
             SetBusy(true, "正在写入 XML 合并结果...");
@@ -850,7 +847,21 @@ public partial class Form1
             targetLabel,
             sourceLabel,
             applyButtonText);
-        var window = new SpreadsheetMergeWindow
+        return ShowMergeReviewWindow(owner, viewModel);
+    }
+
+    private static bool ShowXmlMergeDialog(
+        System.Windows.Forms.IWin32Window owner,
+        string relativePath,
+        XmlMergePlan plan)
+    {
+        var viewModel = new XmlMergeReviewModel(relativePath, plan);
+        return ShowMergeReviewWindow(owner, viewModel);
+    }
+
+    private static bool ShowMergeReviewWindow(System.Windows.Forms.IWin32Window owner, IMergeReviewModel viewModel)
+    {
+        var window = new MergeReviewWindow
         {
             DataContext = viewModel,
         };

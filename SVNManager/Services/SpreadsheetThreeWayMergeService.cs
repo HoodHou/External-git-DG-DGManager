@@ -186,7 +186,7 @@ internal sealed class SpreadsheetMergeChange
     public string RowId { get; }
     public string BaseValue { get; }
     public string LocalValue { get; }
-    public string RemoteValue { get; }
+    public string RemoteValue { get; set; }
     public SpreadsheetMergeResolution Resolution { get; set; }
     public SpreadsheetMergeOperation Operation { get; set; }
     public bool TargetCellExists { get; set; }

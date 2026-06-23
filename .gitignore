@@ -12,3 +12,4 @@ TestResults/
 artifacts/
 SVNManager/ExternalTools/
 SVNManager/diagnostic.log
+.claude/

@@ -105,7 +105,7 @@ internal sealed class XmlMergeChange
     public string DisplayName { get; }
     public string BaseValue { get; }
     public string LocalValue { get; }
-    public string RemoteValue { get; }
+    public string RemoteValue { get; set; }
     public bool LocalExists { get; }
     public bool RemoteExists { get; }
     public string RemoteXml { get; }
