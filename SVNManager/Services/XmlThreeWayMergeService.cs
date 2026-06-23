@@ -588,7 +588,18 @@ internal static class XmlThreeWayMergeService
         var next = string.IsNullOrWhiteSpace(action.NextSiblingPath) ? null : FindElement(document, action.NextSiblingPath);
         if (next != null && next.Parent == parent)
         {
-            next.AddBeforeSelf(new XText(InferChildIndent(parent)), element);
+            // 元素在前、缩进在后:新元素接管 next 原有的前导缩进,再用新缩进与 next 隔开,
+            // 避免出现「新元素与 next 挤在同一行」以及多余空行(会改乱相邻未变行)。
+            next.AddBeforeSelf(element, new XText(InferChildIndent(parent)));
+            return;
+        }
+
+        // 兜底:锚点都失配时追加到末尾。锚定最后一个元素子节点并 AddAfterSelf,
+        // 复用与「插到前一兄弟之后」一致的写法,避免破坏父节点收尾的换行(多空行 / 闭合标签贴在同一行)。
+        var lastElement = parent.Elements().LastOrDefault();
+        if (lastElement != null)
+        {
+            lastElement.AddAfterSelf(new XText(InferChildIndent(parent)), element);
             return;
         }
 
